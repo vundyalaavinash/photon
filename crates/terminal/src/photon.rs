@@ -45,6 +45,23 @@ impl TerminalBlocks {
         self.sync_with_grid(term);
     }
 
+    /// Marks are numbered as of the clear count when the parser saw them, which can
+    /// lag the grid by a frame: a clear the list has not seen yet is applied first,
+    /// and a mark from before a clear the list already applied lands on line 0,
+    /// where that clear left the cursor.
+    fn line_after_clears(&mut self, absolute_line: i64, mark_clears: u64) -> i64 {
+        if mark_clears > self.history_clears {
+            self.history_clears = mark_clears;
+            self.oldest_line = 0;
+            self.list.clear();
+        }
+        if mark_clears < self.history_clears {
+            0
+        } else {
+            absolute_line
+        }
+    }
+
     /// Called after the grid may have changed under the block list.
     pub(crate) fn sync_with_grid(&mut self, term: &AlacrittyTerm) {
         let clears = history_clears(term);
@@ -87,13 +104,14 @@ impl Terminal {
         &mut self,
         params: &[Vec<u8>],
         absolute_line: i64,
+        history_clears: u64,
         cx: &mut Context<Self>,
     ) {
         let Some(blocks) = &mut self.blocks else {
             return;
         };
         blocks.no_marks_check = None;
-        blocks.sync_with_grid(&self.term.lock());
+        let absolute_line = blocks.line_after_clears(absolute_line, history_clears);
         let Some(mark) = parse_shell_mark(params) else {
             return;
         };

@@ -740,10 +740,11 @@ pub(crate) enum TerminalBackendEvent {
     Bell,
     Exit,
     ChildExit(ExitStatus),
-    // photon: OSC 133/633/7 mark at an absolute line.
+    // photon: OSC 133/633/7 mark at an absolute line, numbered as of `history_clears`.
     ShellIntegration {
         params: Vec<Vec<u8>>,
         absolute_line: i64,
+        history_clears: u64,
     },
 }
 
@@ -1802,7 +1803,8 @@ impl Terminal {
             TerminalBackendEvent::ShellIntegration {
                 params,
                 absolute_line,
-            } => self.apply_shell_mark(&params, absolute_line, cx),
+                history_clears,
+            } => self.apply_shell_mark(&params, absolute_line, history_clears, cx),
         }
     }
 
@@ -6707,6 +6709,46 @@ mod tests {
         });
         terminal.read_with(cx, |terminal, _| {
             assert_eq!(terminal.input_target(), InputTarget::Pty)
+        });
+    }
+
+    #[gpui::test]
+    async fn marks_parsed_before_clear_use_post_clear_lines(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        feed_pty_output(&terminal, BLOCK_LIFECYCLE, cx);
+        let mut screenful = Vec::new();
+        for line in 0..40 {
+            screenful.extend_from_slice(format!("{line}\r\n").as_bytes());
+        }
+        screenful.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        feed_pty_output(&terminal, &screenful, cx);
+
+        // `clear` runs: its C mark, the clear itself and the next prompt arrive in one read.
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_raw_output(
+                b"\x1b]633;E;clear\x07\x1b]133;C\x07\x1b[H\x1b[2J\x1b[3J\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+                cx,
+            );
+            // The PTY loop handles a batch's Wakeup before its marks.
+            terminal.process_event(TerminalBackendEvent::Wakeup, cx);
+        });
+        cx.run_until_parked();
+
+        terminal.read_with(cx, |terminal, _| {
+            let blocks = terminal.blocks().expect("blocks enabled");
+            for block in blocks.blocks() {
+                let (Some(output), Some(end)) = (block.output_line, block.end_line) else {
+                    panic!("unfinished block {:?}", block.command);
+                };
+                assert!(end >= output, "inverted block {block:?}");
+                assert!(block.prompt_line <= output, "inverted block {block:?}");
+            }
+            let commands: Vec<_> = blocks
+                .blocks()
+                .map(|block| block.command.as_str())
+                .collect();
+            assert_eq!(commands, ["clear"]);
+            assert_eq!(blocks.phase(), &photon_blocks::Phase::Prompt);
         });
     }
 

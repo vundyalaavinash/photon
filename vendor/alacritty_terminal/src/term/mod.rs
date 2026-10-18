@@ -1893,7 +1893,12 @@ impl<T: EventListener> Handler for Term<T> {
     fn shell_integration(&mut self, params: &[&[u8]]) {
         let absolute_line = self.absolute_line(self.grid.cursor.point.line);
         let params = params.iter().map(|param| param.to_vec()).collect();
-        self.event_proxy.send_event(Event::ShellIntegration { params, absolute_line });
+        let history_clears = self.history_clears();
+        self.event_proxy.send_event(Event::ShellIntegration {
+            params,
+            absolute_line,
+            history_clears,
+        });
     }
 
     #[inline]

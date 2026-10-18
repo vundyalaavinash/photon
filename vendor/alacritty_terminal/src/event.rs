@@ -58,7 +58,9 @@ pub enum Event {
     ChildExit(ExitStatus),
 
     // photon: OSC 133/633/7 shell-integration mark; `params` are the fields after the OSC number.
-    ShellIntegration { params: Vec<Vec<u8>>, absolute_line: i64 },
+    // `history_clears` is `Term::history_clears` when the mark was parsed, so a consumer that
+    // handles it later can tell whether `absolute_line` predates a clear it has already seen.
+    ShellIntegration { params: Vec<Vec<u8>>, absolute_line: i64, history_clears: u64 },
 }
 
 impl Debug for Event {
@@ -69,8 +71,8 @@ impl Debug for Event {
             Event::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
             Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
-            Event::ShellIntegration { params, absolute_line } => {
-                write!(f, "ShellIntegration({params:?}, {absolute_line})")
+            Event::ShellIntegration { params, absolute_line, history_clears } => {
+                write!(f, "ShellIntegration({params:?}, {absolute_line}, {history_clears})")
             },
             Event::Title(title) => write!(f, "Title({title})"),
             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),

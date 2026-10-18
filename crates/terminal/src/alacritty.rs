@@ -343,9 +343,11 @@ impl From<AlacTermEvent> for TerminalBackendEvent {
             AlacTermEvent::ShellIntegration {
                 params,
                 absolute_line,
+                history_clears,
             } => Self::ShellIntegration {
                 params,
                 absolute_line,
+                history_clears,
             },
         }
     }

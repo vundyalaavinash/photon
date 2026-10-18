@@ -13,7 +13,7 @@ struct Collector(Arc<Mutex<Vec<Mark>>>);
 
 impl EventListener for Collector {
     fn send_event(&self, event: Event) {
-        if let Event::ShellIntegration { params, absolute_line } = event {
+        if let Event::ShellIntegration { params, absolute_line, .. } = event {
             self.0.lock().expect("collector lock").push((params, absolute_line));
         }
     }
