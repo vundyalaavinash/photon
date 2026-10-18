@@ -45,6 +45,7 @@ cli = [
 
 [dependencies]
 anyhow.workspace = true
+photon_brand.workspace = true
 askpass = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 clap_complete = { workspace = true, optional = true }

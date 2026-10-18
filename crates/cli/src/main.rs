@@ -153,6 +153,10 @@ struct Args {
     /// by having Zed act like netcat communicating over a Unix socket.
     #[arg(long, hide = true)]
     askpass: Option<String>,
+
+    // photon: hidden on purpose; not listed in --help.
+    #[arg(long = "for", hide = true)]
+    dedication: bool,
 }
 
 /// Parses a path containing a position (e.g. `path:line:column`)
@@ -340,6 +344,19 @@ mod tests {
     }
 
     #[test]
+    fn dedication_flag_is_hidden_from_help() {
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.split_whitespace().any(|word| word == "--for"));
+        assert!(!help.contains("Maha"));
+    }
+
+    #[test]
+    fn for_flag_parses() {
+        let args = Args::try_parse_from(["cli", "--for"]).unwrap();
+        assert!(args.dedication);
+    }
+
+    #[test]
     fn test_parse_non_existing_path() {
         // Absolute path
         let result = parse_path_with_position(path!("/non/existing/path.txt")).unwrap();
@@ -511,6 +528,12 @@ fn run() -> Result<()> {
     }
 
     let args = Args::parse();
+
+    // photon: hidden dedication.
+    if args.dedication {
+        println!("{}", photon_brand::DEDICATION);
+        return Ok(());
+    }
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     if let Some(socket) = &args.askpass {

@@ -3035,6 +3035,7 @@ dependencies = [
  "ipc-channel",
  "parking_lot",
  "paths",
+ "photon_brand",
  "plist",
  "rayon",
  "release_channel",
@@ -13448,6 +13449,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher 1.0.1",
+]
+
+[[package]]
+name = "photon_brand"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "serde_json_lenient",
 ]
 
 [[package]]

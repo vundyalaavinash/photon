@@ -1,0 +1,17 @@
+[package]
+name = "photon_brand"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/photon_brand.rs"
+doctest = false
+
+[dev-dependencies]
+serde_json.workspace = true
+serde_json_lenient.workspace = true
