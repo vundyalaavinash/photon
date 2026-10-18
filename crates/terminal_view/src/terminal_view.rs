@@ -636,6 +636,11 @@ impl TerminalView {
                     !self.read_only && !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| menu.action("Clear", Box::new(Clear)),
                 )
+                // photon: the selected block's actions.
+                .when(
+                    self.selected_block.is_some(),
+                    photon_blocks_view::block_menu_items,
+                )
                 .when(
                     assistant_enabled && !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| {
@@ -1116,6 +1121,10 @@ impl TerminalView {
         // photon: lets block bindings override Zed's terminal keys only while blocks are drawn.
         if photon_blocks_view::active_blocks(self.terminal.read(cx)).is_some() {
             dispatch_context.add("photon_blocks");
+            // photon: a selected block's keys apply only while one is selected.
+            if self.selected_block.is_some() {
+                dispatch_context.add("photon_block_selected");
+            }
         }
 
         let mode = self.terminal.read(cx).last_content.mode;
@@ -3891,6 +3900,62 @@ mod tests {
         assert_eq!(selected(&terminal_view, &mut cx), Some(ids[0]));
         cx.simulate_click(row_position(5.5), gpui::Modifiers::default());
         assert_eq!(selected(&terminal_view, &mut cx), None);
+    }
+
+    #[gpui::test]
+    async fn drag_selects_text_not_block(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let bounds = terminal.read_with(&cx, |terminal, _| terminal.last_content.terminal_bounds);
+        let position = |column: f32, row: f32| {
+            bounds.bounds.origin + gpui::point(bounds.cell_width * column, bounds.line_height * row)
+        };
+        let modifiers = gpui::Modifiers::default();
+        cx.simulate_mouse_down(position(0.5, 1.5), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(position(8.5, 1.5), MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(position(8.5, 1.5), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(selected(&terminal_view, &mut cx), None);
+        terminal.update_in(&mut cx, |terminal, window, cx| terminal.sync(window, cx));
+        let text = terminal.read_with(&cx, |terminal, _| {
+            terminal.last_content.selection_text.clone()
+        });
+        assert!(text.is_some_and(|text| !text.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn escape_clears_block_selection(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(&terminal, NEEDLE_BLOCKS, &mut cx);
+        cx.simulate_keystrokes("cmd-up");
+        assert!(selected(&terminal_view, &mut cx).is_some());
+        assert_eq!(needle_matches(&terminal_view, &mut cx).await, 1);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(selected(&terminal_view, &mut cx), None);
+        assert_eq!(needle_matches(&terminal_view, &mut cx).await, 2);
+    }
+
+    #[gpui::test]
+    async fn block_keybindings_copy_and_rerun(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        let clipboard = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        };
+        // With nothing selected the keys are left to other bindings.
+        cx.simulate_keystrokes("cmd-shift-c");
+        assert_eq!(clipboard(&mut cx), None);
+        cx.simulate_keystrokes("cmd-up");
+        cx.simulate_keystrokes("cmd-shift-c");
+        assert_eq!(clipboard(&mut cx).as_deref(), Some("ls"));
+        cx.simulate_keystrokes("cmd-alt-c");
+        assert_eq!(clipboard(&mut cx).as_deref(), Some("a.txt"));
+        cx.simulate_keystrokes("cmd-alt-shift-c");
+        assert_eq!(clipboard(&mut cx).as_deref(), Some("ls\na.txt"));
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_keystrokes("cmd-shift-r");
+        assert_eq!(
+            take_pty_writes(&terminal, &mut cx).concat(),
+            b"\x15\x1b[200~ls\x1b[201~\r"
+        );
     }
 
     #[gpui::test]

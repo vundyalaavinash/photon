@@ -8,7 +8,7 @@ use gpui::{
 use photon_blocks::{Block, BlockId, BlockList, Phase, VisibleBlock, visible_blocks};
 use photon_terminal::BlockInput;
 use terminal::{BlockPart, InputTarget, Modes, Terminal, TerminalBounds};
-use ui::prelude::*;
+use ui::{ContextMenu, prelude::*};
 use util::{ResultExt as _, paths::PathExt as _};
 use workspace::searchable::SearchEvent;
 
@@ -29,6 +29,8 @@ actions!(
         CopyBlock,
         /// Runs the selected block's command again.
         RerunBlock,
+        /// Unselects the selected command block, so find searches all blocks again.
+        ClearBlockSelection,
     ]
 );
 
@@ -256,6 +258,16 @@ pub(crate) fn register_block_actions(
             cx.listener(|this, _: &CopyBlock, _, cx| this.copy_block_part(BlockPart::Both, cx)),
         )
         .on_action(cx.listener(TerminalView::rerun_block))
+        .on_action(cx.listener(TerminalView::clear_block_selection))
+}
+
+/// The selected block's actions in the terminal's right-click menu.
+pub(crate) fn block_menu_items(menu: ContextMenu) -> ContextMenu {
+    menu.separator()
+        .action("Copy Command", Box::new(CopyBlockCommand))
+        .action("Copy Output", Box::new(CopyBlockOutput))
+        .action("Copy Command and Output", Box::new(CopyBlock))
+        .action("Re-run Command", Box::new(RerunBlock))
 }
 
 impl TerminalView {
@@ -309,6 +321,18 @@ impl TerminalView {
         };
         if let Some(text) = self.terminal.read(cx).block_text(selected, part) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn clear_block_selection(
+        &mut self,
+        _: &ClearBlockSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_block.take().is_some() {
+            cx.emit(SearchEvent::MatchesInvalidated);
+            cx.notify();
         }
     }
 

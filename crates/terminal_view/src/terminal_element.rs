@@ -963,18 +963,14 @@ impl TerminalElement {
 
                 let view = terminal_view.read(cx);
                 let scroll_top = view.scroll_top;
-                // photon: the adjusted position also picks the clicked block.
-                let position = terminal.update(cx, |terminal, cx| {
+                terminal.update(cx, |terminal, cx| {
                     let mut adjusted_event = e.clone();
                     if scroll_top > Pixels::ZERO {
                         adjusted_event.position.y += scroll_top;
                     }
                     terminal.mouse_down(&adjusted_event, mouse_input_mode, cx);
                     cx.notify();
-                    adjusted_event.position
                 });
-                // photon: a click selects the block under it.
-                terminal_view.update(cx, |view, cx| view.select_block_at(position, cx));
             }
         });
 
@@ -987,7 +983,13 @@ impl TerminalElement {
                     return;
                 }
 
-                if e.pressed_button.is_some() && !cx.has_active_drag() && focus.is_focused(window) {
+                // photon: at a block prompt the click hands focus on to the input box inside
+                // the terminal, and the drag must still select text.
+                if e.pressed_button.is_some()
+                    && !cx.has_active_drag()
+                    && (focus.is_focused(window)
+                        || terminal_view.read(cx).block_input_focused(window, cx))
+                {
                     let hovered = hitbox.is_hovered(window);
 
                     let scroll_top = terminal_view.read(cx).scroll_top;
@@ -1020,8 +1022,12 @@ impl TerminalElement {
             self.interactivity.on_mouse_up(button, {
                 let terminal = terminal.clone();
                 let focus = focus.clone();
+                let terminal_view = self.terminal_view.clone();
                 move |event, window, cx| {
-                    if !focus.is_focused(window) {
+                    // photon: as for the drag above, the input box may hold the focus.
+                    if !focus.is_focused(window)
+                        && !terminal_view.read(cx).block_input_focused(window, cx)
+                    {
                         return;
                     }
                     if button != MouseButton::Left
@@ -1041,6 +1047,24 @@ impl TerminalElement {
                 }
             });
         }
+
+        // photon: a plain click (no drag, no modifiers) selects the block under it. Bubble
+        // listeners run newest first, so this sees the drag before the listener above ends it.
+        self.interactivity.on_mouse_up(MouseButton::Left, {
+            let terminal = terminal.clone();
+            let terminal_view = self.terminal_view.clone();
+            move |event, _, cx| {
+                let plain_click = event.click_count == 1
+                    && event.modifiers == gpui::Modifiers::default()
+                    && !terminal.read(cx).selection_started();
+                if plain_click {
+                    let mut position = event.position;
+                    position.y += terminal_view.read(cx).scroll_top.max(Pixels::ZERO);
+                    terminal_view.update(cx, |view, cx| view.select_block_at(position, cx));
+                }
+            }
+        });
+
         for button in [MouseButton::Middle, MouseButton::Right] {
             self.interactivity.on_mouse_down(button, {
                 let terminal = terminal.clone();
