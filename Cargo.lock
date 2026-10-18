@@ -22639,6 +22639,7 @@ dependencies = [
  "outline_panel",
  "parking_lot",
  "paths",
+ "photon_brand",
  "picker",
  "pkg-config",
  "pretty_assertions",
