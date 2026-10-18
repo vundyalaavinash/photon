@@ -162,4 +162,15 @@ impl Terminal {
             blocks.list.set_branch(branch);
         }
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn enable_blocks_for_test(&mut self, cx: &Context<Self>) {
+        self.enable_blocks(cx);
+    }
+
+    /// The PTY event loop's Wakeup, which display-only terminals never receive.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn process_wakeup_for_test(&mut self, cx: &mut Context<Self>) {
+        self.process_event(crate::TerminalBackendEvent::Wakeup, cx);
+    }
 }

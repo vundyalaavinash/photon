@@ -1,4 +1,5 @@
 mod persistence;
+mod photon_blocks_view; // photon: command block chrome and actions
 pub mod terminal_element;
 pub mod terminal_panel;
 mod terminal_path_like_target;
@@ -165,6 +166,8 @@ pub struct TerminalView {
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
+    // photon: the block picked with cmd-up/down or a click.
+    selected_block: Option<photon_blocks::BlockId>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -315,6 +318,7 @@ impl TerminalView {
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
+            selected_block: None,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -1086,6 +1090,10 @@ impl TerminalView {
         if self.terminal.read(cx).vi_mode_enabled() {
             dispatch_context.add("vi_mode");
         }
+        // photon: lets block bindings override Zed's terminal keys only while blocks are drawn.
+        if photon_blocks_view::active_blocks(self.terminal.read(cx)).is_some() {
+            dispatch_context.add("photon_blocks");
+        }
 
         let mode = self.terminal.read(cx).last_content.mode;
         dispatch_context.set(
@@ -1223,6 +1231,7 @@ fn subscribe_for_terminal_events(
 
             match event {
                 Event::Wakeup => {
+                    terminal_view.sync_selected_block(cx); // photon: trims and clears drop blocks
                     cx.notify();
                     window.invalidate_character_coordinates();
                     cx.emit(Event::Wakeup);
@@ -1332,8 +1341,11 @@ fn subscribe_for_terminal_events(
                 },
                 Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
-                // photon: consumed by the block UI.
-                Event::BlocksChanged(_) => {}
+                // photon: block chrome follows the block list.
+                Event::BlocksChanged(_) => {
+                    terminal_view.sync_selected_block(cx);
+                    cx.notify();
+                }
                 Event::SelectionsChanged => {
                     window.invalidate_character_coordinates();
                     cx.emit(SearchEvent::ActiveMatchChanged)
@@ -1491,6 +1503,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::select_all))
             .on_action(cx.listener(TerminalView::rerun_task))
             .on_action(cx.listener(TerminalView::rename_terminal))
+            .map(|this| photon_blocks_view::register_block_actions(this, cx)) // photon: block actions
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(
                 MouseButton::Right,
@@ -3692,5 +3705,190 @@ mod tests {
                 text
             );
         });
+    }
+
+    // photon: command-block tests.
+    use photon_blocks::BlockId;
+
+    const TWO_BLOCKS: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07git status\r\n\x1b]633;E;git status\x07\x1b]133;C\x07On branch main\r\nnothing to commit\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07ls\r\n\x1b]633;E;ls\x07\x1b]133;C\x07a.txt\r\n\x1b]133;D;1\x07\x1b]133;A\x07\x1b]133;B\x07";
+
+    async fn init_block_view(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Terminal>, Entity<TerminalView>, VisualTestContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (terminal, terminal_view) = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let terminal = cx.new(|cx| {
+                    let mut terminal = terminal::TerminalBuilder::new_display_only(
+                        CursorShape::default(),
+                        terminal::terminal_settings::AlternateScroll::On,
+                        Some(10),
+                        0,
+                        cx.background_executor(),
+                        PathStyle::local(),
+                    )
+                    .subscribe(cx);
+                    terminal.enable_blocks_for_test(cx);
+                    terminal
+                });
+                let terminal_view = cx.new(|cx| {
+                    TerminalView::new(
+                        terminal.clone(),
+                        workspace.downgrade(),
+                        None,
+                        project.downgrade(),
+                        window,
+                        cx,
+                    )
+                });
+                let active_pane = workspace.read(cx).active_pane().clone();
+                active_pane.update(cx, |pane, cx| {
+                    pane.add_item(
+                        Box::new(terminal_view.clone()),
+                        true,
+                        false,
+                        None,
+                        window,
+                        cx,
+                    );
+                });
+                let focus_handle = terminal_view.read(cx).focus_handle.clone();
+                focus_handle.focus(window, cx);
+                (terminal, terminal_view)
+            })
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        feed_block_output(&terminal, TWO_BLOCKS, &mut cx);
+        (terminal, terminal_view, cx)
+    }
+
+    fn feed_block_output(terminal: &Entity<Terminal>, bytes: &[u8], cx: &mut VisualTestContext) {
+        terminal.update(cx, |terminal, cx| terminal.write_raw_output(bytes, cx));
+        cx.run_until_parked();
+        terminal.update(cx, |terminal, cx| terminal.process_wakeup_for_test(cx));
+        cx.run_until_parked();
+    }
+
+    fn block_ids(terminal: &Entity<Terminal>, cx: &mut VisualTestContext) -> Vec<BlockId> {
+        terminal.read_with(cx, |terminal, _| {
+            terminal
+                .blocks()
+                .map(|blocks| blocks.blocks().map(|block| block.id).collect())
+                .unwrap_or_default()
+        })
+    }
+
+    fn selected(
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<BlockId> {
+        terminal_view.read_with(cx, |view, _| view.selected_block())
+    }
+
+    #[gpui::test]
+    async fn cmd_up_selects_newest_then_older(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let ids = block_ids(&terminal, &mut cx);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(selected(&terminal_view, &mut cx), None);
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(selected(&terminal_view, &mut cx), Some(ids[1]));
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(selected(&terminal_view, &mut cx), Some(ids[0]));
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(selected(&terminal_view, &mut cx), Some(ids[0]));
+        cx.simulate_keystrokes("cmd-down");
+        assert_eq!(selected(&terminal_view, &mut cx), Some(ids[1]));
+        cx.simulate_keystrokes("cmd-down");
+        assert_eq!(selected(&terminal_view, &mut cx), None);
+    }
+
+    #[gpui::test]
+    async fn copy_block_actions_fill_clipboard(cx: &mut TestAppContext) {
+        let (_terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        cx.simulate_keystrokes("cmd-up");
+        let copy = |action: Box<dyn Action>, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| window.dispatch_action(action, cx));
+            cx.run_until_parked();
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        };
+        assert_eq!(
+            copy(Box::new(photon_blocks_view::CopyBlockCommand), &mut cx).as_deref(),
+            Some("ls")
+        );
+        assert_eq!(
+            copy(Box::new(photon_blocks_view::CopyBlockOutput), &mut cx).as_deref(),
+            Some("a.txt")
+        );
+        assert_eq!(
+            copy(Box::new(photon_blocks_view::CopyBlock), &mut cx).as_deref(),
+            Some("ls\na.txt")
+        );
+    }
+
+    #[gpui::test]
+    async fn rerun_writes_command(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        cx.simulate_keystrokes("cmd-up");
+        terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(photon_blocks_view::RerunBlock), cx)
+        });
+        cx.run_until_parked();
+        let log = terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
+        assert!(log.concat().ends_with(b"\x1b[200~ls\x1b[201~\r"));
+    }
+
+    #[gpui::test]
+    async fn click_selects_block(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let ids = block_ids(&terminal, &mut cx);
+        let bounds = terminal.read_with(&cx, |terminal, _| terminal.last_content.terminal_bounds);
+        // Rows: "git status" block is 0..3, "ls" block is 3..5.
+        let row_position = |row: f32| {
+            bounds.bounds.origin + gpui::point(bounds.cell_width * 2.5, bounds.line_height * row)
+        };
+        cx.simulate_click(row_position(4.5), gpui::Modifiers::default());
+        assert_eq!(selected(&terminal_view, &mut cx), Some(ids[1]));
+        cx.simulate_click(row_position(1.5), gpui::Modifiers::default());
+        assert_eq!(selected(&terminal_view, &mut cx), Some(ids[0]));
+        cx.simulate_click(row_position(5.5), gpui::Modifiers::default());
+        assert_eq!(selected(&terminal_view, &mut cx), None);
+    }
+
+    #[gpui::test]
+    async fn selection_clears_when_block_trimmed(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.simulate_keystrokes("cmd-up cmd-up");
+        assert!(selected(&terminal_view, &mut cx).is_some());
+
+        let mut long_output = b"seq 100\r\n\x1b]633;E;seq 100\x07\x1b]133;C\x07".to_vec();
+        for line in 0..100 {
+            long_output.extend_from_slice(format!("{line}\r\n").as_bytes());
+        }
+        long_output.extend_from_slice(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07");
+        feed_block_output(&terminal, &long_output, &mut cx);
+        assert_eq!(block_ids(&terminal, &mut cx).len(), 1);
+        assert_eq!(selected(&terminal_view, &mut cx), None);
+
+        cx.simulate_keystrokes("cmd-up");
+        assert!(selected(&terminal_view, &mut cx).is_some());
+        terminal.update_in(&mut cx, |terminal, window, cx| {
+            terminal.clear();
+            terminal.sync(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(selected(&terminal_view, &mut cx), None);
+    }
+
+    #[test]
+    fn block_duration_format() {
+        let format = |millis| photon_blocks_view::format_duration(Duration::from_millis(millis));
+        assert_eq!(format(400), "0.4s");
+        assert_eq!(format(12_800), "12.8s");
+        assert_eq!(format(252_000), "4m 12s");
+        assert_eq!(format(3_720_000), "1h 2m");
     }
 }

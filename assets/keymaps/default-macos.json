@@ -1410,6 +1410,15 @@
     },
   },
   {
+    // photon: while command blocks are drawn, cmd-up/down select blocks instead of scrolling a page.
+    "context": "Terminal && photon_blocks && screen == normal",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-up": "photon_terminal::SelectPreviousBlock",
+      "cmd-down": "photon_terminal::SelectNextBlock",
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {

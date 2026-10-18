@@ -29,6 +29,7 @@ itertools.workspace = true
 language.workspace = true
 log.workspace = true
 menu.workspace = true
+photon_blocks.workspace = true # photon: command block chrome
 project.workspace = true
 regex.workspace = true
 schemars.workspace = true

@@ -18166,6 +18166,7 @@ dependencies = [
  "language",
  "log",
  "menu",
+ "photon_blocks",
  "pretty_assertions",
  "project",
  "regex",

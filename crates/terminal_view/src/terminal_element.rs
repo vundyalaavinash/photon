@@ -46,6 +46,8 @@ pub struct LayoutState {
     block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
+    // photon: command block chrome painted over the grid.
+    block_chrome: Vec<crate::photon_blocks_view::BlockChrome>,
 }
 
 /// Helper struct for converting terminal cursor points to displayed cursor points.
@@ -961,14 +963,18 @@ impl TerminalElement {
 
                 let view = terminal_view.read(cx);
                 let scroll_top = view.scroll_top;
-                terminal.update(cx, |terminal, cx| {
+                // photon: the adjusted position also picks the clicked block.
+                let position = terminal.update(cx, |terminal, cx| {
                     let mut adjusted_event = e.clone();
                     if scroll_top > Pixels::ZERO {
                         adjusted_event.position.y += scroll_top;
                     }
                     terminal.mouse_down(&adjusted_event, mouse_input_mode, cx);
                     cx.notify();
-                })
+                    adjusted_event.position
+                });
+                // photon: a click selects the block under it.
+                terminal_view.update(cx, |view, cx| view.select_block_at(position, cx));
             }
         });
 
@@ -1550,6 +1556,13 @@ impl Element for TerminalElement {
                     None
                 };
 
+                // photon: command block chrome.
+                let block_chrome = crate::photon_blocks_view::layout_block_chrome(
+                    self.terminal.read(cx),
+                    self.terminal_view.read(cx).selected_block(),
+                    dimensions.num_lines(),
+                );
+
                 LayoutState {
                     hitbox,
                     batched_text_runs,
@@ -1565,6 +1578,7 @@ impl Element for TerminalElement {
                     block_below_cursor_element,
                     base_text_style: text_style,
                     content_mode,
+                    block_chrome,
                 }
             },
         )
@@ -1679,6 +1693,16 @@ impl Element for TerminalElement {
                         block_element_rect.paint(origin, &layout.dimensions, window);
                     }
                     let text_paint_time = text_paint_start.elapsed();
+                    // photon: block chrome covers the echoed prompt rows of each block.
+                    crate::photon_blocks_view::paint_block_chrome(
+                        &layout.block_chrome,
+                        origin,
+                        &layout.dimensions,
+                        layout.background_color,
+                        &layout.base_text_style,
+                        window,
+                        cx,
+                    );
 
                     if let Some(text_to_mark) = &marked_text_cloned
                         && !text_to_mark.is_empty()
