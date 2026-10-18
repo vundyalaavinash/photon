@@ -49,6 +49,13 @@ The user's favourite thing about Warp is how it feels: output grouped into comma
   - cold start stays ≤ 300 ms;
   - typing in the input box doesn't feel slower than typing in the editor.
 - **It makes network calls.** The `script/photon-netcheck` result must stay clean.
+- **It breaks a performance limit.** These are checked automatically and fail the build:
+  - idle CPU stays under 1% with one terminal open at a prompt;
+  - printing 100,000 lines takes at most 10% longer than with `terminal.blocks: false`;
+  - the integration adds under 1 ms per command (marks plus block bookkeeping);
+  - typing latency in the input box is no worse than in the editor.
+
+  The design is event-driven: no timers or polling beyond the existing cursor blink.
 - **The user has no way back.** A `terminal.blocks` setting (default `true`) turns blocks off and restores the classic SP0 terminal.
 
 ## Decided
