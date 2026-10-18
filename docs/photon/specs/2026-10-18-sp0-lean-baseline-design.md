@@ -81,14 +81,60 @@ If `devin` isn't on `PATH`, the picker shows the existing "command not found" er
 - New file `assets/themes/photon/photon.json`, using the same structure as `one.json`, with one theme
   named **"Photon Black"** (dark). The default theme becomes `"mode": "dark"`, `"dark": "Photon Black"`
   (`default.json:9-13`, `settings_content/src/theme.rs:344-345`). The light theme stays One Light.
+- **The colors match Warp's default "Dark" theme exactly.** Values are taken from Warp's open-source
+  `app/src/themes/default_themes.rs` (`dark_theme()`, `DARK_MODE_*_COLORS`). Color values are facts,
+  not code, and AGPL-3 is compatible with GPL-3 in any case. We credit Warp in `photon.json`.
 - The palette's source of truth lives in the new crate `photon_brand`:
-  - `BHUMI = #000000` is the base background. Panels, the title bar and the status bar use slightly
-    lighter versions of it (around `#0A0A0A` and `#121212`) so borders are visible.
-  - `MAHA = #FFB000` (warm amber) is the accent: cursor, selection, focus rings, the active tab.
-  - Terminal ANSI colors follow Warp's dark palette, adjusted until every color passes contrast checks
-    against `BHUMI`.
+  - `BHUMI = #050505` is Warp's background. Panels, the title bar and the status bar are lighter
+    shades of it, mixed from white the way Warp's `Details::Darker` does.
+  - `MAHA = #19AAD8` is Warp's accent: cursor, selection, focus rings, the active tab.
+  - Foreground text is `#FFFFFF`.
+  - Terminal ANSI colors, normal: `#616161 #FF8272 #B4FA72 #FEFDC2 #A5D5FE #FF8FFD #D0D1FE #F1F1F1`.
+  - Terminal ANSI colors, bright: `#8E8E8E #FFC4BD #D6FCB9 #FEFDD5 #C1E3FE #FFB1FE #E5E6FE #FEFFFF`.
+- **The editor uses the same palette, so the editor and terminal look like one app.** Code-highlighting
+  colors are mapped onto Warp's ANSI colors:
+
+  | Code element | Warp ANSI color it uses |
+  |---|---|
+  | Keywords | magenta `#FF8FFD` |
+  | Strings | green `#B4FA72` |
+  | Functions | blue `#A5D5FE` |
+  | Types | cyan `#D0D1FE` |
+  | Numbers, constants | yellow `#FEFDC2` |
+  | Operators, punctuation | `#F1F1F1` |
+  | Variables | `#FFFFFF` |
+  | Errors | red `#FF8272` |
+
+  - **Comments use bright black `#8E8E8E`**, not normal black `#616161`. On `#050505`, `#616161` is
+    only about 3.3:1 contrast, which fails WCAG AA for text.
+  - **Git and diff colors:** additions green, deletions red, modifications blue, all on 15%-alpha tints
+    of the background.
 - The theme JSON can't reference constants, so **a test ties them together**: the JSON's
   `background` must equal `BHUMI` and its `text.accent` must equal `MAHA`.
+
+### 5.2a Typography and cursor (Warp defaults)
+
+These are the defaults in Warp's `settings_schema.json`, and they match the user's own `~/.warp/settings.toml`:
+
+| Setting | Warp | Photon default (`default.json`) |
+|---|---|---|
+| Font | **Hack** | `terminal.font_family: "Hack"` and `buffer_font_family: "Hack"` |
+| Font size | **13** | `terminal.font_size: 13`, `buffer_font_size: 13` |
+| Line height | **1.2** | `terminal.line_height: {"custom": 1.2}`, `buffer_line_height: {"custom": 1.2}` |
+| Weight | normal | 400 |
+| Cursor | **bar, blinking** | `terminal.cursor_shape: "bar"`, `terminal.blinking: "on"`, `cursor_shape: "bar"` |
+| UI spacing | "normal" | Zed's default UI density. UI font size 13 |
+
+- **Hack is bundled** in `assets/fonts/hack/` (regular, bold, italic and bold italic, about 1.2 MB, under
+  the MIT and Bitstream Vera licenses), so Photon looks the same without a font install. It's
+  registered the same way Zed registers its bundled fonts.
+- **Out of scope here: where things sit inside the terminal** (input box pinned to the bottom, command
+  blocks stacked above it, the prompt line showing the folder and git branch, block padding). Zed's
+  terminal is a plain character grid, and those layouts only exist once blocks exist, so they're
+  specified in sub-project 1 to match Warp's "pinned to bottom" input mode. That spec checks alignment
+  with side-by-side screenshots against Warp at the same window size.
+- **Tab bar** (sub-project 2): tabs on top, close button on the right, the active tab keeps its color.
+  These match Warp's `tab_close_button_position = "right"` and your `preserve_active_tab_color = true`.
 
 ### 5.3 Terminal-first layout
 
@@ -139,7 +185,8 @@ and a release build there takes about an hour, which is too slow to run per PR.
 |---|---|---|
 | Unit | Defaults: telemetry, auto-update and sign-in are off; `edit_predictions` is `none`; Devin is in `agent_servers`; the default dark theme is Photon Black | `#[test]` that parses `assets/settings/default.json` |
 | Unit | Paths resolve under `Photon`/`photon` and never `Zed`/`zed` | `#[test]` in `paths` |
-| Unit | The theme matches `photon_brand`; every text/background pair is at least WCAG AA (4.5:1) | `#[test]` in `photon_brand` that loads `photon.json` |
+| Unit | The theme matches `photon_brand`, including Warp's exact background, accent and 16 ANSI colors; every text/background pair is at least WCAG AA (4.5:1) | `#[test]` in `photon_brand` that loads `photon.json` |
+| Unit | Typography defaults are Hack 13 with line height 1.2 and a blinking bar cursor, in both the terminal and the editor; the bundled Hack font loads | `#[test]` on `default.json`, plus a gpui test that the font is available |
 | UI (headless) | The title bar has no sign-in or collab buttons; the command palette has no collab or account actions; a new empty workspace has a terminal as the active center item | `#[gpui::test]` with `TestAppContext`, following `title_bar/src/application_menu.rs:454` |
 | CLI | `--for` prints the dedication; `--help` doesn't contain "Maha" | Inline `#[test]` in `crates/cli` (existing `mod tests`, `:310`) |
 | Network | No connections other than localhost during 30 s idle | `script/photon-netcheck`: launch the app, poll `lsof -i -a -p <pid>` every second, fail on any non-loopback socket |
