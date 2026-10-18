@@ -339,6 +339,8 @@ impl From<AlacTermEvent> for TerminalBackendEvent {
             AlacTermEvent::Bell => Self::Bell,
             AlacTermEvent::Exit => Self::Exit,
             AlacTermEvent::ChildExit(status) => Self::ChildExit(status),
+            // photon: handled in Task 4
+            _ => Self::Wakeup,
         }
     }
 }
