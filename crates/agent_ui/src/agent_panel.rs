@@ -7252,7 +7252,6 @@ mod tests {
         }
     }
 
-
     #[gpui::test]
     async fn default_agent_is_claude_when_unset() {
         let kvp = KeyValueStore::open_test_db("default_agent_is_claude_when_unset").await;

@@ -1553,6 +1553,8 @@ fn open_about_window(cx: &mut App) {
         message: SharedString,
         commit: Option<SharedString>,
         full_version: SharedString,
+        // photon: set by an Option-click on the icon.
+        icon_note: Option<&'static str>,
     }
 
     impl AboutWindow {
@@ -1581,6 +1583,7 @@ fn open_about_window(cx: &mut App) {
                 message,
                 commit,
                 full_version,
+                icon_note: None,
             }
         }
 
@@ -1625,8 +1628,24 @@ fn open_about_window(cx: &mut App) {
                             .w_full()
                             .gap_2()
                             .items_center()
-                            .child(img(self.app_icon.clone()).size_16().flex_none())
+                            .child(
+                                div()
+                                    .id("about-icon")
+                                    .on_click(cx.listener(
+                                        |this, event: &gpui::ClickEvent, _, cx| {
+                                            this.icon_note =
+                                                photon::about_icon_click_note(&event.modifiers());
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(img(self.app_icon.clone()).size_16().flex_none()),
+                            )
                             .child(Headline::new(self.message.clone()))
+                            .when_some(self.icon_note, |this, note| {
+                                this.child(
+                                    Label::new(note).color(Color::Muted).size(LabelSize::Small),
+                                )
+                            })
                             .when_some(self.commit.clone(), |this, commit| {
                                 this.child(
                                     Label::new("Commit")

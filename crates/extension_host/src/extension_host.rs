@@ -463,7 +463,8 @@ impl ExtensionStore {
 
         // photon: still drive the index load, but skip auto-install and the update check at
         // startup; updates are checked when the Extensions page opens.
-        cx.spawn(async move |_, _| initial_index_load.await).detach();
+        cx.spawn(async move |_, _| initial_index_load.await)
+            .detach();
 
         // Perform all extension loading in a single task to ensure that we
         // never attempt to simultaneously load/unload extensions from multiple

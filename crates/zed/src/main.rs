@@ -1,3 +1,4 @@
+// For Maha & Bhumi — the light this was built by.
 // Disable command line from opening on release mode
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -13,7 +14,9 @@ const _: () = assert!(
     paths::APP_NAME_LOWERCASE
         .as_bytes()
         .eq_ignore_ascii_case(env!("CARGO_BIN_NAME").as_bytes())
-        || env!("CARGO_BIN_NAME").as_bytes().eq_ignore_ascii_case(b"zed"),
+        || env!("CARGO_BIN_NAME")
+            .as_bytes()
+            .eq_ignore_ascii_case(b"zed"),
     "paths::APP_NAME_LOWERCASE must match the binary name. \
      Forks: update APP_NAME in crates/paths/src/paths.rs when renaming the binary.",
 );

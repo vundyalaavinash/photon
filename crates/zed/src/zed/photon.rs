@@ -37,6 +37,12 @@ fn center_terminal_action() -> NewCenterTerminal {
     NewCenterTerminal { local: false }
 }
 
+/// The note shown under the version when the About icon is clicked. Kept quiet on purpose.
+pub fn about_icon_click_note(modifiers: &gpui::Modifiers) -> Option<&'static str> {
+    (modifiers.alt && !modifiers.control && !modifiers.platform && !modifiers.shift)
+        .then_some(photon_brand::DEDICATION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +131,16 @@ mod tests {
 
         // A restored or opened file means the user already has content; don't add a terminal.
         cx.read(|cx| assert!(!should_open_center_terminal(workspace.read(cx), cx)));
+    }
+
+    #[test]
+    fn about_note_only_on_option_click() {
+        assert_eq!(about_icon_click_note(&gpui::Modifiers::default()), None);
+        assert_eq!(about_icon_click_note(&gpui::Modifiers::command()), None);
+        assert_eq!(
+            about_icon_click_note(&gpui::Modifiers::alt()),
+            Some(photon_brand::DEDICATION)
+        );
     }
 
     #[test]

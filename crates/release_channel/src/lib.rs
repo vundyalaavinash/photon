@@ -295,7 +295,11 @@ mod tests {
             ReleaseChannel::Preview,
             ReleaseChannel::Stable,
         ] {
-            assert!(channel.app_id().starts_with("io.github.vundyalaavinash.photon"));
+            assert!(
+                channel
+                    .app_id()
+                    .starts_with("io.github.vundyalaavinash.photon")
+            );
             assert!(channel.display_name().starts_with("Photon"));
         }
     }
