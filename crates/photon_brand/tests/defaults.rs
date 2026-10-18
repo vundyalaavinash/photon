@@ -35,3 +35,13 @@ fn warp_typography_defaults() {
     assert_eq!(terminal["cursor_shape"], "bar");
     assert_eq!(terminal["blinking"], "on");
 }
+
+#[test]
+fn agent_and_terminal_defaults() {
+    let settings = default_settings();
+    let devin = &settings["agent_servers"]["devin"];
+    assert_eq!(devin["type"], "custom");
+    assert_eq!(devin["command"], "devin");
+    assert_eq!(devin["args"], serde_json::json!(["acp"]));
+    assert_eq!(settings["terminal"]["button"], false);
+}

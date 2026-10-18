@@ -206,6 +206,13 @@ fn read_global_last_used_agent(kvp: &KeyValueStore) -> Option<Agent> {
         .flatten()
         .and_then(|json| serde_json::from_str::<LastUsedAgent>(&json).log_err())
         .map(|entry| entry.agent)
+        // photon: a fresh install opens Claude Code (the user's subscription) instead of Zed's
+        // hosted agent.
+        .or_else(|| {
+            Some(Agent::Custom {
+                id: agent_servers::CLAUDE_AGENT_ID.into(),
+            })
+        })
 }
 
 async fn write_global_last_used_agent(kvp: KeyValueStore, agent: Agent) {
@@ -7243,6 +7250,18 @@ mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+
+    #[gpui::test]
+    async fn default_agent_is_claude_when_unset() {
+        let kvp = KeyValueStore::open_test_db("default_agent_is_claude_when_unset").await;
+        assert_eq!(
+            read_global_last_used_agent(&kvp),
+            Some(Agent::Custom {
+                id: agent_servers::CLAUDE_AGENT_ID.into(),
+            })
+        );
     }
 
     #[gpui::test]

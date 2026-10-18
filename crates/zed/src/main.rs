@@ -40,7 +40,6 @@ use gpui_platform;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
-use onboarding::{FIRST_OPEN, show_onboarding_view};
 use project_panel::ProjectPanel;
 use prompt_store::PromptBuilder;
 use remote::RemoteConnectionOptions;
@@ -1546,7 +1545,8 @@ pub(crate) async fn restore_or_create_workspace(
                         match restore_on_startup {
                             workspace::RestoreOnStartupBehavior::Launchpad => {}
                             _ => {
-                                Editor::new_file(workspace, &Default::default(), window, cx);
+                                // photon: terminal-first instead of an empty file.
+                                zed::photon::ensure_center_terminal(workspace, window, cx);
                             }
                         }
                     },
@@ -1554,9 +1554,9 @@ pub(crate) async fn restore_or_create_workspace(
             })
             .await?;
         }
-    } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
-        cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
     } else {
+        // photon: no onboarding view (it is Zed sign-in and hosted-AI setup); first launch opens a
+        // terminal like every other launch.
         cx.update(|cx| {
             workspace::open_new(
                 Default::default(),
@@ -1567,7 +1567,8 @@ pub(crate) async fn restore_or_create_workspace(
                     match restore_on_startup {
                         workspace::RestoreOnStartupBehavior::Launchpad => {}
                         _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
+                            // photon: terminal-first instead of an empty file.
+                            zed::photon::ensure_center_terminal(workspace, window, cx);
                         }
                     }
                 },

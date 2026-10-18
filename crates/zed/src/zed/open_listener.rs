@@ -485,6 +485,17 @@ pub async fn open_paths_with_positions(
         .update(|cx| workspace::open_paths(&paths, app_state.clone(), open_options, cx))
         .await?;
 
+    // photon: opening only folders (e.g. `photon .`) with nothing restored lands in a terminal.
+    if items.iter().all(Option::is_none) && diff_paths.is_empty() {
+        multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    crate::zed::photon::ensure_center_terminal(workspace, window, cx)
+                })
+            })
+            .log_err();
+    }
+
     if diff_all && !diff_paths.is_empty() {
         let mut diff_pairs = Vec::with_capacity(diff_paths.len());
         for diff_pair in diff_paths {
