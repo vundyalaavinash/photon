@@ -44,10 +44,11 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed-Editor-Dev",
-        ReleaseChannel::Nightly => "Zed-Editor-Nightly",
-        ReleaseChannel::Preview => "Zed-Editor-Preview",
-        ReleaseChannel::Stable => "Zed-Editor-Stable",
+        // photon: rebrand.
+        ReleaseChannel::Dev => "Photon-Editor-Dev",
+        ReleaseChannel::Nightly => "Photon-Editor-Nightly",
+        ReleaseChannel::Preview => "Photon-Editor-Preview",
+        ReleaseChannel::Stable => "Photon-Editor-Stable",
     }
 }
 
@@ -205,10 +206,11 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
-            ReleaseChannel::Nightly => "Zed Nightly",
-            ReleaseChannel::Preview => "Zed Preview",
-            ReleaseChannel::Stable => "Zed",
+            // photon: rebrand.
+            ReleaseChannel::Dev => "Photon Dev",
+            ReleaseChannel::Nightly => "Photon Nightly",
+            ReleaseChannel::Preview => "Photon Preview",
+            ReleaseChannel::Stable => "Photon",
         }
     }
 
@@ -227,10 +229,11 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "dev.zed.Zed-Dev",
-            ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
-            ReleaseChannel::Preview => "dev.zed.Zed-Preview",
-            ReleaseChannel::Stable => "dev.zed.Zed",
+            // photon: own bundle id, so Photon gets its own keychain items and preferences.
+            ReleaseChannel::Dev => "io.github.vundyalaavinash.photon-dev",
+            ReleaseChannel::Nightly => "io.github.vundyalaavinash.photon-nightly",
+            ReleaseChannel::Preview => "io.github.vundyalaavinash.photon-preview",
+            ReleaseChannel::Stable => "io.github.vundyalaavinash.photon",
         }
     }
 
@@ -283,6 +286,19 @@ impl FromStr for ReleaseChannel {
 #[cfg(test)]
 mod tests {
     use super::ReleaseChannel;
+
+    #[test]
+    fn ids_are_photon() {
+        for channel in [
+            ReleaseChannel::Dev,
+            ReleaseChannel::Nightly,
+            ReleaseChannel::Preview,
+            ReleaseChannel::Stable,
+        ] {
+            assert!(channel.app_id().starts_with("io.github.vundyalaavinash.photon"));
+            assert!(channel.display_name().starts_with("Photon"));
+        }
+    }
 
     #[test]
     fn test_docs_url_for_release_channel() {

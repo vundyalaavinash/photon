@@ -15,7 +15,8 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// and state directory paths.
 ///
 /// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "Zed";
+// photon: own data dirs so Photon never touches Zed's settings or state.
+pub const APP_NAME: &str = "Photon";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.
@@ -634,4 +635,18 @@ pub fn global_gitignore_path() -> Option<PathBuf> {
     GLOBAL_GITIGNORE_PATH
         .get_or_init(::ignore::gitignore::gitconfig_excludes_path)
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_photon_not_zed() {
+        for path in [config_dir(), data_dir(), logs_dir(), database_dir()] {
+            let path = path.to_string_lossy();
+            assert!(!path.contains("zed") && !path.contains("Zed"), "{path}");
+            assert!(path.contains("photon") || path.contains("Photon"), "{path}");
+        }
+    }
 }
