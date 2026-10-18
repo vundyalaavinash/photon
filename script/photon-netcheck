@@ -20,13 +20,13 @@ while (( $# )); do
 done
 
 scratch=$(mktemp -d)
+# The terminal's login shell would otherwise run the user's zsh rc files, whose network
+# calls (plugin managers, version checks) are not Photon's.
+mkdir "$scratch/zdotdir"
+export ZDOTDIR="$scratch/zdotdir"
 if (( ${#command} == 0 )); then
   command=("$binary" --user-data-dir "$scratch/data" tooling/photon-perf/sample)
 fi
-
-"${command[@]}" >"$scratch/stdout.log" 2>&1 &
-root_pid=$!
-trap 'kill $root_pid 2>/dev/null || true' EXIT
 
 descendants() {
   local pid=$1 child
@@ -34,10 +34,20 @@ descendants() {
   for child in $(pgrep -P $pid 2>/dev/null); do descendants $child; done
 }
 
+"${command[@]}" >"$scratch/stdout.log" 2>&1 &
+root_pid=$!
+keep_scratch=0
+cleanup() {
+  kill $(descendants $root_pid) 2>/dev/null || true
+  (( keep_scratch )) || rm -rf "$scratch"
+}
+trap cleanup EXIT
+
+# ponytail: lsof polling still misses connections shorter than one poll; a packet capture would not.
 offending=()
-for (( second = 0; second < seconds; second++ )); do
-  sleep 1
-  kill -0 $root_pid 2>/dev/null || { echo "process exited early; see $scratch/stdout.log" >&2; exit 2; }
+for (( poll = 0; poll < seconds * 5; poll++ )); do
+  sleep 0.2
+  kill -0 $root_pid 2>/dev/null || { keep_scratch=1; echo "process exited early; see $scratch/stdout.log" >&2; exit 2; }
   pids=$(descendants $root_pid | paste -sd, -)
   while read -r line; do
     [[ -z $line ]] && continue
@@ -47,6 +57,8 @@ for (( second = 0; second < seconds; second++ )); do
 done
 
 if (( ${#offending} )); then
+  keep_scratch=1
+  echo "log: $scratch/stdout.log"
   echo "FAIL: non-loopback connections during ${seconds}s idle:"
   printf '  %s\n' "${(u)offending[@]}"
   exit 1

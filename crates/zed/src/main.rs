@@ -1437,7 +1437,8 @@ pub(crate) async fn restore_or_create_workspace(
                 SerializedWorkspaceLocation::Local => {
                     restore_multiworkspace(multi_workspace, app_state.clone(), cx)
                         .await
-                        .map(|_| ())
+                        // photon: a restored project with no open tabs is terminal-first too.
+                        .map(|window| zed::photon::ensure_center_terminal_in(window, cx))
                 }
                 SerializedWorkspaceLocation::Remote(connection_options) => {
                     let mut connection_options = connection_options.clone();

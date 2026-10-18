@@ -738,6 +738,9 @@ pub enum OnNewWindow {
     /// Show the launchpad with recent projects when opening a new window
     #[default]
     Launchpad,
+    // photon: terminal-first new windows (the default in Photon's default.json).
+    /// Open a terminal in the center when opening a new window
+    Terminal,
 }
 
 #[derive(

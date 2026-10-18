@@ -8,6 +8,9 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: photon-${{ github.ref }}
   cancel-in-progress: true
@@ -30,14 +33,16 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (Photon-touched crates)
         run: >
-          cargo clippy -p photon_brand -p paths -p release_channel -p cli -p install_cli
-          -p agent_ui -p extension_host -p extensions_ui -p settings -p zed -- -D warnings
+          ./script/clippy -p photon_brand -p paths -p release_channel -p cli -p install_cli
+          -p agent_ui -p extension_host -p extensions_ui -p settings -p settings_content
+          -p project -p workspace -p zed_credentials_provider -p zed
       - name: Tests (Photon-touched crates)
         run: >
           cargo nextest run -p photon_brand -p paths -p release_channel -p cli -p install_cli
-          -p agent_ui -p project -p settings -p theme_settings -p zed
+          -p agent_ui -p project -p settings -p theme_settings -p zed_credentials_provider -p zed
           -E 'package(photon_brand) | package(paths) | package(release_channel) | package(cli)
-          | package(settings) | package(theme_settings) | test(photon)
+          | package(settings) | package(theme_settings) | package(zed_credentials_provider)
+          | test(photon) | test(new_window)
           | test(agent_registry) | test(default_agent_is_claude)'
 
   perf:

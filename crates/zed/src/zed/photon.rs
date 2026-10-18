@@ -16,6 +16,7 @@ pub fn hide_offline_actions(cx: &mut App) {
         ] {
             filter.hide_namespace(namespace);
         }
+        filter.hide_action_types(&[std::any::TypeId::of::<zed_actions::OpenAccountSettings>()]);
     });
 }
 
@@ -71,6 +72,7 @@ mod tests {
             let filter = CommandPaletteFilter::try_global(cx).expect("filter initialized");
             assert!(filter.is_hidden(&client::SignIn));
             assert!(filter.is_hidden(&auto_update::Check));
+            assert!(filter.is_hidden(&zed_actions::OpenAccountSettings));
             assert!(!filter.is_hidden(&workspace::NewCenterTerminal::default()));
         });
     }

@@ -954,8 +954,9 @@ fn update_command_palette_filter(cx: &mut App) {
                 }
             }
 
-            filter.show_namespace("zed_predict_onboarding");
-            filter.show_action_types(&[TypeId::of::<zed_actions::OpenZedPredictOnboarding>()]);
+            // photon: Zed's edit-prediction onboarding needs a Zed account; Photon never signs in.
+            filter.hide_namespace("zed_predict_onboarding");
+            filter.hide_action_types(&[TypeId::of::<zed_actions::OpenZedPredictOnboarding>()]);
 
             filter.show_namespace("multi_workspace");
         }
@@ -1051,6 +1052,23 @@ mod tests {
     use settings::{
         DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings, SettingsStore,
     };
+
+    #[gpui::test]
+    fn photon_hides_zed_predict_onboarding(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            command_palette_hooks::init(cx);
+            AgentSettings::register(cx);
+            DisableAiSettings::register(cx);
+            AllLanguageSettings::register(cx);
+            update_command_palette_filter(cx);
+
+            let filter = CommandPaletteFilter::try_global(cx).unwrap();
+            assert!(!DisableAiSettings::get_global(cx).disable_ai);
+            assert!(filter.is_hidden(&zed_actions::OpenZedPredictOnboarding));
+        });
+    }
 
     #[gpui::test]
     fn test_agent_command_palette_visibility(cx: &mut TestAppContext) {

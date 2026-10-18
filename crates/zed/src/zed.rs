@@ -2443,8 +2443,14 @@ fn initialize_new_window(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if WorkspaceSettings::get_global(cx).on_new_window == settings::OnNewWindow::Launchpad {
-        return;
+    match WorkspaceSettings::get_global(cx).on_new_window {
+        settings::OnNewWindow::Launchpad => return,
+        // photon: terminal-first new windows.
+        settings::OnNewWindow::Terminal => {
+            photon::ensure_center_terminal(workspace, window, cx);
+            return;
+        }
+        settings::OnNewWindow::EmptyTab => {}
     }
     // Create buffer synchronously to avoid flicker
     let project = workspace.project().clone();
@@ -3819,6 +3825,41 @@ mod tests {
                 editor.update(cx, |editor, cx| {
                     assert!(!editor.is_dirty(cx));
                     assert_eq!(editor.title(cx), "the-new-name");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn photon_new_window_opens_terminal_by_default(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        // The center terminal spawns a real shell on its own threads.
+        cx.executor().allow_parking();
+
+        cx.update(|cx| {
+            open_new(
+                Default::default(),
+                app_state.clone(),
+                cx,
+                |workspace, window, cx| initialize_new_window(workspace, window, cx),
+            )
+        })
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        let multi_workspace = cx
+            .update(|cx| cx.windows().first().unwrap().downcast::<MultiWorkspace>())
+            .unwrap();
+        multi_workspace
+            .update(cx, |multi_workspace, _, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    assert!(
+                        workspace
+                            .active_item_as::<terminal_view::TerminalView>(cx)
+                            .is_some(),
+                        "a new window should open a center terminal"
+                    );
                 });
             })
             .unwrap();
@@ -7364,6 +7405,8 @@ mod tests {
         use workspace::{OpenMode, ProjectGroupKey, Workspace, WorkspaceId};
 
         let app_state = init_test(cx);
+        // photon: restored empty workspaces open a terminal, whose shell runs on its own threads.
+        cx.executor().allow_parking();
 
         let dir1 = path!("/dir1");
         let dir2 = path!("/dir2");
@@ -7850,6 +7893,8 @@ mod tests {
         use workspace::{OpenMode, ProjectGroupKey};
 
         let app_state = init_test(cx);
+        // photon: restored empty workspaces open a terminal, whose shell runs on its own threads.
+        cx.executor().allow_parking();
 
         let fs = app_state.fs.clone();
         let fake_fs = fs.as_fake();
