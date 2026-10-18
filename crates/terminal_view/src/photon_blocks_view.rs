@@ -366,12 +366,13 @@ impl TerminalView {
 impl TerminalView {
     pub(crate) fn new_block_input(
         terminal: &Entity<Terminal>,
+        workspace: gpui::WeakEntity<workspace::Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<BlockInput>> {
         terminal.read(cx).blocks()?;
         let terminal = terminal.clone();
-        Some(cx.new(|cx| BlockInput::new(terminal, window, cx)))
+        Some(cx.new(|cx| BlockInput::new(terminal, workspace, window, cx)))
     }
 
     /// The input's slot below the grid, kept while blocks are drawn so the grid size does

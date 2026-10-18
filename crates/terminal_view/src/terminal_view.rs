@@ -272,7 +272,7 @@ impl TerminalView {
         let cursor_shape = TerminalSettings::get_global(cx).cursor_shape;
 
         let scroll_handle = TerminalScrollHandle::new(terminal.read(cx));
-        let block_input = Self::new_block_input(&terminal, window, cx); // photon: block input box
+        let block_input = Self::new_block_input(&terminal, workspace_handle.clone(), window, cx); // photon: block input box
 
         let blink_manager = cx.new(|cx| {
             BlinkManager::new(
@@ -3996,6 +3996,18 @@ mod tests {
         assert_eq!(input_text(&terminal_view, &mut cx), "pwd");
         cx.simulate_keystrokes("down");
         assert_eq!(input_text(&terminal_view, &mut cx), "");
+    }
+
+    #[gpui::test]
+    async fn ctrl_r_fills_input_without_running(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.update(|_, cx| editor::init(cx)); // registers the editor the history picker's search box uses
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_keystrokes("ctrl-r");
+        cx.simulate_input("git");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(input_text(&terminal_view, &mut cx), "git status");
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
     }
 
     #[gpui::test]

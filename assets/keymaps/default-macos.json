@@ -1419,7 +1419,7 @@
     },
   },
   {
-    // photon: the block terminal's input box runs on enter and walks history from its first/last line.
+    // photon: the block terminal's input box runs on enter, walks history from its first/last line and opens history search on ctrl-r.
     "context": "PhotonBlockInput > Editor",
     "use_key_equivalents": true,
     "bindings": {
@@ -1427,6 +1427,7 @@
       "shift-enter": "editor::Newline",
       "up": "photon_terminal::HistoryPrevious",
       "down": "photon_terminal::HistoryNext",
+      "ctrl-r": "photon_terminal::SearchHistory",
       "cmd-up": "photon_terminal::SelectPreviousBlock",
       "cmd-down": "photon_terminal::SelectNextBlock",
     },

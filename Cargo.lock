@@ -13472,9 +13472,18 @@ dependencies = [
 name = "photon_terminal"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "db",
  "editor",
  "gpui",
+ "log",
+ "photon_blocks",
+ "picker",
+ "tempfile",
  "terminal",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]
