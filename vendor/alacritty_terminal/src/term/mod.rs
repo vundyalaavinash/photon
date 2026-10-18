@@ -454,6 +454,15 @@ impl<T> Term<T> {
         primary.lines_scrolled_into_history() + i64::from(line.0)
     }
 
+    // photon: how many times the primary grid's history was cleared (reset, CSI 3J, clear).
+    pub fn history_clears(&self) -> u64 {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid.history_clears()
+        } else {
+            self.grid.history_clears()
+        }
+    }
+
     /// Collect the information about the changes in the lines, which
     /// could be used to minimize the amount of drawing operations.
     ///

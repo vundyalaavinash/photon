@@ -141,6 +141,10 @@ pub struct Grid<T> {
     // needs per-row identity. Accepted SP1a limitation.
     #[cfg_attr(feature = "serde", serde(skip))]
     lines_scrolled_into_history: i64,
+
+    // photon: bumped on every history clear so callers can tell absolute numbering restarted.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    history_clears: u64,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -154,12 +158,18 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             lines,
             columns,
             lines_scrolled_into_history: 0,
+            history_clears: 0,
         }
     }
 
     // photon: see `lines_scrolled_into_history`.
     pub fn lines_scrolled_into_history(&self) -> i64 {
         self.lines_scrolled_into_history
+    }
+
+    // photon: see `history_clears`.
+    pub fn history_clears(&self) -> u64 {
+        self.history_clears
     }
 
     /// Update the size of the scrollback history.
@@ -403,6 +413,7 @@ impl<T> Grid<T> {
 
         // photon: absolute numbering restarts when history is cleared.
         self.lines_scrolled_into_history = 0;
+        self.history_clears += 1;
     }
 
     /// This is used only for initializing after loading ref-tests.

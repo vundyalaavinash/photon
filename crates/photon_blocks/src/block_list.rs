@@ -185,12 +185,16 @@ impl BlockList {
         }
     }
 
+    /// Drops finished blocks but keeps the phase, so a command running through
+    /// cmd-K or `clear` still owns the keyboard and a pending prompt still runs.
     pub fn clear(&mut self) {
-        self.blocks.clear();
-        self.pending_command = None;
-        self.command_started = false;
-        if self.phase == Phase::Running {
-            self.phase = Phase::Prompt;
+        self.blocks.retain(|block| block.end_line.is_none());
+        // Clearing restarts absolute numbering with the cursor's line as line 0,
+        // so whatever survives (prompt or running output) now starts there.
+        self.prompt_line = 0;
+        for block in &mut self.blocks {
+            block.prompt_line = 0;
+            block.output_line = Some(0);
         }
     }
 }
@@ -311,6 +315,44 @@ mod tests {
         }
         let commands: Vec<_> = list.blocks().map(|block| block.command.as_str()).collect();
         assert_eq!(commands, ["b", "c"]);
+    }
+
+    #[test]
+    fn clear_keeps_running_block() {
+        let now = Instant::now();
+        let mut list = BlockList::new(10);
+        run(&mut list, "done", 0, now);
+        list.apply(PromptStart, 10, now);
+        list.apply(CommandStart, 10, now);
+        list.apply(text("sleep 9"), 10, now);
+        list.apply(OutputStart, 11, now);
+        list.clear();
+        assert_eq!(list.phase(), &Phase::Running);
+        let blocks: Vec<_> = list.blocks().collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].command, "sleep 9");
+        assert_eq!(blocks[0].output_line, Some(0));
+        assert!(matches!(
+            list.apply(CommandEnd { exit_code: Some(0) }, 2, now),
+            Some(BlockEvent::Finished(_))
+        ));
+    }
+
+    #[test]
+    fn clear_at_prompt_keeps_command_start() {
+        let now = Instant::now();
+        let mut list = BlockList::new(10);
+        run(&mut list, "done", 0, now);
+        list.apply(PromptStart, 10, now);
+        list.apply(CommandStart, 10, now);
+        list.clear();
+        assert_eq!(list.blocks().count(), 0);
+        list.apply(text("ls"), 0, now);
+        assert!(matches!(
+            list.apply(OutputStart, 1, now),
+            Some(BlockEvent::Started(_))
+        ));
+        assert_eq!(list.blocks().next().map(|block| block.prompt_line), Some(0));
     }
 
     #[test]

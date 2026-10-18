@@ -2250,7 +2250,9 @@ impl AgentPanel {
                 | TerminalEvent::OutputReplaced
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
-                | TerminalEvent::Open(_) => {}
+                | TerminalEvent::Open(_)
+                // photon: command blocks are not shown in agent terminals.
+                | TerminalEvent::BlocksChanged(_) => {}
             },
         );
 

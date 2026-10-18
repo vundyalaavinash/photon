@@ -339,8 +339,14 @@ impl From<AlacTermEvent> for TerminalBackendEvent {
             AlacTermEvent::Bell => Self::Bell,
             AlacTermEvent::Exit => Self::Exit,
             AlacTermEvent::ChildExit(status) => Self::ChildExit(status),
-            // photon: handled in Task 4
-            _ => Self::Wakeup,
+            // photon: shell-integration marks feed the block list.
+            AlacTermEvent::ShellIntegration {
+                params,
+                absolute_line,
+            } => Self::ShellIntegration {
+                params,
+                absolute_line,
+            },
         }
     }
 }
@@ -825,6 +831,52 @@ pub(super) fn clear_saved_screen(term: &mut Term<ZedListener>) {
     if (new_cursor.line.0 as usize) < term.screen_lines() - 1 {
         term.grid_mut().reset_region((new_cursor.line + 1)..);
     }
+}
+
+// photon: block-terminal reads of the primary grid, in absolute line numbers.
+pub(super) fn is_alt_screen(term: &Term<ZedListener>) -> bool {
+    term.mode().contains(TermMode::ALT_SCREEN)
+}
+
+pub(super) fn top_absolute_line(term: &Term<ZedListener>) -> i64 {
+    term.absolute_line(Line(-(term.grid().display_offset() as i32)))
+}
+
+pub(super) fn history_clears(term: &Term<ZedListener>) -> u64 {
+    term.history_clears()
+}
+
+/// None on the alternate screen, whose (empty) history says nothing about the primary grid.
+pub(super) fn oldest_absolute_line(term: &Term<ZedListener>) -> Option<i64> {
+    (!is_alt_screen(term)).then(|| term.absolute_line(term.grid().topmost_line()))
+}
+
+/// Text of absolute lines `start..end`, or `start..=cursor line` when `end` is None,
+/// with trailing blank lines trimmed. Evicted lines are skipped.
+pub(super) fn absolute_lines_text(
+    term: &Term<ZedListener>,
+    start: i64,
+    end: Option<i64>,
+) -> Option<String> {
+    if is_alt_screen(term) {
+        return None;
+    }
+    let origin = term.absolute_line(Line(0));
+    let grid = term.grid();
+    let first = Line(i32::try_from(start - origin).ok()?).max(grid.topmost_line());
+    let last = match end {
+        Some(end) => Line(i32::try_from(end - origin - 1).ok()?),
+        None => grid.cursor.point.line,
+    }
+    .min(grid.bottommost_line());
+    if last < first {
+        return Some(String::new());
+    }
+    let text = term.bounds_to_string(
+        AlacPoint::new(first, Column(0)),
+        AlacPoint::new(last, grid.last_column()),
+    );
+    Some(text.trim_end().to_string())
 }
 
 pub(super) fn shrink_to_used(term: &mut Term<ZedListener>) {
