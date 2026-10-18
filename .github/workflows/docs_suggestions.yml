@@ -52,12 +52,15 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+    # photon: upstream-only job; needs zed-industries secrets
     if: |
+      github.repository == 'zed-industries/zed' && (
       (github.event_name == 'pull_request' &&
        github.event.pull_request.merged == true &&
        github.event.pull_request.base.ref == 'main' &&
        github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'workflow_dispatch' && inputs.mode == 'batch')
+      )
 
     steps:
       - name: Checkout repository
@@ -285,7 +288,9 @@ jobs:
     concurrency:
       group: docs-suggestions-${{ github.event.pull_request.number || inputs.pr_number || 'manual' }}
       cancel-in-progress: true
+    # photon: upstream-only job; needs zed-industries secrets
     if: |
+      github.repository == 'zed-industries/zed' && (
       (github.event_name == 'pull_request' &&
        contains(fromJSON('["opened","synchronize"]'), github.event.action) &&
        startsWith(github.event.pull_request.base.ref, 'v0.') &&
@@ -293,6 +298,7 @@ jobs:
        contains(fromJSON('["MEMBER","OWNER"]'),
                 github.event.pull_request.author_association)) ||
       (github.event_name == 'workflow_dispatch' && inputs.mode == 'immediate')
+      )
 
     steps:
       - name: Checkout repository
