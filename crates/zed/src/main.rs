@@ -765,6 +765,7 @@ fn main() {
         });
         vim::init(cx);
         terminal_view::init(cx);
+        photon_terminal::init(cx); // photon: block terminal input and history
         journal::init(app_state.clone(), cx);
         encoding_selector::init(cx);
         language_selector::init(cx);

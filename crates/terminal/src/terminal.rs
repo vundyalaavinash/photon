@@ -6758,7 +6758,8 @@ mod tests {
         terminal.update(cx, |terminal, _| {
             terminal.run_command("ls -la");
             let log = terminal.take_pty_write_log();
-            assert!(log.concat().ends_with(b"\x1b[200~ls -la\x1b[201~\r"));
+            // Ctrl-U first drops any typeahead sitting in zsh's line buffer.
+            assert_eq!(log.concat(), b"\x15\x1b[200~ls -la\x1b[201~\r");
         });
     }
 

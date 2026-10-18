@@ -292,6 +292,7 @@ impl TerminalView {
             focus_out,
             cx.observe(&blink_manager, |_, _, cx| cx.notify()),
             cx.observe_global::<SettingsStore>(Self::settings_changed),
+            Self::redirect_grid_focus_to_block_input(&focus_handle, window, cx), // photon: block input owns prompt keys
         ];
 
         Self {
@@ -1585,9 +1586,9 @@ impl Render for TerminalView {
                                 self.block_below_cursor.clone(),
                                 self.mode.clone(),
                             ))
-                            // photon: the input box sits below the grid at a block prompt.
-                            .when_some(self.visible_block_input(cx), |this, input| {
-                                this.flex().flex_col().child(input)
+                            // photon: the input box's slot sits below the grid while blocks are drawn.
+                            .when_some(self.block_input_slot(cx), |this, slot| {
+                                this.flex().flex_col().child(slot)
                             }),
                     )
                     .when(content_mode.is_scrollable(), |div| {
@@ -3864,7 +3865,7 @@ mod tests {
         });
         cx.run_until_parked();
         let log = terminal.update(&mut cx, |terminal, _| terminal.take_pty_write_log());
-        assert!(log.concat().ends_with(b"\x1b[200~ls\x1b[201~\r"));
+        assert!(log.concat().ends_with(b"\x15\x1b[200~ls\x1b[201~\r"));
     }
 
     #[gpui::test]
@@ -3937,12 +3938,15 @@ mod tests {
         cx.simulate_keystrokes("enter");
         assert_eq!(
             take_pty_writes(&terminal, &mut cx),
-            vec![b"\x1b[200~echo 'a; b'\x1b[201~\r".to_vec()]
+            vec![b"\x15\x1b[200~echo 'a; b'\x1b[201~\r".to_vec()]
         );
         assert_eq!(input_text(&terminal_view, &mut cx), "");
 
         cx.simulate_keystrokes("enter");
-        assert_eq!(take_pty_writes(&terminal, &mut cx), vec![b"\r".to_vec()]);
+        assert_eq!(
+            take_pty_writes(&terminal, &mut cx),
+            vec![b"\x15\r".to_vec()]
+        );
     }
 
     #[gpui::test]
@@ -3956,7 +3960,7 @@ mod tests {
         cx.simulate_keystrokes("enter");
         assert_eq!(
             take_pty_writes(&terminal, &mut cx),
-            vec![b"\x1b[200~for f in a b\ndo echo $f\ndone\x1b[201~\r".to_vec()]
+            vec![b"\x15\x1b[200~for f in a b\ndo echo $f\ndone\x1b[201~\r".to_vec()]
         );
     }
 
@@ -4030,6 +4034,62 @@ mod tests {
         assert_eq!(input_text(&terminal_view, &mut cx), "ls");
         assert!(!grid_focused(&terminal_view, &mut cx));
         assert!(take_pty_writes(&terminal, &mut cx).is_empty());
+    }
+
+    fn grid_rows(terminal: &Entity<Terminal>, cx: &mut VisualTestContext) -> usize {
+        terminal.read_with(cx, |terminal, _| {
+            terminal.last_content.terminal_bounds.num_lines()
+        })
+    }
+
+    #[gpui::test]
+    async fn input_slot_keeps_grid_rows(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        let rows = grid_rows(&terminal, &mut cx);
+        cx.simulate_input("a");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("b");
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(grid_rows(&terminal, &mut cx), rows);
+        feed_block_output(
+            &terminal,
+            b"sleep 5\r\n\x1b]633;E;sleep 5\x07\x1b]133;C\x07",
+            &mut cx,
+        );
+        assert_eq!(grid_rows(&terminal, &mut cx), rows);
+        feed_block_output(
+            &terminal,
+            b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07",
+            &mut cx,
+        );
+        assert_eq!(grid_rows(&terminal, &mut cx), rows);
+    }
+
+    #[gpui::test]
+    async fn grid_keys_at_prompt_go_to_input(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.update(|window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasted".to_string()));
+            let focus_handle = terminal_view.read(cx).focus_handle.clone();
+            focus_handle.focus(window, cx);
+        });
+        cx.run_until_parked();
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_keystrokes("up");
+        cx.simulate_keystrokes("cmd-v");
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
+        assert!(!grid_focused(&terminal_view, &mut cx));
+        assert!(input_text(&terminal_view, &mut cx).ends_with("pasted"));
+    }
+
+    #[gpui::test]
+    async fn copy_in_empty_input_copies_grid_selection(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        terminal.update(&mut cx, |terminal, _| terminal.select_all());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-c");
+        let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert!(copied.is_some_and(|text| text.contains("a.txt")));
     }
 
     #[test]

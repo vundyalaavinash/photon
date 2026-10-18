@@ -374,12 +374,36 @@ impl TerminalView {
         Some(cx.new(|cx| BlockInput::new(terminal, window, cx)))
     }
 
+    /// The input's slot below the grid, kept while blocks are drawn so the grid size does
+    /// not change between commands.
+    pub(crate) fn block_input_slot(&self, cx: &App) -> Option<impl IntoElement + use<>> {
+        let shown = self.block_input.is_some()
+            && !self.read_only
+            && !matches!(self.mode, TerminalMode::Embedded { .. })
+            && active_blocks(self.terminal.read(cx)).is_some();
+        shown.then(|| photon_terminal::input_slot(self.visible_block_input(cx)))
+    }
+
     /// The input box, shown only while the shell waits at a block prompt.
     pub(crate) fn visible_block_input(&self, cx: &App) -> Option<Entity<BlockInput>> {
         let shown = !self.read_only
             && !matches!(self.mode, TerminalMode::Embedded { .. })
             && self.terminal.read(cx).input_target() == InputTarget::BlockInput;
         self.block_input.clone().filter(|_| shown)
+    }
+
+    /// While the input is shown, focus given to the grid (tab switch, pane activation, a
+    /// click) moves on to the input, so keys and pastes never reach zsh's line buffer.
+    pub(crate) fn redirect_grid_focus_to_block_input(
+        focus_handle: &gpui::FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Subscription {
+        cx.on_focus(focus_handle, window, |this, window, cx| {
+            if let Some(input) = this.visible_block_input(cx) {
+                window.focus(&input.focus_handle(cx), cx);
+            }
+        })
     }
 
     pub(crate) fn block_input_focused(&self, window: &Window, cx: &App) -> bool {

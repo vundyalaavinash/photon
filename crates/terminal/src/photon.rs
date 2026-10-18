@@ -139,7 +139,8 @@ impl Terminal {
     pub fn run_command(&mut self, command: &str) {
         // ESC is dropped (as in `paste`) so the text cannot end the paste early.
         let command = command.replace('\x1b', "");
-        self.input(format!("\x1b[200~{command}\x1b[201~\r").into_bytes());
+        // Ctrl-U first clears typeahead left in zsh's line buffer, which the paste would join.
+        self.input(format!("\x15\x1b[200~{command}\x1b[201~\r").into_bytes());
     }
 
     /// Absolute line of the first visible row.

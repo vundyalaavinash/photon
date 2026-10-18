@@ -25,6 +25,30 @@ const LINE_HEIGHT: f32 = 1.2;
 const METADATA_COLOR: u32 = 0x8E8E8E;
 const BORDER_COLOR: u32 = 0x222222;
 const BACKGROUND_COLOR: u32 = 0x0a0a0a;
+const PADDING_TOP: f32 = 10.;
+const PADDING_BOTTOM: f32 = 12.;
+const BORDER_WIDTH: f32 = 1.;
+
+/// App startup hook for Photon terminal state (the command history store lands here).
+pub fn init(_cx: &mut App) {}
+
+/// The space below the grid while blocks are active. It always reserves one input line,
+/// empty while a command runs, so the grid (and the PTY size) never changes as commands
+/// start and finish; extra input lines grow upward over the grid.
+pub fn input_slot(input: Option<Entity<BlockInput>>) -> impl IntoElement {
+    let height = BORDER_WIDTH + PADDING_TOP + FONT_SIZE * LINE_HEIGHT + PADDING_BOTTOM;
+    div()
+        .relative()
+        .flex_none()
+        .w_full()
+        .h(px(height))
+        .border_t_1()
+        .border_color(rgb(BORDER_COLOR))
+        .bg(rgb(BACKGROUND_COLOR))
+        .when_some(input, |this, input| {
+            this.child(div().absolute().left_0().right_0().bottom_0().child(input))
+        })
+}
 
 /// The command line of a block terminal: an editor whose text is sent to the
 /// shell as one command.
@@ -71,6 +95,25 @@ impl BlockInput {
             .update(cx, |editor, cx| editor.insert(text, window, cx));
     }
 
+    /// With nothing selected in the input, copy takes the grid's selection instead.
+    fn copy(&mut self, _: &editor::actions::Copy, _: &mut Window, cx: &mut Context<Self>) {
+        let has_selection = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.has_non_empty_selection(&snapshot)
+        });
+        if has_selection {
+            return;
+        }
+        if let Some(terminal) = self.terminal.upgrade() {
+            // The copy happens on the terminal's next sync, which the view's re-render runs.
+            terminal.update(cx, |terminal, cx| {
+                terminal.copy(None);
+                cx.notify();
+            });
+            cx.stop_propagation();
+        }
+    }
+
     fn run_input(&mut self, _: &RunInput, window: &mut Window, cx: &mut Context<Self>) {
         let Some(terminal) = self.terminal.upgrade() else {
             return;
@@ -78,8 +121,9 @@ impl BlockInput {
         let text = self.text(cx);
         terminal.update(cx, |terminal, _| {
             // An empty paste would be a no-op for zsh; a bare Enter gives a fresh prompt.
+            // Ctrl-U first, as in `run_command`, so typeahead is not run.
             if text.is_empty() {
-                terminal.input(b"\r".as_slice());
+                terminal.input(b"\x15\r".as_slice());
             } else {
                 terminal.run_command(&text);
             }
@@ -165,15 +209,16 @@ impl Render for BlockInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .key_context("PhotonBlockInput")
+            .capture_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::run_input))
             .on_action(cx.listener(Self::history_previous))
             .on_action(cx.listener(Self::history_next))
             .flex()
             .flex_none()
             .gap(px(6.))
-            .pt(px(10.))
+            .pt(px(PADDING_TOP))
             .px(px(14.))
-            .pb(px(12.))
+            .pb(px(PADDING_BOTTOM))
             .border_t_1()
             .border_color(rgb(BORDER_COLOR))
             .bg(rgb(BACKGROUND_COLOR))
