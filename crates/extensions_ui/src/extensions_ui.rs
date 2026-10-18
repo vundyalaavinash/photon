@@ -151,6 +151,9 @@ pub fn init(cx: &mut App) {
 
                         workspace.activate_item(&existing, true, true, window, cx);
                     } else {
+                        // photon: extension updates are checked here instead of at startup.
+                        ExtensionStore::global(cx)
+                            .update(cx, |store, cx| store.check_for_updates(cx));
                         let extensions_page = ExtensionsPage::new(
                             workspace,
                             provides_filter,

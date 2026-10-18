@@ -19,6 +19,8 @@ async fn registry_refresh_times_out_when_fetch_never_completes(cx: &mut TestAppC
 
     let registry_store =
         cx.update(|cx| AgentRegistryStore::init_global(cx, fs.clone(), http_client));
+    // photon: init_global no longer fetches; request the refresh explicitly.
+    registry_store.update(cx, |store, cx| store.refresh(cx));
     cx.run_until_parked();
 
     cx.executor().advance_clock(Duration::from_secs(31));
@@ -99,6 +101,8 @@ async fn registry_refresh_does_not_block_sequentially_on_hung_icon_downloads(
 
     let registry_store =
         cx.update(|cx| AgentRegistryStore::init_global(cx, fs.clone(), http_client));
+    // photon: init_global no longer fetches; request the refresh explicitly.
+    registry_store.update(cx, |store, cx| store.refresh(cx));
     cx.run_until_parked();
 
     cx.executor().advance_clock(Duration::from_secs(11));
@@ -150,6 +154,8 @@ async fn registry_refresh_preserves_optional_binary_checksums(cx: &mut TestAppCo
 
     let registry_store =
         cx.update(|cx| AgentRegistryStore::init_global(cx, fs.clone(), http_client));
+    // photon: init_global no longer fetches; request the refresh explicitly.
+    registry_store.update(cx, |store, cx| store.refresh(cx));
     cx.run_until_parked();
 
     registry_store.read_with(cx, |store, _| {

@@ -879,11 +879,7 @@ fn main() {
 
         cx.activate(true);
 
-        cx.spawn({
-            let client = app_state.client.clone();
-            async move |cx| authenticate(client, cx).await
-        })
-        .detach_and_log_err(cx);
+        // photon: never sign in to zed.dev at startup, even if Zed credentials exist in the keychain.
 
         let urls: Vec<_> = args
             .paths_or_urls
@@ -1371,6 +1367,8 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
     }
 }
 
+// photon: kept (unused) to keep upstream merges small; see the startup hook above.
+#[allow(dead_code)]
 async fn authenticate(client: Arc<Client>, cx: &AsyncApp) -> Result<()> {
     if stdout_is_a_pty() {
         if client::IMPERSONATE_LOGIN.is_some() {

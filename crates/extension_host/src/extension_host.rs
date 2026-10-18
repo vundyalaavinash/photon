@@ -461,13 +461,9 @@ impl ExtensionStore {
             .shared();
         this.initial_index_load = initial_index_load.clone();
 
-        cx.spawn(async move |this, cx| {
-            initial_index_load.await;
-            this.update(cx, |this, cx| this.auto_install_extensions(cx))
-                .ok();
-            this.update(cx, |this, cx| this.check_for_updates(cx)).ok();
-        })
-        .detach();
+        // photon: still drive the index load, but skip auto-install and the update check at
+        // startup; updates are checked when the Extensions page opens.
+        cx.spawn(async move |_, _| initial_index_load.await).detach();
 
         // Perform all extension loading in a single task to ensure that we
         // never attempt to simultaneously load/unload extensions from multiple

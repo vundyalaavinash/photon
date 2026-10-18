@@ -73,7 +73,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action(format!("About {}", paths::APP_NAME), zed_actions::About),
-                MenuItem::action("Check for Updates", auto_update::Check),
+                // photon: no auto-update; "Check for Updates" removed.
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([
                     MenuItem::action("Open Settings", zed_actions::OpenSettings),
