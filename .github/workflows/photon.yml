@@ -1,0 +1,61 @@
+name: Photon
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: photon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: github.event_name != 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build prerequisites
+        run: |
+          brew install cmake cargo-nextest
+          xcodebuild -downloadComponent MetalToolchain || true
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (Photon-touched crates)
+        run: >
+          cargo clippy -p photon_brand -p paths -p release_channel -p cli -p install_cli
+          -p agent_ui -p extension_host -p extensions_ui -p settings -p zed -- -D warnings
+      - name: Tests (Photon-touched crates)
+        run: >
+          cargo nextest run -p photon_brand -p paths -p release_channel -p cli -p install_cli
+          -p agent_ui -p project -p settings -p theme_settings -p zed
+          -E 'package(photon_brand) | package(paths) | package(release_channel) | package(cli)
+          | package(settings) | package(theme_settings) | test(photon)
+          | test(agent_registry) | test(default_agent_is_claude)'
+
+  perf:
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build prerequisites
+        run: |
+          brew install cmake
+          xcodebuild -downloadComponent MetalToolchain || true
+      - name: Build release
+        run: cargo build --release -p zed -p cli
+      - name: Network silence
+        run: script/photon-netcheck
+      - name: Performance (20% threshold on shared runners)
+        run: script/photon-perf --no-build --threshold 20
