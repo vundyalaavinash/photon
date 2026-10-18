@@ -68,13 +68,23 @@ fn new(cx: &App) -> Arc<dyn CredentialsProvider> {
 /// A credentials provider that stores credentials in the system keychain.
 struct KeychainCredentialsProvider;
 
+/// photon: keychain items are keyed only by this server string, so prefix it; otherwise Photon
+/// would read (and prompt for) the API keys and zed.dev login of an installed Zed.
+fn keychain_server(url: &str) -> String {
+    format!("photon+{url}")
+}
+
 impl CredentialsProvider for KeychainCredentialsProvider {
     fn read_credentials<'a>(
         &'a self,
         url: &'a str,
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-        async move { cx.update(|cx| cx.read_credentials(url)).await }.boxed_local()
+        async move {
+            cx.update(|cx| cx.read_credentials(&keychain_server(url)))
+                .await
+        }
+        .boxed_local()
     }
 
     fn write_credentials<'a>(
@@ -85,7 +95,7 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         async move {
-            cx.update(move |cx| cx.write_credentials(url, username, password))
+            cx.update(move |cx| cx.write_credentials(&keychain_server(url), username, password))
                 .await
         }
         .boxed_local()
@@ -96,7 +106,11 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         url: &'a str,
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        async move { cx.update(move |cx| cx.delete_credentials(url)).await }.boxed_local()
+        async move {
+            cx.update(move |cx| cx.delete_credentials(&keychain_server(url)))
+                .await
+        }
+        .boxed_local()
     }
 }
 
@@ -177,5 +191,17 @@ impl CredentialsProvider for DevelopmentCredentialsProvider {
             self.save_credentials(&credentials)
         }
         .boxed_local()
+    }
+}
+
+#[cfg(test)]
+mod photon_tests {
+    use super::*;
+
+    #[test]
+    fn keychain_items_are_namespaced_away_from_zed() {
+        let url = "https://api.anthropic.com";
+        assert_eq!(keychain_server(url), "photon+https://api.anthropic.com");
+        assert_ne!(keychain_server(url), url);
     }
 }

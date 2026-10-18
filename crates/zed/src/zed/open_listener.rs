@@ -4,9 +4,7 @@ use agent_ui::ExternalSourcePrompt;
 use anyhow::{Context as _, Result, anyhow};
 use cli::{CliRequest, CliResponse, CliResponseSink};
 use cli::{IpcHandshake, ipc};
-use client::{ZedLink, parse_zed_link};
-use db::kvp::KeyValueStore;
-use editor::Editor;
+use client::parse_zed_link;
 use fs::Fs;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::channel::{mpsc, oneshot};
@@ -16,8 +14,6 @@ use futures::{FutureExt, StreamExt};
 use git_ui::multi_diff_view::MultiDiffView;
 use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{App, AsyncApp, Global, TaskExt, WindowHandle};
-use onboarding::FIRST_OPEN;
-use onboarding::show_onboarding_view;
 use recent_projects::{RemoteSettings, navigate_to_positions, open_remote_project};
 use remote::{RemoteConnectionOptions, WslConnectionOptions};
 use settings::Settings;
@@ -194,18 +190,9 @@ impl OpenRequest {
                 this.parse_git_commit_url(commit_path)?
             } else if url.starts_with("ssh://") {
                 this.parse_ssh_file_path(&url, cx)?
-            } else if let Some(zed_link) = parse_zed_link(&url, cx) {
-                match zed_link {
-                    ZedLink::Channel { channel_id } => {
-                        this.join_channel = Some(channel_id);
-                    }
-                    ZedLink::ChannelNotes {
-                        channel_id,
-                        heading,
-                    } => {
-                        this.open_channel_notes.push((channel_id, heading));
-                    }
-                }
+            } else if parse_zed_link(&url, cx).is_some() {
+                // photon: channels need a zed.dev sign-in, which Photon never does.
+                log::info!("ignoring Zed channel link: {url}");
             } else {
                 log::error!("unhandled url: {}", url);
             }
@@ -873,24 +860,21 @@ async fn open_workspaces(
         };
 
     if grouped_locations.is_empty() {
-        // If we have no paths to open, show the welcome screen if this is the first launch
-        let kvp = cx.update(|cx| KeyValueStore::global(cx));
-        if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
-            cx.update(|cx| show_onboarding_view(app_state, cx).detach());
-        }
-        // If not the first launch, show an empty window with empty editor
-        else {
-            cx.update(|cx| {
-                let open_options = OpenOptions {
-                    env,
-                    ..Default::default()
-                };
-                workspace::open_new(open_options, app_state, cx, |workspace, window, cx| {
-                    Editor::new_file(workspace, &Default::default(), window, cx)
-                })
-                .detach_and_log_err(cx);
-            });
-        }
+        // photon: no onboarding (Zed sign-in / hosted AI) and no empty file; a new window with no
+        // paths is terminal-first.
+        cx.update(|cx| {
+            let open_options = OpenOptions {
+                env,
+                ..Default::default()
+            };
+            workspace::open_new(
+                open_options,
+                app_state,
+                cx,
+                crate::zed::photon::ensure_center_terminal,
+            )
+            .detach_and_log_err(cx);
+        });
         return Ok(());
     }
     // If there are paths to open, open a workspace for each grouping of paths
@@ -939,7 +923,7 @@ async fn open_workspaces(
                     });
                 }
                 cx.spawn(async move |cx| {
-                    open_remote_project(
+                    let window = open_remote_project(
                         connection,
                         workspace_paths.paths().to_vec(),
                         app_state,
@@ -948,6 +932,10 @@ async fn open_workspaces(
                     )
                     .await
                     .log_err();
+                    // photon: remote projects are terminal-first too.
+                    if let Some(window) = window {
+                        crate::zed::photon::ensure_center_terminal_in(window, cx);
+                    }
                 })
                 .detach();
             }
@@ -1136,7 +1124,14 @@ pub async fn derive_paths_with_position(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zed::{open_listener::open_local_workspace, tests::init_test};
+    use crate::zed::open_listener::open_local_workspace;
+
+    // photon: opening a folder starts a terminal (terminal-first), which spawns a real PTY reader
+    // thread, so these tests must allow activity outside the deterministic scheduler.
+    fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
+        cx.executor().allow_parking();
+        crate::zed::tests::init_test(cx)
+    }
     use cli::CliResponse;
     use editor::Editor;
     use futures::poll;
@@ -1478,6 +1473,27 @@ mod tests {
             workspace::WorkspaceMatching::MatchExact
         );
         assert!(options.add_dirs_to_sidebar);
+    }
+
+    // photon: channel links would connect to zed.dev with the user's Zed login; ignore them.
+    #[gpui::test]
+    fn channel_links_are_ignored(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+        let request = cx.update(|cx| {
+            OpenRequest::parse(
+                RawOpenRequest {
+                    urls: vec![
+                        "zed://channel/some-channel-123".into(),
+                        "zed://channel/some-channel-123/notes".into(),
+                    ],
+                    ..Default::default()
+                },
+                cx,
+            )
+            .unwrap()
+        });
+        assert_eq!(request.join_channel, None);
+        assert!(request.open_channel_notes.is_empty());
     }
 
     #[gpui::test]
@@ -1946,6 +1962,50 @@ mod tests {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
                     let items = workspace.items(cx).collect::<Vec<_>>();
                     assert_eq!(items.len(), 1, "Workspace should have two items");
+                });
+            })
+            .unwrap();
+    }
+
+    // photon: `photon -n` with no paths opens a terminal, never Zed's onboarding or an empty file.
+    #[gpui::test]
+    async fn new_window_without_paths_is_terminal_first(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.spawn({
+            let app_state = app_state.clone();
+            |mut cx| async move {
+                open_workspaces(
+                    Vec::new(),
+                    Vec::new(),
+                    false,
+                    cli::OpenBehavior::AlwaysNew,
+                    &DiscardResponseSink,
+                    false,
+                    false,
+                    app_state,
+                    None,
+                    None,
+                    &mut cx,
+                )
+                .await
+            }
+        })
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(cx.windows().len(), 1);
+        let multi_workspace = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
+        multi_workspace
+            .update(cx, |multi_workspace, _, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    assert!(workspace.active_item_as::<Editor>(cx).is_none());
+                    assert!(
+                        workspace.active_item(cx).is_none_or(|item| item
+                            .downcast::<terminal_view::TerminalView>()
+                            .is_some()),
+                        "expected a terminal (or nothing yet), not onboarding"
+                    );
                 });
             })
             .unwrap();

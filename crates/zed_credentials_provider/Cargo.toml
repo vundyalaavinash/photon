@@ -10,7 +10,7 @@ workspace = true
 
 [lib]
 path = "src/zed_credentials_provider.rs"
-test = false
+test = true # photon: run the keychain namespacing test
 doctest = false
 
 [dependencies]

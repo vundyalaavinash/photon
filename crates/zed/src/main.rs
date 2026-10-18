@@ -1266,7 +1266,12 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
         let base_open_options = zed::open_options_for_request(open_behavior, &location, cx);
         cx.spawn(async move |cx| {
             let paths: Vec<PathBuf> = request.open_paths.into_iter().map(PathBuf::from).collect();
-            open_remote_project(connection_options, paths, app_state, base_open_options, cx).await
+            let window =
+                open_remote_project(connection_options, paths, app_state, base_open_options, cx)
+                    .await?;
+            // photon: remote projects are terminal-first too (the shell runs on the remote host).
+            zed::photon::ensure_center_terminal_in(window, cx);
+            anyhow::Ok(())
         })
         .detach_and_log_err(cx);
         return;
@@ -1467,6 +1472,8 @@ pub(crate) async fn restore_or_create_workspace(
                             cx,
                         )
                         .await;
+                        // photon: remote projects are terminal-first too.
+                        zed::photon::ensure_center_terminal_in(window, cx);
                         Ok::<(), anyhow::Error>(())
                     }
                     .await

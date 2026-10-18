@@ -312,14 +312,9 @@ impl AgentServerStore {
             .get::<AllAgentServersSettings>(None)
             .clone();
 
-        // If we don't have agents from the registry loaded yet, trigger a
-        // refresh, which will cause this function to be called again
+        // photon: no registry fetch on settings change or project open; connecting to a registry
+        // agent refreshes it (agent_servers/src/custom.rs), and the refresh re-runs this function.
         let registry_store = AgentRegistryStore::try_global(cx);
-        if new_settings.has_registry_agents()
-            && let Some(registry) = registry_store.as_ref()
-        {
-            registry.update(cx, |registry, cx| registry.refresh_if_stale(cx));
-        }
 
         let registry_agents_by_id = registry_store
             .as_ref()

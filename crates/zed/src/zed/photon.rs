@@ -1,6 +1,7 @@
 use command_palette_hooks::CommandPaletteFilter;
 use gpui::{App, Context, Window};
 use terminal_view::TerminalView;
+use util::ResultExt as _;
 use workspace::{NewCenterTerminal, Workspace};
 
 /// Hides actions for services Photon keeps switched off (Zed account, collaboration, auto-update).
@@ -27,6 +28,20 @@ pub fn ensure_center_terminal(
     if should_open_center_terminal(workspace, cx) {
         TerminalView::deploy(workspace, &center_terminal_action(), window, cx);
     }
+}
+
+/// [`ensure_center_terminal`] for a window opened asynchronously (e.g. a remote/SSH project).
+pub fn ensure_center_terminal_in(
+    window: gpui::WindowHandle<workspace::MultiWorkspace>,
+    cx: &mut gpui::AsyncApp,
+) {
+    window
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.workspace().update(cx, |workspace, cx| {
+                ensure_center_terminal(workspace, window, cx)
+            })
+        })
+        .log_err();
 }
 
 fn should_open_center_terminal(workspace: &Workspace, cx: &App) -> bool {
@@ -151,5 +166,11 @@ mod tests {
             let path = format!("fonts/hack/Hack-{style}.ttf");
             assert!(fonts.iter().any(|font| font.as_ref() == path), "{path}");
         }
+        // Prompt icons (starship, powerlevel10k) that Hack lacks; the terminal falls back to it.
+        let symbols = "fonts/symbols-nerd-font/SymbolsNerdFontMono-Regular.ttf";
+        assert!(
+            fonts.iter().any(|font| font.as_ref() == symbols),
+            "{symbols}"
+        );
     }
 }

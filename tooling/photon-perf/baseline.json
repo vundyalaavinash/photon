@@ -1,6 +1,6 @@
 {
-  "idle_footprint_mb": 171,
-  "cold_start_ms": 203,
+  "idle_footprint_mb": 125,
+  "cold_start_ms": 185,
   "measured_on": "Apple M1 Max, 32 GB",
   "date": "2026-10-18"
 }

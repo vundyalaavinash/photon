@@ -2053,7 +2053,7 @@
     // photon: Warp's default typography (Hack 13, line height 1.2).
     "font_family": "Hack",
     "font_size": 13,
-    "font_fallbacks": ["Symbols Nerd Font Mono", "Apple Symbols"],
+    "font_fallbacks": ["Symbols Nerd Font Mono", "Apple Symbols"], // photon: Nerd symbols are bundled
     // Whether the terminal panel should open on startup.
     //
     // Default: false

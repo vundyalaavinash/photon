@@ -1656,6 +1656,8 @@ impl AgentPanel {
         // Local settings do not list remote agents, and the remote list may not have loaded yet.
         self.project.read(cx).is_via_remote_server()
             || AllAgentServersSettings::get_global(cx).contains_key(id.0.as_ref())
+            // photon: Claude Code is the default agent even before it appears in user settings.
+            || id.0.as_ref() == agent_servers::CLAUDE_AGENT_ID
     }
 
     fn restorable_agent_selection(&self, cx: &App) -> Agent {
@@ -12622,6 +12624,44 @@ mod tests {
                     id: external_agent_id.clone()
                 },
                 "a restored thread should keep its original agent"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn fresh_local_panel_selects_claude(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let panel = AgentPanel::load(workspace.downgrade(), async_cx)
+            .await
+            .expect("panel load should succeed");
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _cx| {
+            assert_eq!(
+                panel.selected_agent,
+                Agent::Custom {
+                    id: agent_servers::CLAUDE_AGENT_ID.into(),
+                },
+                "a fresh install should open Claude Code, not Zed's hosted agent"
             );
         });
     }

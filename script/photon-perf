@@ -55,6 +55,11 @@ for (( run = 1; run <= runs; run++ )); do
   fi
   sleep 10
   footprint_bytes=$(footprint -p $pid -f bytes | awk '/phys_footprint:/ { print $2; exit }')
+  if [[ ! $footprint_bytes == <-> ]]; then
+    kill $pid 2>/dev/null || true
+    echo "could not read phys_footprint for pid $pid (is the footprint tool available?)" >&2
+    exit 2
+  fi
   kill $pid; wait $pid 2>/dev/null || true
   start_times+=($(( first_frame_ms - launched_ms )))
   footprint_values+=($(( footprint_bytes / 1048576 )))
