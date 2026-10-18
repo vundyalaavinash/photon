@@ -1,0 +1,91 @@
+<h2>Is this the Warp feel you mean?</h2>
+<p class="subtitle">My first guess at Photon's terminal: command blocks on top, Warp's prompt area pinned to the bottom. Click the parts you like most (pick more than one if you want).</p>
+
+<style>
+  .pt { background:#050505; color:#fff; font-family: Hack, Menlo, monospace; font-size:13px; line-height:1.2; border-radius:8px; overflow:hidden; border:1px solid #222; }
+  .pt .blocks { padding:6px 0; }
+  .pt .block { padding:8px 14px; border-left:3px solid transparent; }
+  .pt .block + .block { border-top:1px solid #1a1a1a; }
+  .pt .block.sel { background:#0d1a20; border-left-color:#19AAD8; }
+  .pt .block.err { border-left-color:#FF8272; }
+  .pt .meta { color:#8E8E8E; font-size:11px; margin-bottom:3px; display:flex; gap:10px; }
+  .pt .cmd { color:#fff; font-weight:bold; margin-bottom:4px; }
+  .pt .out { color:#D0D1FE; white-space:pre; }
+  .pt .red { color:#FF8272; } .pt .green { color:#B4FA72; } .pt .dim { color:#8E8E8E; }
+  .pt .input { border-top:1px solid #222; padding:10px 14px 12px; background:#0a0a0a; }
+  .pt .chips { display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap; }
+  .pt .chip { border:1px solid #333; border-radius:4px; padding:2px 7px; font-size:12px; color:#ddd; cursor:pointer; }
+  .pt .chip:hover { border-color:#19AAD8; }
+  .pt .chip.dir { color:#A5D5FE; } .pt .chip.git { color:#B4FA72; }
+  .pt .menu { position:relative; }
+  .pt .dropdown { position:absolute; bottom:28px; left:0; background:#111; border:1px solid #333; border-radius:6px; padding:4px 0; width:230px; z-index:2; }
+  .pt .dropdown div { padding:3px 10px; } .pt .dropdown .on { background:#19AAD8; color:#050505; }
+  .pt .line { display:flex; gap:6px; } .pt .caret { width:2px; background:#19AAD8; height:15px; }
+  .callouts { display:flex; gap:12px; margin-top:12px; flex-wrap:wrap; }
+</style>
+
+<div class="mockup">
+  <div class="mockup-header">Preview: Photon terminal (center of the window)</div>
+  <div class="mockup-body">
+    <div class="pt">
+      <div class="blocks">
+        <div class="block">
+          <div class="meta"><span>~/github/warpspeed</span><span>main</span><span>0.4s</span></div>
+          <div class="cmd">git status</div>
+          <div class="out">On branch main
+nothing to commit, working tree clean</div>
+        </div>
+        <div class="block err">
+          <div class="meta"><span>~/github/warpspeed</span><span>main</span><span class="red">exit 101 · 12.8s</span></div>
+          <div class="cmd">cargo test -p cli</div>
+          <div class="out"><span class="red">error[E0425]</span>: cannot find value `args` in this scope
+  <span class="dim">--&gt; crates/cli/src/main.rs:356:9</span></div>
+        </div>
+        <div class="block sel">
+          <div class="meta"><span>~/github/warpspeed</span><span>photon/blocks</span><span class="green">✓ 1.1s</span><span>· selected (copy, re-run, share with agent)</span></div>
+          <div class="cmd">ls crates | head -3</div>
+          <div class="out">acp_thread
+action_log
+activity_indicator</div>
+        </div>
+      </div>
+      <div class="input">
+        <div class="chips">
+          <span class="chip dir">📁 ~/github/warpspeed ▾</span>
+          <span class="menu"><span class="chip git">⎇ photon/blocks ▾</span>
+            <div class="dropdown">
+              <div class="dim">Switch branch…  (type to filter)</div>
+              <div class="on">photon/blocks</div>
+              <div>main</div>
+              <div>photon/sp0-minors</div>
+              <div class="dim">+ New branch</div>
+            </div>
+          </span>
+          <span class="chip">± 3 changed</span>
+          <span class="chip">⏱ 1.1s</span>
+          <span class="chip">🦀 1.98.1</span>
+        </div>
+        <div class="line"><span class="dim">❯</span><span>cargo build --release</span><span class="caret"></span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="options" data-multiselect>
+  <div class="option" data-choice="blocks" onclick="toggleSelect(this)">
+    <div class="letter">1</div>
+    <div class="content"><h3>Command blocks</h3><p>Each command and its output grouped, with a red edge on failure. Click a block to copy it, re-run it, or hand it to an agent.</p></div>
+  </div>
+  <div class="option" data-choice="dir-chip" onclick="toggleSelect(this)">
+    <div class="letter">2</div>
+    <div class="content"><h3>Folder chip</h3><p>Click to jump to another folder (recent folders, fuzzy search). Runs <code>cd</code> for you.</p></div>
+  </div>
+  <div class="option" data-choice="git-chip" onclick="toggleSelect(this)">
+    <div class="letter">3</div>
+    <div class="content"><h3>Git branch chip</h3><p>Click to switch or create a branch from a list, no typing <code>git checkout</code>.</p></div>
+  </div>
+  <div class="option" data-choice="editor-input" onclick="toggleSelect(this)">
+    <div class="letter">4</div>
+    <div class="content"><h3>Editor-style input</h3><p>The command line is a real text box: mouse to move the cursor, multi-line, select and delete like in an editor.</p></div>
+  </div>
+</div>

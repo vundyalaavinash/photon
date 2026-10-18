@@ -1,0 +1,76 @@
+<h2>Blocks that know what the command did</h2>
+<p class="subtitle">Ideas from Warp/Wave/iTerm2 reviews, Microsoft's new Intelligent Terminal, and agent tools. Each block gets actions that fit its command. Click every idea you'd actually use.</p>
+
+<style>
+  .pt { background:#050505; color:#fff; font-family: Hack, Menlo, monospace; font-size:12.5px; line-height:1.25; border-radius:8px; overflow:hidden; border:1px solid #222; }
+  .pt .block { padding:8px 14px; border-left:3px solid transparent; }
+  .pt .block + .block { border-top:1px solid #1a1a1a; }
+  .pt .block.err { border-left-color:#FF8272; } .pt .block.run { border-left-color:#19AAD8; }
+  .pt .meta { color:#8E8E8E; font-size:11px; margin-bottom:3px; display:flex; gap:10px; }
+  .pt .cmd { font-weight:bold; margin-bottom:4px; }
+  .pt .out { color:#D0D1FE; white-space:pre; }
+  .pt .red { color:#FF8272; } .pt .green { color:#B4FA72; } .pt .dim { color:#8E8E8E; } .pt .blue { color:#A5D5FE; } .pt .yel{color:#FEFDC2}
+  .pt .acts { display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; }
+  .pt .act { border:1px solid #333; border-radius:4px; padding:1px 7px; font-size:11px; color:#ddd; }
+  .pt .act.ai { border-color:#19AAD8; color:#19AAD8; }
+  .pt .link { color:#A5D5FE; text-decoration:underline; }
+  .pt table { border-collapse:collapse; font-size:11.5px; } .pt td, .pt th { padding:1px 10px 1px 0; text-align:left; } .pt th { color:#8E8E8E; font-weight:normal; }
+</style>
+
+<div class="mockup">
+  <div class="mockup-header">Preview: smart blocks</div>
+  <div class="mockup-body">
+    <div class="pt">
+      <div class="block err">
+        <div class="meta"><span>~/warpspeed</span><span>photon/blocks</span><span class="red">exit 101 · 12.8s</span></div>
+        <div class="cmd">cargo test -p cli</div>
+        <div class="out"><span class="red">2 failed</span>, <span class="green">41 passed</span>
+  <span class="red">✗</span> tests::help_names_photon_not_zed   <span class="link">crates/cli/src/main.rs:356</span>
+  <span class="red">✗</span> tests::for_flag_parses           <span class="link">crates/cli/src/main.rs:361</span></div>
+        <div class="acts"><span class="act ai">✦ Fix with Claude</span><span class="act">↻ Re-run failed only</span><span class="act">Open errors in editor</span><span class="act">Δ vs last run</span></div>
+      </div>
+      <div class="block">
+        <div class="meta"><span>~/warpspeed</span><span>photon/blocks</span><span class="green">✓ 0.2s</span></div>
+        <div class="cmd">git status</div>
+        <div class="out"><span class="yel">M</span> crates/cli/src/main.rs        <span class="dim">[stage] [diff] [discard]</span>
+<span class="yel">M</span> assets/settings/default.json  <span class="dim">[stage] [diff] [discard]</span>
+<span class="green">?</span> docs/photon/specs/sp1.md      <span class="dim">[stage]</span></div>
+        <div class="acts"><span class="act">Stage all</span><span class="act ai">✦ Write commit message</span><span class="act">Open in Git panel</span></div>
+      </div>
+      <div class="block run">
+        <div class="meta"><span>~/app</span><span>main</span><span class="blue">● running 4m 12s</span></div>
+        <div class="cmd">npm run dev</div>
+        <div class="out">  ➜  Local:   <span class="link">http://localhost:5173/</span>
+<span class="dim">  3 new lines collapsed · last: page reload src/App.tsx</span></div>
+        <div class="acts"><span class="act">Open localhost:5173</span><span class="act">■ Stop</span><span class="act">Pin to top</span><span class="act">Notify on error</span></div>
+      </div>
+      <div class="block">
+        <div class="meta"><span>~/k8s</span><span>main</span><span class="green">✓ 0.9s</span></div>
+        <div class="cmd">kubectl get pods</div>
+        <div class="out"><table><tr><th>NAME ▾</th><th>STATUS</th><th>RESTARTS</th><th>AGE</th></tr>
+<tr><td>api-7f9c</td><td class="green">Running</td><td>0</td><td>2d</td></tr>
+<tr><td>worker-1b2a</td><td class="red">CrashLoopBackOff</td><td>14</td><td>3h</td></tr></table></div>
+        <div class="acts"><span class="act">Filter rows</span><span class="act">Sort</span><span class="act">Copy as CSV</span><span class="act ai">✦ Why is worker crashing?</span></div>
+      </div>
+      <div class="block" style="border-left-color:#FF8FFD">
+        <div class="meta"><span>~/warpspeed</span><span>photon/blocks</span><span style="color:#FF8FFD">✦ Claude wants to run</span></div>
+        <div class="cmd">git push --force origin photon/blocks</div>
+        <div class="out yel">⚠ Rewrites remote history.</div>
+        <div class="acts"><span class="act">Allow once</span><span class="act">Edit first</span><span class="act">Deny</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="options" data-multiselect>
+  <div class="option" data-choice="fix-failed" onclick="toggleSelect(this)"><div class="letter">A</div><div class="content"><h3>Fix a failed block with your agent</h3><p>One click hands the failure to Claude Code / Devin (your subscription). Fix goes back into the same terminal.</p></div></div>
+  <div class="option" data-choice="test-build" onclick="toggleSelect(this)"><div class="letter">B</div><div class="content"><h3>Test &amp; build blocks</h3><p>Pass/fail summary, clickable <code>file:line</code> (opens in a split), re-run only the failed tests, "what changed vs last run".</p></div></div>
+  <div class="option" data-choice="git-blocks" onclick="toggleSelect(this)"><div class="letter">C</div><div class="content"><h3>Git blocks you can act on</h3><p><code>git status</code> with stage/diff buttons, <code>git log</code> with clickable commits, AI commit message.</p></div></div>
+  <div class="option" data-choice="long-running" onclick="toggleSelect(this)"><div class="letter">D</div><div class="content"><h3>Long-running blocks</h3><p>Dev servers stay a live block: open-URL chip, stop button, collapse noise, pin. Mac notification when a slow command finishes or a server errors.</p></div></div>
+  <div class="option" data-choice="tables-json" onclick="toggleSelect(this)"><div class="letter">E</div><div class="content"><h3>Tables &amp; JSON</h3><p><code>kubectl</code>, <code>ps</code>, <code>docker ps</code> output becomes a sortable/filterable table; JSON gets a fold-able tree.</p></div></div>
+  <div class="option" data-choice="agent-blocks" onclick="toggleSelect(this)"><div class="letter">F</div><div class="content"><h3>Agent commands as blocks</h3><p>Anything an agent runs shows up as a normal block with Allow / Edit / Deny, and risky commands (force push, <code>rm -rf</code>) get a warning.</p></div></div>
+  <div class="option" data-choice="ask-in-english" onclick="toggleSelect(this)"><div class="letter">G</div><div class="content"><h3>Type in plain English</h3><p>Start the line with <code>#</code> ("# undo my last commit but keep changes") and your agent proposes the command for you to run.</p></div></div>
+  <div class="option" data-choice="find-and-history" onclick="toggleSelect(this)"><div class="letter">H</div><div class="content"><h3>Find &amp; history</h3><p>Search inside one block's output, sticky command header while scrolling, history search across all projects (with exit codes and folder).</p></div></div>
+</div>
+
+<p class="subtitle" style="margin-top:14px">Things reviewers hated in Warp that Photon avoids by design: forced sign-in, 1 GB+ memory, AI reading the terminal without asking, interactive programs (<code>top</code>, ssh) breaking blocks. AI here only runs when you click it.</p>
