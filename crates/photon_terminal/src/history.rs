@@ -310,7 +310,7 @@ impl HistoryStore {
     }
 }
 
-fn is_subsequence(needle: &str, haystack: &str) -> bool {
+pub(crate) fn is_subsequence(needle: &str, haystack: &str) -> bool {
     let mut haystack = haystack.chars();
     needle
         .chars()

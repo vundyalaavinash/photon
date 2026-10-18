@@ -4104,6 +4104,82 @@ mod tests {
         assert!(copied.is_some_and(|text| text.contains("a.txt")));
     }
 
+    async fn git(directory: &std::path::Path, args: &[&str]) {
+        let status = util::command::new_command("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .status()
+            .await
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Reports `directory` as the cwd and finishes a block there, which refreshes the chips.
+    async fn finish_block_in(
+        directory: &std::path::Path,
+        terminal: &Entity<Terminal>,
+        cx: &mut VisualTestContext,
+    ) {
+        let bytes = format!(
+            "\x1b]7;file://host{}\x07pwd\r\n\x1b]633;E;pwd\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07",
+            directory.display()
+        );
+        feed_block_output(terminal, bytes.as_bytes(), cx);
+        for _ in 0..20 {
+            cx.executor()
+                .timer(std::time::Duration::from_millis(50))
+                .await;
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    async fn branch_pick_runs_switch(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| editor::init(cx));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path();
+        git(path, &["init", "-b", "main"]).await;
+        git(path, &["config", "user.name", "Test"]).await;
+        git(path, &["config", "user.email", "test@example.com"]).await;
+        git(path, &["commit", "--allow-empty", "-m", "init"]).await;
+        git(path, &["branch", "feature"]).await;
+        finish_block_in(path, &terminal, &mut cx).await;
+        take_pty_writes(&terminal, &mut cx);
+
+        cx.dispatch_action(photon_terminal::ToggleBranchPicker);
+        cx.simulate_input("feature");
+        cx.simulate_keystrokes("enter");
+        let writes = take_pty_writes(&terminal, &mut cx);
+        assert_eq!(
+            writes,
+            vec![b"\x15\x1b[200~git switch -- 'feature'\x1b[201~\r".to_vec()]
+        );
+    }
+
+    #[gpui::test]
+    async fn folder_pick_runs_cd(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| editor::init(cx));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("it's here");
+        std::fs::create_dir(&path).expect("mkdir");
+        finish_block_in(&path, &terminal, &mut cx).await;
+        take_pty_writes(&terminal, &mut cx);
+
+        cx.dispatch_action(photon_terminal::ToggleFolderPicker);
+        cx.simulate_keystrokes("enter");
+        let writes = take_pty_writes(&terminal, &mut cx);
+        let expected = format!(
+            "\x15\x1b[200~cd -- '{}'\x1b[201~\r",
+            path.display().to_string().replace('\'', r"'\''")
+        );
+        assert_eq!(writes, vec![expected.into_bytes()]);
+    }
+
     #[test]
     fn block_duration_format() {
         let format = |millis| photon_blocks_view::format_duration(Duration::from_millis(millis));
