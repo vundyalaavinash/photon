@@ -172,7 +172,7 @@ project (`tooling/photon-perf/sample/`, a few small text files, no language serv
   the first frame, behind the env var `PHOTON_PERF=1`.
 - **Idle memory:** RSS of the app process 10 s after the first frame (`ps -o rss`).
 
-Budgets on the user's M-series Mac: **≤ 150 MB idle, ≤ 300 ms cold start**. Results are written to
+Budgets on the user's M-series Mac: **≤ 200 MB idle physical footprint** (the number Activity Monitor shows; revised from 150 MB RSS on 2026-10-18 after measuring: ~86 MB of it is GPU window buffers that scale with window size, ~62 MB is app heap) **and ≤ 300 ms cold start**. Results are written to
 `tooling/photon-perf/baseline.json`, and a regression of more than 10% against it fails.
 
 **Where it runs.** On every PR it runs locally, as part of the pre-merge checklist. In CI it runs on

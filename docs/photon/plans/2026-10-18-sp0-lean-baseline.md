@@ -18,7 +18,7 @@
 - Dedication text, exactly: `Dedicated to Maha & Bhumi.` It must never appear in `--help`, the README, menus, or settings.
 - Colors (Warp Dark): background `#050505`, foreground `#FFFFFF`, accent `#19AAD8`. ANSI normal `#616161 #FF8272 #B4FA72 #FEFDC2 #A5D5FE #FF8FFD #D0D1FE #F1F1F1`, ANSI bright `#8E8E8E #FFC4BD #D6FCB9 #FEFDD5 #C1E3FE #FFB1FE #E5E6FE #FEFFFF`. Comments use `#8E8E8E`.
 - Typography: Hack, size 13, line height 1.2, weight 400, bar cursor that blinks, in both the terminal and the editor.
-- Performance budgets: ≤ 150 MB RSS when idle, ≤ 300 ms cold start. Locally, fail on a regression of more than 10%. In CI, fail at more than 20%.
+- Performance budgets: ≤ 200 MB idle physical footprint (revised by the user from 150 MB RSS during Task 8), ≤ 300 ms cold start. Locally, fail on a regression of more than 10%. In CI, fail at more than 20%.
 - No outbound connection to anything other than loopback during the 30 s after launch.
 - Photon never reads Zed's `~/.config/zed`, `~/Library/Application Support/Zed`, or Zed's Keychain items.
 - Disk: about 100 GB free. Run `cargo clean -p <crate>` when `target/` goes over 50 GB (`du -sh target`).
@@ -230,11 +230,11 @@
 - `script/photon-perf [--update-baseline] [--threshold 10]`:
   1. Run `cargo build --release -p zed -p cli`.
   2. Run 5 times, each with a fresh `--user-data-dir`: launch with `PHOTON_PERF=1`, read `first-frame` from stderr, wait 10 s, read `ps -o rss= -p <pid>`, and kill the app.
-  3. Report the median of each. Fail with exit 1 if a median is over budget (150 MB, 300 ms) or more than `threshold`% worse than `baseline.json`. `--update-baseline` writes the medians to `baseline.json` instead.
+  3. Report the median of each. Fail with exit 1 if a median is over budget (200 MB footprint, 300 ms) or more than `threshold`% worse than `baseline.json`. `--update-baseline` writes the medians to `baseline.json` instead.
 
 - [ ] **Step 1: Write `photon-netcheck` and run it against a known-bad build.** Temporarily set `auto_update: true` and `telemetry.metrics: true` in a user settings file inside the temporary data dir. Expected: exit 1, listing the update or telemetry hosts. This proves the check can catch problems.
 - [ ] **Step 2: Run netcheck on the real build.** `cargo build --release -p zed && script/photon-netcheck`. Expected: exit 0. For each connection it reports, find what opened it with `log stream --predicate 'process == "zed"'` or by grepping the URL in `crates/`, add a `// photon:` hook in the style of Task 4, and run again until it exits 0.
-- [ ] **Step 3: Add the `PHOTON_PERF` hook and `photon-perf`, then record the baseline.** Run `script/photon-perf --update-baseline`, then `script/photon-perf`. Expected: exit 0, with medians within budget. If idle RSS is over 150 MB, **stop and report the number to the user.** Don't loosen the budget without asking.
+- [ ] **Step 3: Add the `PHOTON_PERF` hook and `photon-perf`, then record the baseline.** Run `script/photon-perf --update-baseline`, then `script/photon-perf`. Expected: exit 0, with medians within budget. If idle memory is over budget, **stop and report the number to the user.** Don't loosen the budget without asking.
 - [ ] **Step 4: Commit.** `git add script/photon-* tooling/photon-perf crates/zed/src/main.rs && git commit -m "photon: netcheck + perf baseline"`
 
 ### Task 9: CI workflow and final verification
