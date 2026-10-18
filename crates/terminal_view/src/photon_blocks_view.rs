@@ -2,14 +2,15 @@ use std::{ops::Range, time::Duration};
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla, KeyDownEvent,
-    Pixels, Point, SharedString, Stateful, TextRun, TextStyle, Window, actions, fill, point, px,
-    rgb, rgba, size,
+    Pixels, Point, SharedString, Stateful, Task, TextRun, TextStyle, Window, actions, fill, point,
+    px, rgb, rgba, size,
 };
 use photon_blocks::{Block, BlockId, BlockList, Phase, VisibleBlock, visible_blocks};
 use photon_terminal::BlockInput;
 use terminal::{BlockPart, InputTarget, Modes, Terminal, TerminalBounds};
 use ui::prelude::*;
 use util::{ResultExt as _, paths::PathExt as _};
+use workspace::searchable::SearchEvent;
 
 use crate::{TerminalMode, TerminalView};
 
@@ -282,6 +283,7 @@ impl TerminalView {
             None => blocks.blocks().next_back().map(|block| block.id),
         };
         self.selected_block = previous;
+        cx.emit(SearchEvent::MatchesInvalidated);
         cx.notify();
     }
 
@@ -297,6 +299,7 @@ impl TerminalView {
                 .nth(1)
                 .map(|block| block.id)
         });
+        cx.emit(SearchEvent::MatchesInvalidated);
         cx.notify();
     }
 
@@ -347,8 +350,31 @@ impl TerminalView {
             .map(|visible| visible.id);
         if clicked != self.selected_block {
             self.selected_block = clicked;
+            cx.emit(SearchEvent::MatchesInvalidated);
             cx.notify();
         }
+    }
+
+    /// Keeps only the matches inside the selected block; all matches when none is selected.
+    pub(crate) fn scope_find_to_selected_block(
+        &self,
+        matches: Task<Vec<terminal::Range>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Vec<terminal::Range>> {
+        let terminal = self.terminal.read(cx);
+        let lines = self
+            .selected_block
+            .and_then(|selected| terminal.block_grid_lines(selected));
+        let Some(lines) = lines else {
+            return matches;
+        };
+        cx.background_spawn(async move {
+            let mut matches = matches.await;
+            matches.retain(|found| {
+                lines.contains(&found.start().line) && lines.contains(&found.end().line)
+            });
+            matches
+        })
     }
 
     /// Drops the selection once its block is trimmed or cleared away.

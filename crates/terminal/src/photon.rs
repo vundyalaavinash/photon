@@ -158,6 +158,20 @@ impl Terminal {
         }
     }
 
+    /// Grid lines from the block's header through its last output line (to the cursor while
+    /// running); history is negative.
+    pub fn block_grid_lines(&self, id: BlockId) -> Option<std::ops::RangeInclusive<i32>> {
+        let block = self.blocks()?.block(id)?;
+        let term = self.term.lock();
+        let origin = term.absolute_line(alacritty_terminal::index::Line(0));
+        let first = i32::try_from(block.prompt_line - origin).ok()?;
+        let last = match block.end_line {
+            Some(end) => i32::try_from(end - origin - 1).ok()?,
+            None => term.grid().cursor.point.line.0,
+        };
+        Some(first..=last)
+    }
+
     pub fn set_block_branch(&mut self, branch: Option<String>) {
         if let Some(blocks) = &mut self.blocks {
             blocks.list.set_branch(branch);

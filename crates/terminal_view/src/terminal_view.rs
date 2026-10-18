@@ -2224,8 +2224,10 @@ impl SearchableItem for TerminalView {
         cx: &mut Context<Self>,
     ) -> Task<Vec<Self::Match>> {
         if let Some(s) = regex_search_for_query(&query) {
-            self.terminal()
-                .update(cx, |term, cx| term.find_matches(s, cx))
+            let matches = self
+                .terminal()
+                .update(cx, |term, cx| term.find_matches(s, cx));
+            self.scope_find_to_selected_block(matches, cx) // photon: find within the selected block
         } else {
             Task::ready(vec![])
         }
@@ -3908,6 +3910,51 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(selected(&terminal_view, &mut cx), None);
+    }
+
+    const NEEDLE_BLOCKS: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]633;E;one\x07\x1b]133;C\x07needle first\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]633;E;two\x07\x1b]133;C\x07needle second\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07";
+
+    async fn needle_matches(
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> usize {
+        let query = Arc::new(
+            SearchQuery::text(
+                "needle",
+                false,
+                false,
+                false,
+                Default::default(),
+                Default::default(),
+                false,
+                None,
+            )
+            .unwrap(),
+        );
+        let task = terminal_view.update_in(cx, |view, window, cx| {
+            SearchableItem::find_matches(view, query, window, cx)
+        });
+        task.await.len()
+    }
+
+    #[gpui::test]
+    async fn find_is_scoped_to_selected_block(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(&terminal, NEEDLE_BLOCKS, &mut cx);
+        let ids = block_ids(&terminal, &mut cx);
+        assert_eq!(ids.len(), 4);
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(selected(&terminal_view, &mut cx), ids.last().copied());
+        assert_eq!(needle_matches(&terminal_view, &mut cx).await, 1);
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(needle_matches(&terminal_view, &mut cx).await, 1);
+    }
+
+    #[gpui::test]
+    async fn find_without_selection_searches_all(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(&terminal, NEEDLE_BLOCKS, &mut cx);
+        assert_eq!(needle_matches(&terminal_view, &mut cx).await, 2);
     }
 
     fn input_text(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> String {
