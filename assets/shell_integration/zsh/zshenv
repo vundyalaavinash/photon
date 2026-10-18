@@ -11,4 +11,10 @@ ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
 [[ -f $ZDOTDIR/.zshenv ]] && source "$ZDOTDIR/.zshenv"
 # The user's .zshenv may relocate ZDOTDIR; later files must come from there.
 PHOTON_USER_ZDOTDIR=$ZDOTDIR
-ZDOTDIR=$PHOTON_ZDOTDIR
+if [[ ! -o interactive && ! -o login ]]; then
+  # Only zshenv runs here, so nothing would hand ZDOTDIR back; don't let children inherit ours.
+  ZDOTDIR=$PHOTON_USER_ZDOTDIR
+  unset PHOTON_BLOCKS PHOTON_USER_ZDOTDIR PHOTON_ZDOTDIR
+else
+  ZDOTDIR=$PHOTON_ZDOTDIR
+fi

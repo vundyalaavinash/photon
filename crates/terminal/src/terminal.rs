@@ -1196,6 +1196,9 @@ impl TerminalBuilder {
             let terminal_title_override =
                 shell_params.as_ref().and_then(|e| e.title_override.clone());
 
+            // photon: clones re-run this hook, so the template must not keep the injection
+            // (the user may have turned blocks off by then).
+            let template_env = env.clone();
             // photon: point zsh at Photon's ZDOTDIR so it emits shell marks.
             let shell_integration = blocks_enabled
                 && task.is_none()
@@ -1374,7 +1377,7 @@ impl TerminalBuilder {
                 activation_script: activation_script.clone(),
                 template: CopyTemplate {
                     shell,
-                    env,
+                    env: template_env,
                     cursor_shape,
                     alternate_scroll,
                     max_scroll_history_lines,
@@ -4395,6 +4398,50 @@ mod tests {
             exit_status.await.is_some(),
             "expected terminal completion after sleep exits"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_clone_template_env_excludes_photon_integration(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let builder = cx
+            .update(|cx| {
+                TerminalBuilder::new(
+                    None,
+                    TerminalMode::interactive(),
+                    task::Shell::Program("/bin/zsh".to_string()),
+                    HashMap::default(),
+                    SettingsCursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    vec![],
+                    Duration::ZERO,
+                    false,
+                    0,
+                    cx,
+                    Vec::new(),
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .unwrap();
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+        terminal.read_with(cx, |terminal, _| {
+            assert!(terminal.shell_integration);
+            assert!(!terminal.template.env.contains_key("PHOTON_BLOCKS"));
+            assert!(!terminal.template.env.contains_key("PHOTON_USER_ZDOTDIR"));
+            assert_ne!(
+                terminal.template.env.get("ZDOTDIR").map(String::as_str),
+                Some(
+                    paths::data_dir()
+                        .join("shell_integration/zsh")
+                        .to_str()
+                        .unwrap_or_default()
+                )
+            );
+        });
     }
 
     // TODO should be tested on Linux too, but does not work there well

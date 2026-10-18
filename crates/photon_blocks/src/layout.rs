@@ -19,7 +19,9 @@ pub fn visible_blocks(
         .filter_map(|block| {
             let first = block.prompt_line - top_absolute_line;
             // A running block has no end yet, so it extends to the screen bottom.
-            let last = block.end_line.map_or(bottom_row, |end| end - top_absolute_line);
+            let last = block
+                .end_line
+                .map_or(bottom_row, |end| end - top_absolute_line);
             if last < 0 || first > bottom_row {
                 return None;
             }

@@ -49,9 +49,7 @@ fn osc_sequences(bytes: &[u8]) -> Vec<Vec<Vec<u8>>> {
     sequences
 }
 
-fn run_zsh(user_zshrc: &str, input: &str) -> (Vec<ShellMark>, String, tempfile::TempDir) {
-    let home = tempfile::tempdir().expect("home");
-    std::fs::write(home.path().join(".zshrc"), user_zshrc).expect("write zshrc");
+fn photon_env(home: &Path) -> (HashMap<String, String>, tempfile::TempDir) {
     let data = tempfile::tempdir().expect("data");
     let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shell_integration/zsh");
     let contents: Vec<(&str, Vec<u8>)> = FILES
@@ -68,13 +66,18 @@ fn run_zsh(user_zshrc: &str, input: &str) -> (Vec<ShellMark>, String, tempfile::
         .map(|(name, bytes)| (*name, bytes.as_slice()))
         .collect();
     let directory = install_zsh_integration(data.path(), &files).expect("install");
-
-    let mut env = HashMap::new();
+    let mut env = HashMap::from([("HOME".to_string(), home.to_string_lossy().into_owned())]);
     assert!(prepare_zsh_env("/bin/zsh", &directory, &mut env));
+    (env, data)
+}
+
+fn run_zsh(user_zshrc: &str, input: &str) -> (Vec<ShellMark>, String, tempfile::TempDir) {
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(home.path().join(".zshrc"), user_zshrc).expect("write zshrc");
+    let (env, _data) = photon_env(home.path());
     let mut child = Command::new("zsh")
         .arg("-i")
         .env_clear()
-        .env("HOME", home.path())
         .env("PATH", "/usr/bin:/bin")
         .envs(&env)
         .stdin(Stdio::piped())
@@ -195,4 +198,24 @@ fn non_zsh_is_untouched() {
     let before = env.clone();
     assert!(!prepare_zsh_env("/bin/bash", Path::new("/x"), &mut env));
     assert_eq!(env, before);
+}
+
+#[test]
+fn non_interactive_zsh_does_not_leak_integration() {
+    if !zsh_available() {
+        return;
+    }
+    let home = tempfile::tempdir().expect("home");
+    let (env, _data) = photon_env(home.path());
+    let output = Command::new("zsh")
+        .args(["-c", "echo ${ZDOTDIR-unset}; echo ${PHOTON_BLOCKS-unset}"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .envs(&env)
+        .output()
+        .expect("zsh -c");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.get(1), Some(&"unset"), "{stdout}");
+    assert_eq!(lines.first().map(Path::new), Some(home.path()), "{stdout}");
 }

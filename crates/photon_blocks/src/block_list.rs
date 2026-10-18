@@ -90,7 +90,10 @@ impl BlockList {
                     self.command_started = true;
                 }
             }
-            ShellMark::CommandText { command, save_to_history } => {
+            ShellMark::CommandText {
+                command,
+                save_to_history,
+            } => {
                 if self.phase == Phase::Prompt {
                     self.pending_command = Some((command, save_to_history));
                 }
@@ -152,7 +155,11 @@ impl BlockList {
     }
 
     pub fn blocks(&self) -> impl DoubleEndedIterator<Item = &Block> {
-        let visible = if matches!(self.phase, Phase::Degraded(_)) { 0 } else { self.blocks.len() };
+        let visible = if matches!(self.phase, Phase::Degraded(_)) {
+            0
+        } else {
+            self.blocks.len()
+        };
         self.blocks.iter().take(visible)
     }
 
@@ -195,7 +202,10 @@ mod tests {
     use std::{path::Path, time::Instant};
 
     fn text(command: &str) -> crate::marks::ShellMark {
-        CommandText { command: command.into(), save_to_history: true }
+        CommandText {
+            command: command.into(),
+            save_to_history: true,
+        }
     }
 
     fn run(list: &mut BlockList, command: &str, line: i64, now: Instant) {
@@ -214,7 +224,10 @@ mod tests {
         list.apply(PromptStart, 0, now);
         list.apply(CommandStart, 0, now);
         list.apply(text("git status"), 0, now);
-        assert!(matches!(list.apply(OutputStart, 1, now), Some(BlockEvent::Started(_))));
+        assert!(matches!(
+            list.apply(OutputStart, 1, now),
+            Some(BlockEvent::Started(_))
+        ));
         assert!(matches!(
             list.apply(CommandEnd { exit_code: Some(0) }, 3, now),
             Some(BlockEvent::Finished(_))

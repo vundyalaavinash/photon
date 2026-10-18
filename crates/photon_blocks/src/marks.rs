@@ -6,8 +6,13 @@ pub enum ShellMark {
     PromptStart,
     CommandStart,
     OutputStart,
-    CommandEnd { exit_code: Option<i32> },
-    CommandText { command: String, save_to_history: bool },
+    CommandEnd {
+        exit_code: Option<i32>,
+    },
+    CommandText {
+        command: String,
+        save_to_history: bool,
+    },
     Cwd(PathBuf),
 }
 
@@ -15,7 +20,11 @@ pub enum ShellMark {
 /// decides which OSC (133, 633 or 7) the mark came from.
 pub fn parse_shell_mark(params: &[Vec<u8>]) -> Option<ShellMark> {
     let first = std::str::from_utf8(params.first()?).ok()?;
-    let field = |index: usize| params.get(index).and_then(|bytes| std::str::from_utf8(bytes).ok());
+    let field = |index: usize| {
+        params
+            .get(index)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    };
     match first {
         "A" => Some(ShellMark::PromptStart),
         "B" => Some(ShellMark::CommandStart),
@@ -80,7 +89,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn parse(fields: &[&str]) -> Option<ShellMark> {
-        let params: Vec<Vec<u8>> = fields.iter().map(|field| field.as_bytes().to_vec()).collect();
+        let params: Vec<Vec<u8>> = fields
+            .iter()
+            .map(|field| field.as_bytes().to_vec())
+            .collect();
         parse_shell_mark(&params)
     }
 
@@ -89,15 +101,29 @@ mod tests {
         assert_eq!(parse(&["A"]), Some(ShellMark::PromptStart));
         assert_eq!(parse(&["B"]), Some(ShellMark::CommandStart));
         assert_eq!(parse(&["C"]), Some(ShellMark::OutputStart));
-        assert_eq!(parse(&["D", "130"]), Some(ShellMark::CommandEnd { exit_code: Some(130) }));
-        assert_eq!(parse(&["D"]), Some(ShellMark::CommandEnd { exit_code: None }));
+        assert_eq!(
+            parse(&["D", "130"]),
+            Some(ShellMark::CommandEnd {
+                exit_code: Some(130)
+            })
+        );
+        assert_eq!(
+            parse(&["D"]),
+            Some(ShellMark::CommandEnd { exit_code: None })
+        );
         assert_eq!(
             parse(&["E", "echo a\\x3bb"]),
-            Some(ShellMark::CommandText { command: "echo a;b".into(), save_to_history: true })
+            Some(ShellMark::CommandText {
+                command: "echo a;b".into(),
+                save_to_history: true
+            })
         );
         assert_eq!(
             parse(&["E", "ls", "nohist"]),
-            Some(ShellMark::CommandText { command: "ls".into(), save_to_history: false })
+            Some(ShellMark::CommandText {
+                command: "ls".into(),
+                save_to_history: false
+            })
         );
         assert_eq!(
             parse(&["file://host/Users/a%20b"]),
@@ -120,7 +146,10 @@ mod tests {
         assert!(escaped.contains("\\x5c"));
         assert_eq!(
             parse(&["E", &escaped]),
-            Some(ShellMark::CommandText { command: command.into(), save_to_history: true })
+            Some(ShellMark::CommandText {
+                command: command.into(),
+                save_to_history: true
+            })
         );
     }
 }
