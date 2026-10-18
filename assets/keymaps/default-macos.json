@@ -1421,7 +1421,7 @@
     },
   },
   {
-    // photon: the block terminal's input box runs on enter, walks history from its first/last line opens history search on ctrl-r, completes on tab and accepts the grey suggestion on right.
+    // photon: the block terminal's input box runs on enter, walks history from its first/last line opens history search on ctrl-r, completes on tab, accepts the grey suggestion on right and clears on ctrl-c.
     "context": "PhotonBlockInput > Editor",
     "use_key_equivalents": true,
     "bindings": {
@@ -1434,6 +1434,7 @@
       "cmd-down": "photon_terminal::SelectNextBlock",
       "tab": "photon_terminal::Complete",
       "right": "photon_terminal::AcceptSuggestion",
+      "ctrl-c": "photon_terminal::Interrupt",
     },
   },
   {

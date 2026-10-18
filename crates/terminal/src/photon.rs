@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{Context, Task};
-use photon_blocks::{BlockEvent, BlockId, BlockList, Phase, parse_shell_mark};
+use photon_blocks::{BlockEvent, BlockId, BlockList, Phase, ShellMark, parse_shell_mark};
 use util::ResultExt as _;
 
 use crate::{
@@ -35,12 +35,30 @@ pub(crate) struct TerminalBlocks {
     no_marks_check: Option<Task<()>>,
     history_clears: u64,
     oldest_line: i64,
+    /// Set once a command is sent, until the shell answers with a prompt (A) or output (C).
+    /// Until then zsh may be at a continuation prompt (an unclosed quote), which only the
+    /// PTY can answer.
+    awaiting_shell: bool,
 }
 
 impl TerminalBlocks {
+    fn new(max_blocks: usize, history_clears: u64) -> Self {
+        Self {
+            list: BlockList::new(max_blocks),
+            no_marks_check: None,
+            history_clears,
+            oldest_line: 0,
+            awaiting_shell: false,
+        }
+    }
+
     /// cmd-K: Zed's clear moves the cursor line to the top even when there was
-    /// no history to clear, so it cannot be detected from the grid alone.
+    /// no history to clear, so it cannot be detected from the grid alone. On the
+    /// alternate screen it clears only that screen, so the blocks stay.
     pub(crate) fn clear(&mut self, term: &AlacrittyTerm) {
+        if is_alt_screen(term) {
+            return;
+        }
         self.list.clear();
         self.sync_with_grid(term);
     }
@@ -71,6 +89,9 @@ impl TerminalBlocks {
     ) -> Option<Option<BlockEvent>> {
         let absolute_line = self.line_after_clears(absolute_line, history_clears);
         let mark = parse_shell_mark(params)?;
+        if matches!(mark, ShellMark::PromptStart | ShellMark::OutputStart) {
+            self.awaiting_shell = false;
+        }
         Some(self.list.apply(mark, absolute_line, Instant::now()))
     }
 
@@ -105,10 +126,8 @@ impl Terminal {
             .log_err();
         });
         self.blocks = Some(TerminalBlocks {
-            list: BlockList::new(MAX_BLOCKS),
             no_marks_check: Some(no_marks_check),
-            history_clears: history_clears(&self.term.lock()),
-            oldest_line: 0,
+            ..TerminalBlocks::new(MAX_BLOCKS, history_clears(&self.term.lock()))
         });
     }
 
@@ -136,7 +155,9 @@ impl Terminal {
     pub fn input_target(&self) -> InputTarget {
         match &self.blocks {
             Some(blocks)
-                if *blocks.list.phase() == Phase::Prompt && !is_alt_screen(&self.term.lock()) =>
+                if *blocks.list.phase() == Phase::Prompt
+                    && !blocks.awaiting_shell
+                    && !is_alt_screen(&self.term.lock()) =>
             {
                 InputTarget::BlockInput
             }
@@ -144,12 +165,21 @@ impl Terminal {
         }
     }
 
-    /// Sends the command as one bracketed paste plus Enter, so multi-line text runs as a single command.
-    pub fn run_command(&mut self, command: &str) {
+    /// Sends the command as one bracketed paste plus Enter, so multi-line text runs as a single
+    /// command. Does nothing unless the shell is waiting at a block prompt, where the text
+    /// would otherwise be typed into a running program or joined to an unfinished command.
+    pub fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        if self.input_target() != InputTarget::BlockInput {
+            return;
+        }
         // ESC is dropped (as in `paste`) so the text cannot end the paste early.
         let command = command.replace('\x1b', "");
         // Ctrl-U first clears typeahead left in zsh's line buffer, which the paste would join.
         self.input(format!("\x15\x1b[200~{command}\x1b[201~\r").into_bytes());
+        if let Some(blocks) = &mut self.blocks {
+            blocks.awaiting_shell = true;
+        }
+        cx.emit(Event::BlocksChanged(None));
     }
 
     /// Absolute line of the first visible row.
@@ -268,12 +298,7 @@ mod tests {
             AlternateScroll::On,
             0,
         );
-        let mut blocks = with_blocks.then(|| TerminalBlocks {
-            list: BlockList::new(MAX_BLOCKS),
-            no_marks_check: None,
-            history_clears: 0,
-            oldest_line: 0,
-        });
+        let mut blocks = with_blocks.then(|| TerminalBlocks::new(MAX_BLOCKS, 0));
         let mut processor = Processor::<StdSyncHandler>::new();
         let started = thread_cpu_time();
         for read in bytes.chunks(READ_SIZE) {
@@ -386,6 +411,110 @@ mod tests {
                 .await;
         }
         content
+    }
+
+    /// Polls the real PTY until `done` holds, or fails after about 5 s.
+    #[cfg(target_os = "macos")]
+    async fn wait_until(
+        terminal: &gpui::Entity<Terminal>,
+        what: &str,
+        cx: &mut gpui::TestAppContext,
+        done: impl Fn(&Terminal) -> bool,
+    ) {
+        for _ in 0..500 {
+            if terminal.read_with(cx, |terminal, _| done(terminal)) {
+                return;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        let content = terminal.read_with(cx, |terminal, _| terminal.get_content());
+        panic!("timed out waiting for {what}:\n{content}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn unclosed_quote_waits_for_shell_until_ctrl_c(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        cx.update_global(|store: &mut settings::SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.terminal.get_or_insert_default().blocks = Some(true);
+            });
+        });
+        // An empty home, so the developer's own zsh config stays out of the test.
+        let home = std::env::temp_dir().join(format!("photon-quote-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("create home");
+        let home_text = home.to_string_lossy().into_owned();
+        let env = collections::HashMap::from_iter([
+            ("HOME".to_string(), home_text.clone()),
+            ("ZDOTDIR".to_string(), home_text),
+        ]);
+        let builder = cx
+            .update(|cx| {
+                crate::TerminalBuilder::new(
+                    None,
+                    crate::TerminalMode::interactive(),
+                    task::Shell::WithArguments {
+                        program: "/bin/zsh".to_string(),
+                        args: vec!["-i".to_string()],
+                        title_override: None,
+                    },
+                    env,
+                    CursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    Vec::new(),
+                    Duration::ZERO,
+                    false,
+                    0,
+                    cx,
+                    Vec::new(),
+                    util::paths::PathStyle::local(),
+                )
+            })
+            .await
+            .expect("spawn zsh");
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+        let at_prompt = |terminal: &Terminal| terminal.input_target() == InputTarget::BlockInput;
+        wait_until(&terminal, "the first prompt", cx, at_prompt).await;
+
+        terminal.update(cx, |terminal, cx| terminal.run_command("echo \"it is", cx));
+        wait_until(&terminal, "the continuation prompt", cx, |terminal| {
+            terminal.get_content().contains("dquote>")
+        })
+        .await;
+        terminal.read_with(cx, |terminal, _| {
+            assert_eq!(terminal.input_target(), InputTarget::Pty)
+        });
+
+        terminal.update(cx, |terminal, _| terminal.input(b"\x03".as_slice()));
+        wait_until(&terminal, "the prompt after ctrl-c", cx, at_prompt).await;
+        terminal.update(cx, |terminal, cx| terminal.run_command("echo SECOND", cx));
+        let finished = |terminal: &Terminal| {
+            terminal.blocks().is_some_and(|blocks| {
+                blocks
+                    .blocks()
+                    .any(|block| block.end_line.is_some() && block.command == "echo SECOND")
+            })
+        };
+        wait_until(&terminal, "the second command", cx, finished).await;
+        terminal.read_with(cx, |terminal, _| {
+            let blocks = terminal.blocks().expect("blocks");
+            let commands: Vec<_> = blocks.blocks().map(|block| block.command.clone()).collect();
+            assert_eq!(commands, ["echo SECOND"]);
+            let id = blocks.blocks().next().map(|block| block.id).expect("block");
+            assert_eq!(
+                terminal.block_text(id, BlockPart::Output).as_deref(),
+                Some("SECOND")
+            );
+        });
+        std::fs::remove_dir_all(&home).log_err();
     }
 
     #[cfg(target_os = "macos")]

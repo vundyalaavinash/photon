@@ -6759,12 +6759,82 @@ mod tests {
     #[gpui::test]
     async fn run_command_uses_bracketed_paste(cx: &mut TestAppContext) {
         let (terminal, cx) = init_block_terminal(cx);
-        terminal.update(cx, |terminal, _| {
-            terminal.run_command("ls -la");
+        feed_pty_output(&terminal, b"\x1b]133;A\x07$ \x1b]133;B\x07", cx);
+        terminal.update(cx, |terminal, cx| {
+            terminal.run_command("ls -la", cx);
             let log = terminal.take_pty_write_log();
             // Ctrl-U first drops any typeahead sitting in zsh's line buffer.
             assert_eq!(log.concat(), b"\x15\x1b[200~ls -la\x1b[201~\r");
         });
+    }
+
+    #[gpui::test]
+    async fn input_waits_for_shell_after_run_command(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        let target = |terminal: &Entity<Terminal>, cx: &mut VisualTestContext| {
+            terminal.read_with(cx, |terminal, _| terminal.input_target())
+        };
+        feed_pty_output(&terminal, b"\x1b]133;A\x07$ \x1b]133;B\x07", cx);
+        assert_eq!(target(&terminal, cx), InputTarget::BlockInput);
+
+        // An unclosed quote: zsh shows its continuation prompt and sends no mark.
+        terminal.update(cx, |terminal, cx| terminal.run_command("echo \"it is", cx));
+        assert_eq!(target(&terminal, cx), InputTarget::Pty);
+        feed_pty_output(&terminal, b"\r\ndquote> ", cx);
+        assert_eq!(target(&terminal, cx), InputTarget::Pty);
+        // While waiting, nothing else is pasted into the continuation line.
+        terminal.update(cx, |terminal, cx| {
+            terminal.take_pty_write_log();
+            terminal.run_command("echo SECOND", cx);
+            assert!(terminal.take_pty_write_log().is_empty());
+        });
+        // ctrl-c there makes zsh print a fresh prompt.
+        feed_pty_output(&terminal, b"\r\n\x1b]133;A\x07\x1b]133;B\x07", cx);
+        assert_eq!(target(&terminal, cx), InputTarget::BlockInput);
+
+        // A normal command hands the keyboard back once its output starts.
+        terminal.update(cx, |terminal, cx| terminal.run_command("sleep 1", cx));
+        assert_eq!(target(&terminal, cx), InputTarget::Pty);
+        feed_pty_output(&terminal, b"\x1b]633;E;sleep 1\x07\x1b]133;C\x07", cx);
+        assert_eq!(target(&terminal, cx), InputTarget::Pty);
+        feed_pty_output(
+            &terminal,
+            b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07",
+            cx,
+        );
+        assert_eq!(target(&terminal, cx), InputTarget::BlockInput);
+    }
+
+    #[gpui::test]
+    async fn clear_on_alt_screen_keeps_blocks(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        feed_pty_output(&terminal, BLOCK_LIFECYCLE, cx);
+        feed_pty_output(
+            &terminal,
+            b"vim\r\n\x1b]633;E;vim\x07\x1b]133;C\x07\x1b[?1049h",
+            cx,
+        );
+        let blocks = |terminal: &Entity<Terminal>, cx: &mut VisualTestContext| {
+            terminal.read_with(cx, |terminal, _| {
+                terminal
+                    .blocks()
+                    .map(|blocks| {
+                        blocks
+                            .blocks()
+                            .map(|block| (block.command.clone(), block.output_line))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+        };
+        let before = blocks(&terminal, cx);
+        assert_eq!(before.len(), 2);
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.clear();
+            terminal.sync(window, cx);
+        });
+        feed_pty_output(&terminal, b"\x1b[?1049l", cx);
+        assert_eq!(blocks(&terminal, cx), before);
     }
 
     #[gpui::test]

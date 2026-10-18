@@ -15,7 +15,7 @@ use gpui::{
     prelude::*, px, relative, rgb,
 };
 use photon_blocks::BlockEvent;
-use terminal::{Event, Terminal};
+use terminal::{Event, InputTarget, Terminal};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -40,6 +40,8 @@ actions!(
         Complete,
         /// Accepts the grey history suggestion, or moves right when there is none.
         AcceptSuggestion,
+        /// Clears the input box; interrupts the shell if it has not answered the last command yet.
+        Interrupt,
     ]
 );
 
@@ -468,18 +470,32 @@ impl BlockInput {
         let Some(terminal) = self.terminal.upgrade() else {
             return;
         };
+        // Already sent: the shell owns the keyboard until it answers, and the text stays put.
+        if terminal.read(cx).input_target() != InputTarget::BlockInput {
+            return;
+        }
         let text = self.text(cx);
-        terminal.update(cx, |terminal, _| {
+        terminal.update(cx, |terminal, cx| {
             // An empty paste would be a no-op for zsh; a bare Enter gives a fresh prompt.
             // Ctrl-U first, as in `run_command`, so typeahead is not run.
             if text.is_empty() {
                 terminal.input(b"\x15\r".as_slice());
             } else {
-                terminal.run_command(&text);
+                terminal.run_command(&text, cx);
             }
         });
         self.history_cursor = None;
         self.set_text("", window, cx);
+    }
+
+    fn interrupt(&mut self, _: &Interrupt, window: &mut Window, cx: &mut Context<Self>) {
+        self.history_cursor = None;
+        self.set_text("", window, cx);
+        if let Some(terminal) = self.terminal.upgrade()
+            && terminal.read(cx).input_target() == InputTarget::Pty
+        {
+            terminal.update(cx, |terminal, _| terminal.input(b"\x03".as_slice()));
+        }
     }
 
     fn history_previous(
@@ -542,6 +558,7 @@ impl Render for BlockInput {
             .key_context("PhotonBlockInput")
             .capture_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::run_input))
+            .on_action(cx.listener(Self::interrupt))
             .on_action(cx.listener(Self::history_previous))
             .on_action(cx.listener(Self::history_next))
             .on_action(cx.listener(Self::search_history))

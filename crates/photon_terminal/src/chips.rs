@@ -307,7 +307,7 @@ impl PickerDelegate for ChipPickerDelegate {
         match action {
             Some(ChipAction::Run(command)) if !command.is_empty() => {
                 self.terminal
-                    .update(cx, |terminal, _| terminal.run_command(&command))
+                    .update(cx, |terminal, cx| terminal.run_command(&command, cx))
                     .log_err();
             }
             Some(ChipAction::OpenFolder(path)) => {

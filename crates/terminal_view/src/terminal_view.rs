@@ -3995,11 +3995,43 @@ mod tests {
         );
         assert_eq!(input_text(&terminal_view, &mut cx), "");
 
+        // The shell's next prompt brings the input back.
+        feed_block_output(&terminal, b"\x1b]133;A\x07\x1b]133;B\x07", &mut cx);
         cx.simulate_keystrokes("enter");
         assert_eq!(
             take_pty_writes(&terminal, &mut cx),
             vec![b"\x15\r".to_vec()]
         );
+    }
+
+    #[gpui::test]
+    async fn keys_go_to_pty_until_shell_answers(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.simulate_input("echo \"it is");
+        cx.simulate_keystrokes("enter");
+        take_pty_writes(&terminal, &mut cx);
+        // zsh is at its continuation prompt; what is typed now answers it.
+        assert!(terminal_view.read_with(&cx, |view, cx| view.visible_block_input(cx).is_none()));
+        assert!(grid_focused(&terminal_view, &mut cx));
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("ctrl-c");
+        assert_eq!(take_pty_writes(&terminal, &mut cx).concat(), b"x\x03");
+        assert_eq!(input_text(&terminal_view, &mut cx), "");
+
+        feed_block_output(&terminal, b"\x1b]133;A\x07\x1b]133;B\x07", &mut cx);
+        assert!(!grid_focused(&terminal_view, &mut cx));
+        assert!(terminal_view.read_with(&cx, |view, cx| view.visible_block_input(cx).is_some()));
+    }
+
+    #[gpui::test]
+    async fn ctrl_c_clears_input(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_input("git sta");
+        cx.simulate_keystrokes("ctrl-c");
+        assert_eq!(input_text(&terminal_view, &mut cx), "");
+        // At a prompt zsh's own line is empty, so there is nothing to interrupt.
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
     }
 
     #[gpui::test]
@@ -4387,6 +4419,33 @@ mod tests {
             writes,
             vec![b"\x15\x1b[200~git switch -- 'feature'\x1b[201~\r".to_vec()]
         );
+    }
+
+    #[gpui::test]
+    async fn branch_pick_waits_for_prompt(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| editor::init(cx));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path();
+        git(path, &["init", "-b", "main"]).await;
+        git(path, &["config", "user.name", "Test"]).await;
+        git(path, &["config", "user.email", "test@example.com"]).await;
+        git(path, &["commit", "--allow-empty", "-m", "init"]).await;
+        git(path, &["branch", "feature"]).await;
+        finish_block_in(path, &terminal, &mut cx).await;
+
+        cx.dispatch_action(photon_terminal::ToggleBranchPicker);
+        cx.simulate_input("feature");
+        // A command started while the picker was open owns the keyboard.
+        feed_block_output(
+            &terminal,
+            b"sleep 5\r\n\x1b]633;E;sleep 5\x07\x1b]133;C\x07",
+            &mut cx,
+        );
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_keystrokes("enter");
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
     }
 
     #[gpui::test]

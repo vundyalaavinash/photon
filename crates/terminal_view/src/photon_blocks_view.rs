@@ -316,12 +316,12 @@ impl TerminalView {
         let Some(selected) = self.selected_block else {
             return;
         };
-        let terminal = self.terminal.read(cx);
-        // While a command runs, the text would be typed into that program instead.
-        if self.read_only || terminal.input_target() != InputTarget::BlockInput {
+        if self.read_only {
             return;
         }
-        let Some(command) = terminal
+        let Some(command) = self
+            .terminal
+            .read(cx)
             .blocks()
             .and_then(|blocks| blocks.block(selected))
             .map(|block| block.command.clone())
@@ -329,7 +329,7 @@ impl TerminalView {
             return;
         };
         self.terminal
-            .update(cx, |terminal, _| terminal.run_command(&command));
+            .update(cx, |terminal, cx| terminal.run_command(&command, cx));
     }
 
     pub(crate) fn select_block_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
