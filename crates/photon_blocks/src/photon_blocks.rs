@@ -6,4 +6,4 @@ mod shell_integration;
 pub use block_list::{Block, BlockEvent, BlockId, BlockList, Phase};
 pub use layout::{VisibleBlock, visible_blocks};
 pub use marks::{ShellMark, escape_command_text, parse_shell_mark};
-pub use shell_integration::{install_zsh_integration, prepare_zsh_env};
+pub use shell_integration::{install_zsh_integration, prepare_zsh_env, zsh_integration_dir};

@@ -8,6 +8,9 @@ license = "GPL-3.0-or-later"
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [lib]
 path = "src/photon_terminal.rs"
 doctest = false
@@ -17,9 +20,13 @@ anyhow.workspace = true
 db.workspace = true
 editor.workspace = true
 gpui.workspace = true
+language.workspace = true
 log.workspace = true
+paths.workspace = true
 photon_blocks.workspace = true
 picker.workspace = true
+project.workspace = true
+smol.workspace = true
 terminal.workspace = true
 ui.workspace = true
 util.workspace = true
@@ -29,3 +36,4 @@ workspace.workspace = true
 db = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+which.workspace = true

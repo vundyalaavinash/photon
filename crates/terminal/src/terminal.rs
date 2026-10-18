@@ -1688,11 +1688,15 @@ const SELECTION_DRAG_THRESHOLD: f64 = 2.0;
 // photon: installs the bundled zsh files under the data dir and returns their directory.
 fn install_photon_zsh_integration() -> Result<PathBuf> {
     use gpui::AssetSource as _;
-    const FILES: [(&str, &str); 4] = [
+    const FILES: [(&str, &str); 5] = [
         (".zshenv", "shell_integration/zsh/zshenv"),
         (".zprofile", "shell_integration/zsh/zprofile"),
         (".zshrc", "shell_integration/zsh/zshrc"),
         (".zlogin", "shell_integration/zsh/zlogin"),
+        (
+            "photon-complete.zsh",
+            "shell_integration/zsh/photon-complete.zsh",
+        ),
     ];
     let mut loaded = Vec::with_capacity(FILES.len());
     for (name, asset_path) in FILES {

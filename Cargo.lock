@@ -13476,13 +13476,18 @@ dependencies = [
  "db",
  "editor",
  "gpui",
+ "language",
  "log",
+ "paths",
  "photon_blocks",
  "picker",
+ "project",
+ "smol",
  "tempfile",
  "terminal",
  "ui",
  "util",
+ "which",
  "workspace",
 ]
 

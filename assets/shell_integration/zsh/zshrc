@@ -1,10 +1,14 @@
 # photon: see zshenv.
 # /etc/zshrc on macOS derives HISTFILE from the ZDOTDIR we pointed at Photon's dir.
 [[ $HISTFILE == $PHOTON_ZDOTDIR/* ]] && HISTFILE=${PHOTON_USER_ZDOTDIR:-$HOME}/${HISTFILE:t}
+# photon: the completion helper's driver skips the user's config; its capture shell loads it.
+[[ $PHOTON_COMPLETER == 1 && -z $PHOTON_COMPLETER_PTY ]] && source $PHOTON_ZDOTDIR/photon-complete.zsh
 ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
 [[ -f $ZDOTDIR/.zshrc ]] && source "$ZDOTDIR/.zshrc"
 
-if [[ $PHOTON_BLOCKS == 1 ]]; then
+if [[ $PHOTON_COMPLETER == 1 ]]; then
+  source $PHOTON_ZDOTDIR/photon-complete.zsh
+elif [[ $PHOTON_BLOCKS == 1 ]]; then
   __photon_capture_status() { __photon_status=$? }
 
   __photon_precmd() {

@@ -54,7 +54,7 @@ impl HistoryEntry {
         })
     }
 
-    fn imported(command: String) -> Self {
+    pub(crate) fn imported(command: String) -> Self {
         Self {
             command,
             cwd: None,
@@ -262,6 +262,13 @@ impl HistoryStore {
     /// Newest first, keeping the newest occurrence of each command.
     pub fn recent(&self, limit: usize) -> Vec<HistoryEntry> {
         self.distinct(self.entries.iter(), limit)
+    }
+
+    /// The grey autosuggestion for `buffer`; see [`crate::history_suggestion`].
+    pub fn suggestion(&self, buffer: &str) -> Option<String> {
+        let (newer, older) = self.entries.as_slices();
+        crate::history_suggestion(buffer, newer)
+            .or_else(|| crate::history_suggestion(buffer, older))
     }
 
     // ponytail: case-insensitive subsequence match in recency order, not scored; swap in

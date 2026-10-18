@@ -4048,6 +4048,113 @@ mod tests {
         assert!(take_pty_writes(&terminal, &mut cx).is_empty());
     }
 
+    #[gpui::test]
+    async fn right_arrow_accepts_suggestion(cx: &mut TestAppContext) {
+        let (_terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let input = terminal_view.read_with(&cx, |view, _| view.block_input.clone().unwrap());
+        cx.simulate_input("git s");
+        assert_eq!(
+            input.read_with(&cx, |input, _| input.suggestion().map(str::to_string)),
+            Some("tatus".to_string())
+        );
+        cx.simulate_keystrokes("right");
+        assert_eq!(input_text(&terminal_view, &mut cx), "git status");
+        assert_eq!(
+            input.read_with(&cx, |input, _| input.suggestion().is_none()),
+            true
+        );
+
+        // Away from the end there is no suggestion, so right just moves the cursor.
+        input.update_in(&mut cx, |input, window, cx| input.set_text("", window, cx));
+        cx.simulate_input("l");
+        cx.simulate_keystrokes("left");
+        assert!(input.read_with(&cx, |input, _| input.suggestion().is_none()));
+        cx.simulate_keystrokes("right");
+        cx.simulate_input("x");
+        assert_eq!(input_text(&terminal_view, &mut cx), "lx");
+    }
+
+    #[gpui::test]
+    async fn tab_inserts_single_completion(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.executor().allow_parking();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("alpha.txt"), "").unwrap();
+        std::fs::create_dir(work.path().join("beta")).unwrap();
+        feed_block_output(
+            &terminal,
+            format!("\x1b]7;file://host{}\x07", work.path().display()).as_bytes(),
+            &mut cx,
+        );
+        let input = terminal_view.read_with(&cx, |view, _| view.block_input.clone().unwrap());
+        // A helper that exits at once falls back to path completion.
+        input.update(&mut cx, |input, _| {
+            input.set_completer_for_test(photon_terminal::ZshCompleter::with_command(
+                "true",
+                &[],
+                Default::default(),
+            ))
+        });
+        cx.simulate_input("cat al");
+        cx.simulate_keystrokes("tab");
+        wait_for_input(&terminal_view, "cat alpha.txt ", &mut cx).await;
+        cx.simulate_input("b");
+        cx.simulate_keystrokes("tab");
+        wait_for_input(&terminal_view, "cat alpha.txt beta/", &mut cx).await;
+    }
+
+    #[gpui::test]
+    async fn tab_with_several_matches_opens_menu(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.executor().allow_parking();
+        let input = terminal_view.read_with(&cx, |view, _| view.block_input.clone().unwrap());
+        input.update(&mut cx, |input, _| {
+            input.set_completer_for_test(photon_terminal::ZshCompleter::with_command(
+                "sh",
+                &[
+                    "-c",
+                    "read request; printf 'alpha\\tfirst\\nalps\\t\\n\\n'; sleep 5",
+                ],
+                Default::default(),
+            ))
+        });
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_input("cat al");
+        cx.simulate_keystrokes("tab");
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if input.read_with(&cx, |input, cx| input.completion_menu_visible(cx)) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert!(input.read_with(&cx, |input, cx| input.completion_menu_visible(cx)));
+        // The menu ranks the closer match, alps, first; down must move in the menu, not history.
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(input_text(&terminal_view, &mut cx), "cat alpha");
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
+    }
+
+    /// The completion helper is a real process, so its answer arrives in real time.
+    async fn wait_for_input(
+        terminal_view: &Entity<TerminalView>,
+        expected: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if input_text(terminal_view, cx) == expected {
+                return;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert_eq!(input_text(terminal_view, cx), expected);
+    }
+
     fn grid_rows(terminal: &Entity<Terminal>, cx: &mut VisualTestContext) -> usize {
         terminal.read_with(cx, |terminal, _| {
             terminal.last_content.terminal_bounds.num_lines()

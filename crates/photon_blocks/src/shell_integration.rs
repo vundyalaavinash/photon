@@ -3,9 +3,13 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 
-/// Writes the bundled zsh files to `<data_dir>/shell_integration/zsh` if missing or changed.
+pub fn zsh_integration_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("shell_integration").join("zsh")
+}
+
+/// Writes the bundled zsh files to [`zsh_integration_dir`] if missing or changed.
 pub fn install_zsh_integration(data_dir: &Path, files: &[(&str, &[u8])]) -> Result<PathBuf> {
-    let directory = data_dir.join("shell_integration").join("zsh");
+    let directory = zsh_integration_dir(data_dir);
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("creating {}", directory.display()))?;
     for (name, contents) in files {

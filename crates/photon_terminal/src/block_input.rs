@@ -1,5 +1,13 @@
-use editor::{Editor, ToPoint as _};
-use std::path::PathBuf;
+use editor::{
+    CompletionProvider, Editor, EditorEvent, Inlay, MultiBufferOffset, SelectionEffects,
+    ToOffset as _, ToPoint as _,
+};
+use language::{Buffer, CodeLabel};
+use project::{
+    CompletionDisplayOptions, CompletionResponse, CompletionSource, InlayId,
+    lsp_store::CompletionDocumentation,
+};
+use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use gpui::{
     Action as _, App, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement as _,
@@ -12,6 +20,7 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 use crate::chips::{ChipPicker, GitInfo, branch_chip_text, folder_chip_text, git_info};
+use crate::completion::{Completion, ZshCompleter, word_start};
 use crate::history::{ClearHistory, HistoryEntry, HistoryPicker, HistoryStore, SearchHistory};
 
 actions!(
@@ -27,6 +36,10 @@ actions!(
         ToggleFolderPicker,
         /// Opens the picker for switching the git branch.
         ToggleBranchPicker,
+        /// Completes the word before the cursor the way zsh would.
+        Complete,
+        /// Accepts the grey history suggestion, or moves right when there is none.
+        AcceptSuggestion,
     ]
 );
 
@@ -45,6 +58,9 @@ const CHIPS_GAP: f32 = 8.;
 const CHIP_BORDER_COLOR: u32 = 0x333333;
 const FOLDER_CHIP_COLOR: u32 = 0xA5D5FE;
 const BRANCH_CHIP_COLOR: u32 = 0xB4FA72;
+// Far above the ids the editor hands out for its own predictions.
+const SUGGESTION_INLAY_ID: usize = usize::MAX;
+const SUGGESTION_INLAY: InlayId = InlayId::EditPrediction(SUGGESTION_INLAY_ID);
 
 /// App startup hook: creates the global command history and registers its actions.
 pub fn init(cx: &mut App) {
@@ -93,7 +109,15 @@ pub struct BlockInput {
     git: Option<GitInfo>,
     /// Replacing this cancels an older, now stale, query.
     git_task: Task<()>,
+    completer: ZshCompleter,
+    /// Set while a Tab is waiting on the helper; further Tabs are ignored until it answers.
+    completion_task: Option<Task<()>>,
+    /// What the editor's completion menu lists: the word's start offset and its candidates.
+    menu_items: Rc<RefCell<Option<(usize, Vec<Completion>)>>>,
+    /// The rest of a history command, shown in grey after the cursor.
+    suggestion: Option<String>,
     _terminal_subscription: Subscription,
+    _editor_subscription: Subscription,
 }
 
 impl BlockInput {
@@ -114,7 +138,22 @@ impl BlockInput {
             });
             editor
         });
+        let menu_items = Rc::default();
+        editor.update(cx, |editor, _| {
+            editor.set_completion_provider(Some(Rc::new(ShellCompletionProvider {
+                items: Rc::clone(&menu_items),
+            })));
+            editor.set_show_completions_on_input(Some(false));
+        });
         let _terminal_subscription = cx.subscribe(&terminal, Self::record_finished_block);
+        let _editor_subscription = cx.subscribe(&editor, |this, _, event, cx| {
+            if matches!(
+                event,
+                EditorEvent::BufferEdited | EditorEvent::SelectionsChanged { .. }
+            ) {
+                this.refresh_suggestion(cx);
+            }
+        });
         let mut this = Self {
             editor,
             terminal: terminal.downgrade(),
@@ -124,7 +163,12 @@ impl BlockInput {
             queried_cwd: None,
             git: None,
             git_task: Task::ready(()),
+            completer: ZshCompleter::new(&photon_blocks::zsh_integration_dir(paths::data_dir())),
+            completion_task: None,
+            menu_items,
+            suggestion: None,
             _terminal_subscription,
+            _editor_subscription,
         };
         this.refresh_git(true, cx);
         this
@@ -240,6 +284,143 @@ impl BlockInput {
                 });
             })
             .log_err();
+    }
+
+    pub fn suggestion(&self) -> Option<&str> {
+        self.suggestion.as_deref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_completer_for_test(&mut self, completer: ZshCompleter) {
+        self.completer = completer;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completion_menu_visible(&self, cx: &App) -> bool {
+        self.editor.read(cx).has_visible_completions_menu()
+    }
+
+    fn text_and_cursor(&self, cx: &App) -> (String, usize) {
+        let editor = self.editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot);
+        (snapshot.text(), cursor.0)
+    }
+
+    fn refresh_suggestion(&mut self, cx: &mut Context<Self>) {
+        let (text, cursor) = self.text_and_cursor(cx);
+        let suggestion = if cursor == text.len() {
+            self.history.read(cx).suggestion(&text)
+        } else {
+            None
+        };
+        if suggestion == self.suggestion {
+            return;
+        }
+        self.suggestion = suggestion.clone();
+        self.editor.update(cx, |editor, cx| {
+            let end = editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_after(MultiBufferOffset(text.len()));
+            let inlays = suggestion
+                .map(|suggestion| Inlay::edit_prediction(SUGGESTION_INLAY_ID, end, suggestion))
+                .into_iter()
+                .collect();
+            editor.splice_inlays(&[SUGGESTION_INLAY], inlays, cx);
+        });
+    }
+
+    fn accept_suggestion(
+        &mut self,
+        _: &AcceptSuggestion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.suggestion.clone() {
+            Some(suggestion) => self.insert(&suggestion, window, cx),
+            // Lets the editor's own binding (cursor right) handle the key.
+            None => cx.propagate(),
+        }
+    }
+
+    fn complete(&mut self, _: &Complete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.completion_task.is_some() {
+            return;
+        }
+        let Some(terminal) = self.terminal.upgrade() else {
+            return;
+        };
+        let cwd = terminal
+            .read(cx)
+            .blocks()
+            .and_then(|blocks| blocks.current_cwd().map(PathBuf::from))
+            .unwrap_or_else(|| util::paths::home_dir().clone());
+        let (text, cursor) = self.text_and_cursor(cx);
+        let Some(before) = text.get(..cursor).map(str::to_string) else {
+            return;
+        };
+        let task = self.completer.complete(&before, &cwd, cx);
+        self.completion_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let completions = task.await;
+            this.update_in(cx, |this, window, cx| {
+                this.completion_task = None;
+                match completions {
+                    Ok(completions) => this.apply_completions(&before, completions, window, cx),
+                    Err(error) => log::error!("tab completion failed: {error:#}"),
+                }
+            })
+            .log_err();
+        }));
+    }
+
+    fn apply_completions(
+        &mut self,
+        before: &str,
+        completions: Vec<Completion>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (text, cursor) = self.text_and_cursor(cx);
+        // Typed or moved while the helper was thinking: the answer is for another word.
+        if text.get(..cursor) != Some(before) {
+            return;
+        }
+        let start = word_start(before);
+        *self.menu_items.borrow_mut() = None;
+        match completions.as_slice() {
+            [] => {}
+            [only] => {
+                let mut insert = only.insert.clone();
+                if !insert.ends_with('/') {
+                    insert.push(' ');
+                }
+                self.editor.update(cx, |editor, cx| {
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_ranges([
+                                MultiBufferOffset(start)..MultiBufferOffset(cursor)
+                            ])
+                        },
+                    );
+                    editor.insert(&insert, window, cx);
+                });
+            }
+            _ => {
+                *self.menu_items.borrow_mut() = Some((start, completions));
+                self.editor.update(cx, |editor, cx| {
+                    editor.show_completions(&editor::actions::ShowCompletions, window, cx)
+                });
+            }
+        }
     }
 
     pub fn text(&self, cx: &App) -> String {
@@ -360,6 +541,8 @@ impl Render for BlockInput {
             .on_action(cx.listener(Self::search_history))
             .on_action(cx.listener(Self::toggle_folder_picker))
             .on_action(cx.listener(Self::toggle_branch_picker))
+            .on_action(cx.listener(Self::complete))
+            .on_action(cx.listener(Self::accept_suggestion))
             .flex()
             .flex_col()
             .flex_none()
@@ -428,4 +611,67 @@ fn chip(
         .hover(|style| style.border_color(rgb(0x19AAD8)))
         .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
         .child(text)
+}
+
+/// Feeds the editor's completion menu with the candidates the last Tab produced.
+struct ShellCompletionProvider {
+    items: Rc<RefCell<Option<(usize, Vec<Completion>)>>>,
+}
+
+impl CompletionProvider for ShellCompletionProvider {
+    fn completions(
+        &self,
+        buffer: &Entity<Buffer>,
+        buffer_position: language::Anchor,
+        _: editor::CompletionContext,
+        _: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> Task<anyhow::Result<Vec<CompletionResponse>>> {
+        let Some((start, items)) = self.items.borrow().clone() else {
+            return Task::ready(Ok(Vec::new()));
+        };
+        let buffer = buffer.read(cx);
+        let start = buffer.anchor_before(start.min(buffer.len()));
+        let completions = items
+            .into_iter()
+            .map(|item| project::Completion {
+                replace_range: start..buffer_position,
+                label: CodeLabel::plain(item.insert.clone(), None),
+                new_text: item.insert,
+                documentation: item
+                    .description
+                    .map(|description| CompletionDocumentation::SingleLine(description.into())),
+                source: CompletionSource::Custom,
+                icon_path: None,
+                icon_color: None,
+                match_start: None,
+                snippet_deduplication_key: None,
+                insert_text_mode: None,
+                confirm: None,
+                group: None,
+            })
+            .collect();
+        Task::ready(Ok(vec![CompletionResponse {
+            completions,
+            display_options: CompletionDisplayOptions::default(),
+            is_incomplete: false,
+        }]))
+    }
+
+    // Typing while the menu is open re-filters the same candidates; with the menu closed
+    // the editor never asks, since completions-on-input is off.
+    fn is_completion_trigger(
+        &self,
+        _: &Entity<Buffer>,
+        _: language::Anchor,
+        _: &str,
+        _: bool,
+        _: &mut Context<Editor>,
+    ) -> bool {
+        self.items.borrow().is_some()
+    }
+
+    fn sort_completions(&self) -> bool {
+        false
+    }
 }
