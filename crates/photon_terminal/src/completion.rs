@@ -1,7 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     time::Duration,
 };
@@ -15,6 +15,9 @@ use util::command::{Child, Stdio, new_command};
 use crate::history::HistoryEntry;
 
 const TIMEOUT: Duration = Duration::from_secs(1);
+// Startup loads the user's whole zsh config, so it gets far longer than a request.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const READY_LINE: &[u8] = b"\x1dready";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Completion {
@@ -30,6 +33,19 @@ struct Helper {
 }
 
 impl Helper {
+    async fn wait_until_ready(&mut self) -> Result<()> {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if self.stdout.read_until(b'\n', &mut line).await? == 0 {
+                bail!("completion helper exited while starting");
+            }
+            if line.trim_ascii_end() == READY_LINE {
+                return Ok(());
+            }
+        }
+    }
+
     async fn request(&mut self, request: &str) -> Result<Vec<Completion>> {
         self.stdin.write_all(request.as_bytes()).await?;
         self.stdin.flush().await?;
@@ -62,8 +78,20 @@ pub struct ZshCompleter {
     program: String,
     args: Vec<String>,
     env: HashMap<String, String>,
-    helper: Rc<RefCell<Option<Helper>>>,
+    state: Rc<RefCell<HelperState>>,
+    /// Waits for the helper's ready line; dropping it kills a helper that is still starting.
+    startup: Task<()>,
     warned: Rc<Cell<bool>>,
+}
+
+#[derive(Default)]
+enum HelperState {
+    #[default]
+    Stopped,
+    Starting,
+    Ready(Helper),
+    /// Taken out by a request in flight.
+    Busy,
 }
 
 impl ZshCompleter {
@@ -86,39 +114,45 @@ impl ZshCompleter {
             program: program.to_string(),
             args: args.iter().map(|arg| arg.to_string()).collect(),
             env,
-            helper: Rc::default(),
+            state: Rc::default(),
+            startup: Task::ready(()),
             warned: Rc::default(),
         }
     }
 
-    /// Completions for the word ending at the end of `buffer`. Never fails: a helper that
-    /// errors or takes over a second is dropped (restarted next time) and paths are offered.
+    /// Completions for the word ending at the end of `buffer`. Never fails. Until the helper
+    /// is ready (it starts on the first call) paths are offered at once; a ready helper that
+    /// errors or takes over a second is dropped, restarted next time, and paths are offered.
     pub fn complete(
         &mut self,
         buffer: &str,
         cwd: &Path,
         cx: &App,
     ) -> Task<Result<Vec<Completion>>> {
+        let buffer = buffer.to_string();
+        let cwd = cwd.to_path_buf();
+        let current = std::mem::replace(&mut *self.state.borrow_mut(), HelperState::Busy);
+        let mut helper = match current {
+            HelperState::Ready(helper) => helper,
+            HelperState::Stopped => {
+                self.start(cx);
+                return paths_task(buffer, cwd, cx);
+            }
+            waiting @ (HelperState::Starting | HelperState::Busy) => {
+                *self.state.borrow_mut() = waiting;
+                return paths_task(buffer, cwd, cx);
+            }
+        };
         let request = format!(
             "{}\t{}\n",
             escape_command_text(&cwd.to_string_lossy()),
-            escape_command_text(buffer)
+            escape_command_text(&buffer)
         );
-        let existing = self.helper.borrow_mut().take();
-        let spawn = existing.is_none().then(|| self.spawn_helper());
-        let slot = self.helper.clone();
+        let state = self.state.clone();
         let warned = self.warned.clone();
         let timer = cx.background_executor().timer(TIMEOUT);
-        let background = cx.background_executor().clone();
-        let buffer = buffer.to_string();
-        let cwd = cwd.to_path_buf();
-        cx.spawn(async move |_| {
+        cx.spawn(async move |cx| {
             let ask = async move {
-                let mut helper = match (existing, spawn) {
-                    (Some(helper), _) => helper,
-                    (None, Some(spawned)) => spawned?,
-                    (None, None) => bail!("no completion helper"),
-                };
                 let completions = helper.request(&request).await?;
                 Ok((helper, completions))
             };
@@ -128,19 +162,53 @@ impl ZshCompleter {
             };
             match smol::future::or(ask, timeout).await {
                 Ok((helper, completions)) => {
-                    *slot.borrow_mut() = Some(helper);
+                    *state.borrow_mut() = HelperState::Ready(helper);
                     Ok(completions)
                 }
                 Err(error) => {
-                    if !warned.replace(true) {
-                        log::warn!("zsh completion failed, completing paths instead: {error:#}");
-                    }
-                    Ok(background
-                        .spawn(async move { path_completions(&buffer, &cwd) })
-                        .await)
+                    *state.borrow_mut() = HelperState::Stopped;
+                    warn_once(&warned, &error);
+                    cx.update(|cx| paths_task(buffer, cwd, cx)).await
                 }
             }
         })
+    }
+
+    fn start(&mut self, cx: &App) {
+        let mut helper = match self.spawn_helper() {
+            Ok(helper) => helper,
+            Err(error) => {
+                *self.state.borrow_mut() = HelperState::Stopped;
+                warn_once(&self.warned, &error);
+                return;
+            }
+        };
+        *self.state.borrow_mut() = HelperState::Starting;
+        let state = self.state.clone();
+        let warned = self.warned.clone();
+        let timer = cx.background_executor().timer(STARTUP_TIMEOUT);
+        self.startup = cx.spawn(async move |_| {
+            let ready = async move {
+                helper.wait_until_ready().await?;
+                Ok(helper)
+            };
+            let timeout = async move {
+                timer.await;
+                Err(anyhow!("not ready within {STARTUP_TIMEOUT:?}"))
+            };
+            *state.borrow_mut() = match smol::future::or(ready, timeout).await {
+                Ok(helper) => HelperState::Ready(helper),
+                Err(error) => {
+                    warn_once(&warned, &error);
+                    HelperState::Stopped
+                }
+            };
+        });
+    }
+
+    #[cfg(test)]
+    fn is_ready(&self) -> bool {
+        matches!(*self.state.borrow(), HelperState::Ready(_))
     }
 
     fn spawn_helper(&self) -> Result<Helper> {
@@ -165,6 +233,17 @@ impl ZshCompleter {
     }
 }
 
+fn warn_once(warned: &Cell<bool>, error: &anyhow::Error) {
+    if !warned.replace(true) {
+        log::warn!("zsh completion unavailable, completing paths instead: {error:#}");
+    }
+}
+
+fn paths_task(buffer: String, cwd: PathBuf, cx: &App) -> Task<Result<Vec<Completion>>> {
+    cx.background_executor()
+        .spawn(async move { Ok(path_completions(&buffer, &cwd)) })
+}
+
 /// Fallback completion: entries of the directory named by the current word.
 pub fn path_completions(buffer: &str, cwd: &Path) -> Vec<Completion> {
     let word = unquote(&buffer[word_start(buffer)..]);
@@ -179,6 +258,11 @@ pub fn path_completions(buffer: &str, cwd: &Path) -> Vec<Completion> {
     } else {
         cwd.join(directory)
     };
+    // The word was unquoted to find the directory, so the inserted text must be re-quoted.
+    let escaped_directory = match directory.strip_prefix("~/") {
+        Some(rest) => format!("~/{}", shell_escape(rest)),
+        None => shell_escape(directory),
+    };
     let Ok(entries) = std::fs::read_dir(&search) else {
         return Vec::new();
     };
@@ -190,7 +274,7 @@ pub fn path_completions(buffer: &str, cwd: &Path) -> Vec<Completion> {
             (visible && name.starts_with(prefix)).then(|| {
                 let slash = if entry.path().is_dir() { "/" } else { "" };
                 Completion {
-                    insert: format!("{}{}{slash}", directory, shell_escape(&name)),
+                    insert: format!("{escaped_directory}{}{slash}", shell_escape(&name)),
                     description: None,
                 }
             })
@@ -213,7 +297,7 @@ pub fn history_suggestion(buffer: &str, recent: &[HistoryEntry]) -> Option<Strin
 }
 
 /// Byte offset where the shell word ending at the end of `text` starts: words split on
-/// whitespace outside quotes and not escaped by a backslash.
+/// whitespace and the operators `|;&()<>`, outside quotes and not escaped by a backslash.
 pub fn word_start(text: &str) -> usize {
     let mut start = 0;
     let mut quote = None;
@@ -228,7 +312,9 @@ pub fn word_start(text: &str) -> usize {
             (Some('\''), _) => {}
             (_, '\\') => escaped = true,
             (None, '\'' | '"') => quote = Some(character),
-            (None, character) if character.is_whitespace() => start = index + character.len_utf8(),
+            (None, character) if character.is_whitespace() || "|;&()<>".contains(character) => {
+                start = index + character.len_utf8()
+            }
             _ => {}
         }
     }
@@ -354,6 +440,23 @@ mod tests {
         completer
     }
 
+    /// The first Tab only starts the helper (and answers with paths); wait for it to be ready.
+    async fn start_and_wait(completer: &mut ZshCompleter, cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("dir");
+        cx.update(|cx| completer.complete("x", directory.path(), cx))
+            .await
+            .expect("completions");
+        for _ in 0..1500 {
+            if completer.is_ready() {
+                return;
+            }
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(10))
+                .await;
+        }
+        panic!("helper never became ready");
+    }
+
     fn inserts(completions: &[Completion]) -> Vec<&str> {
         completions
             .iter()
@@ -372,6 +475,7 @@ mod tests {
             tempfile::tempdir().expect("home"),
         );
         let mut completer = test_completer(data.path(), home.path());
+        start_and_wait(&mut completer, cx).await;
         let completions = cx
             .update(|cx| completer.complete("git che", home.path(), cx))
             .await
@@ -381,10 +485,7 @@ mod tests {
             .find(|completion| completion.insert == "checkout")
             .unwrap_or_else(|| panic!("no checkout in {:?}", inserts(&completions)));
         assert!(checkout.description.is_some());
-        assert!(
-            completer.helper.borrow().is_some(),
-            "helper is kept for the next Tab"
-        );
+        assert!(completer.is_ready(), "helper is kept for the next Tab");
     }
 
     #[gpui::test]
@@ -400,6 +501,7 @@ mod tests {
         let work = tempfile::tempdir().expect("work");
         std::fs::write(work.path().join("alpha.txt"), "").expect("write");
         let mut completer = test_completer(data.path(), home.path());
+        start_and_wait(&mut completer, cx).await;
         let completions = cx
             .update(|cx| completer.complete("cat al", work.path(), cx))
             .await
@@ -426,17 +528,57 @@ mod tests {
         std::fs::write(work.path().join("alpha.txt"), "").expect("write");
         std::fs::create_dir(work.path().join("alps")).expect("mkdir");
         std::fs::write(work.path().join("beta.txt"), "").expect("write");
-        let mut completer = ZshCompleter::with_command("sh", &["-c", "sleep 2"], HashMap::new());
+        let mut completer = ZshCompleter::with_command(
+            "sh",
+            &["-c", r"printf '\035ready\n'; sleep 5"],
+            HashMap::new(),
+        );
+        start_and_wait(&mut completer, cx).await;
         let completions = cx
             .update(|cx| completer.complete("cat al", work.path(), cx))
             .await
             .expect("completions");
         assert_eq!(inserts(&completions), ["alpha.txt", "alps/"]);
-        assert!(
-            completer.helper.borrow().is_none(),
-            "a timed-out helper is restarted"
-        );
+        assert!(!completer.is_ready(), "a timed-out helper is restarted");
         assert!(completer.warned.get());
+    }
+
+    #[gpui::test]
+    async fn starting_helper_does_not_delay_tab(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let work = tempfile::tempdir().expect("work");
+        std::fs::write(work.path().join("alpha.txt"), "").expect("write");
+        let mut completer = ZshCompleter::with_command(
+            "sh",
+            &[
+                "-c",
+                r"sleep 2; printf '\035ready\n'; read request; printf 'from-zsh\t\n\n'; sleep 5",
+            ],
+            HashMap::new(),
+        );
+        let started = std::time::Instant::now();
+        let completions = cx
+            .update(|cx| completer.complete("cat al", work.path(), cx))
+            .await
+            .expect("completions");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(inserts(&completions), ["alpha.txt"]);
+        assert!(!completer.is_ready());
+
+        for _ in 0..500 {
+            if completer.is_ready() {
+                break;
+            }
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(10))
+                .await;
+        }
+        let completions = cx
+            .update(|cx| completer.complete("cat al", work.path(), cx))
+            .await
+            .expect("completions");
+        assert_eq!(inserts(&completions), ["from-zsh"]);
+        assert!(!completer.warned.get(), "a slow start is not a failure");
     }
 
     #[test]
@@ -456,6 +598,17 @@ mod tests {
             inserts(&path_completions("ls src/.h", work.path())),
             ["src/.hidden"]
         );
+        std::fs::write(work.path().join("src/my dir/file.txt"), "").expect("write");
+        assert_eq!(
+            inserts(&path_completions(r"cat src/my\ dir/f", work.path())),
+            [r"src/my\ dir/file.txt"]
+        );
+        assert_eq!(
+            inserts(&path_completions("cat 'src/my dir'/f", work.path())),
+            [r"src/my\ dir/file.txt"]
+        );
+        std::fs::write(work.path().join("grep"), "").expect("write");
+        assert_eq!(inserts(&path_completions("ls x|gr", work.path())), ["grep"]);
     }
 
     #[test]
@@ -466,6 +619,9 @@ mod tests {
         assert_eq!(word_start(r"cat my\ fi"), 4);
         assert_eq!(word_start("echo \"a b\" c"), 11);
         assert_eq!(word_start("ls"), 0);
+        assert_eq!(word_start("ls x|gr"), 5);
+        assert_eq!(word_start("a;b&&c(d)e<f>g"), 13);
+        assert_eq!(word_start("echo 'a|b"), 5);
     }
 
     #[test]

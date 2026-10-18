@@ -7,6 +7,7 @@
 #
 # Request (one line):  <cwd>\t<buffer>, both escaped as \xHH for `\`, `;`, BEL, ESC and newline.
 # Response:            <insert>\t<description> lines, then an empty line.
+# Once the capture shell has loaded, the driver prints \x1dready on a line of its own.
 
 if [[ -z $PHOTON_COMPLETER_PTY ]]; then
   __photon_complete_driver() {
@@ -21,6 +22,8 @@ if [[ -z $PHOTON_COMPLETER_PTY ]]; then
     # could be eaten by the user's startup files.
     local out request line
     zpty -r photon out $'*\x1dready*' || return 1
+    # Tell Photon it can send requests now; until then it completes paths itself.
+    print -r -- $'\x1dready'
     while IFS= read -r request; do
       print -r -- $request >| $PHOTON_COMPLETER_REQUEST
       zpty -w -n photon $'\e[photon-complete~'

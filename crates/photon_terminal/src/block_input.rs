@@ -146,11 +146,17 @@ impl BlockInput {
             editor.set_show_completions_on_input(Some(false));
         });
         let _terminal_subscription = cx.subscribe(&terminal, Self::record_finished_block);
-        let _editor_subscription = cx.subscribe(&editor, |this, _, event, cx| {
+        let _editor_subscription = cx.subscribe(&editor, |this, editor, event, cx| {
             if matches!(
                 event,
                 EditorEvent::BufferEdited | EditorEvent::SelectionsChanged { .. }
             ) {
+                // Candidates are only valid for the word they were fetched for; once their
+                // menu is closed, an edit or a cursor move makes them stale (ctrl-space
+                // would otherwise reopen them over the wrong range).
+                if !editor.read(cx).has_visible_completions_menu() {
+                    this.menu_items.borrow_mut().take();
+                }
                 this.refresh_suggestion(cx);
             }
         });

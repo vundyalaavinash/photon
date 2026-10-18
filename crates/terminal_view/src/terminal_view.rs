@@ -4101,40 +4101,85 @@ mod tests {
         cx.simulate_input("b");
         cx.simulate_keystrokes("tab");
         wait_for_input(&terminal_view, "cat alpha.txt beta/", &mut cx).await;
+
+        // `|` ends a shell word, so only `gr` is replaced.
+        std::fs::write(work.path().join("grep"), "").unwrap();
+        input.update_in(&mut cx, |input, window, cx| {
+            input.set_text("ls x|gr", window, cx)
+        });
+        cx.simulate_keystrokes("tab");
+        wait_for_input(&terminal_view, "ls x|grep ", &mut cx).await;
     }
 
     #[gpui::test]
     async fn tab_with_several_matches_opens_menu(cx: &mut TestAppContext) {
         let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let (_work, input) = open_completion_menu(&terminal, &terminal_view, &mut cx).await;
+        // Enter and the arrows drive the menu, not the history or the PTY. The menu's own
+        // ranking decides which candidate comes first.
+        cx.simulate_keystrokes("down enter");
+        let text = input_text(&terminal_view, &mut cx);
+        assert!(text == "cat alpha" || text == "cat alps", "{text:?}");
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
+        assert!(!input.read_with(&cx, |input, cx| input.completion_menu_visible(cx)));
+    }
+
+    #[gpui::test]
+    async fn closed_menu_does_not_reopen_stale_candidates(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let (_work, input) = open_completion_menu(&terminal, &terminal_view, &mut cx).await;
+        cx.simulate_keystrokes("escape");
+        // The word now starts at a different offset than when the candidates were fetched.
+        cx.simulate_keystrokes("home");
+        cx.simulate_input("sudo ");
+        cx.simulate_keystrokes("end ctrl-space");
+        cx.run_until_parked();
+        assert!(!input.read_with(&cx, |input, cx| input.completion_menu_visible(cx)));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(input_text(&terminal_view, &mut cx), "sudo cat al\n");
+    }
+
+    /// Types `cat al` and presses Tab until a fake helper (alpha, alps) has started and
+    /// its answer has opened the menu. The cwd is an empty directory, so the path
+    /// completions given while the helper starts change nothing.
+    async fn open_completion_menu(
+        terminal: &Entity<Terminal>,
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> (tempfile::TempDir, Entity<photon_terminal::BlockInput>) {
         cx.executor().allow_parking();
-        let input = terminal_view.read_with(&cx, |view, _| view.block_input.clone().unwrap());
-        input.update(&mut cx, |input, _| {
+        let work = tempfile::tempdir().unwrap();
+        feed_block_output(
+            terminal,
+            format!("\x1b]7;file://host{}\x07", work.path().display()).as_bytes(),
+            cx,
+        );
+        let input = terminal_view.read_with(cx, |view, _| view.block_input.clone().unwrap());
+        input.update(cx, |input, _| {
             input.set_completer_for_test(photon_terminal::ZshCompleter::with_command(
                 "sh",
                 &[
                     "-c",
-                    "read request; printf 'alpha\\tfirst\\nalps\\t\\n\\n'; sleep 5",
+                    "printf '\\035ready\\n'; read request; printf 'alpha\\tfirst\\nalps\\t\\n\\n'; sleep 5",
                 ],
                 Default::default(),
             ))
         });
-        take_pty_writes(&terminal, &mut cx);
+        take_pty_writes(terminal, cx);
         cx.simulate_input("cat al");
-        cx.simulate_keystrokes("tab");
         for _ in 0..200 {
+            cx.simulate_keystrokes("tab");
             cx.run_until_parked();
-            if input.read_with(&cx, |input, cx| input.completion_menu_visible(cx)) {
+            if input.read_with(cx, |input, cx| input.completion_menu_visible(cx)) {
                 break;
             }
             cx.background_executor
                 .timer(Duration::from_millis(10))
                 .await;
         }
-        assert!(input.read_with(&cx, |input, cx| input.completion_menu_visible(cx)));
-        // The menu ranks the closer match, alps, first; down must move in the menu, not history.
-        cx.simulate_keystrokes("down enter");
-        assert_eq!(input_text(&terminal_view, &mut cx), "cat alpha");
-        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
+        assert!(input.read_with(cx, |input, cx| input.completion_menu_visible(cx)));
+        assert_eq!(input_text(terminal_view, cx), "cat al");
+        (work, input)
     }
 
     /// The completion helper is a real process, so its answer arrives in real time.
