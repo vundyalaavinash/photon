@@ -73,8 +73,13 @@ pub fn cd_command(path: &Path) -> String {
 }
 
 pub fn switch_command(branch: &str, create: bool) -> String {
-    let create = if create { " -c" } else { "" };
-    format!("git switch{create} -- {}", shell_quote(branch))
+    // `-c` takes the next argument as the new name, so `--` would become the name. A name
+    // starting with `-` is still safe there: git rejects it as an invalid branch name.
+    if create {
+        format!("git switch -c {}", shell_quote(branch))
+    } else {
+        format!("git switch -- {}", shell_quote(branch))
+    }
 }
 
 pub fn folder_chip_text(cwd: &Path) -> String {
@@ -374,7 +379,7 @@ mod tests {
     #[test]
     fn switch_command_variants() {
         assert_eq!(switch_command("main", false), "git switch -- 'main'");
-        assert_eq!(switch_command("feat/x", true), "git switch -c -- 'feat/x'");
+        assert_eq!(switch_command("feat/x", true), "git switch -c 'feat/x'");
         assert_eq!(switch_command("-x; rm", false), "git switch -- '-x; rm'");
     }
 
@@ -439,6 +444,41 @@ mod tests {
             .expect("inside a repo");
         assert!(sha.starts_with(&detached.branch));
         assert_ne!(detached.branch, "HEAD");
+    }
+
+    async fn run_in_shell(directory: &Path, command: &str) {
+        let output = util::command::new_command("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(directory)
+            .output()
+            .await
+            .expect("run sh");
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[gpui::test]
+    async fn switch_commands_work_in_a_real_repo(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path();
+        git(path, &["init", "-b", "main"]).await;
+        git(path, &["config", "user.name", "Test"]).await;
+        git(path, &["config", "user.email", "test@example.com"]).await;
+        git(path, &["commit", "--allow-empty", "-m", "init"]).await;
+
+        run_in_shell(path, &switch_command("feat/new", true)).await;
+        let info = cx.update(|cx| git_info(path, cx)).await.expect("repo");
+        assert_eq!(info.branch, "feat/new");
+        assert!(info.branches.contains(&"feat/new".to_string()));
+
+        run_in_shell(path, &switch_command("main", false)).await;
+        let info = cx.update(|cx| git_info(path, cx)).await.expect("repo");
+        assert_eq!(info.branch, "main");
     }
 
     #[gpui::test]
