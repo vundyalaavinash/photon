@@ -139,7 +139,7 @@ These are the defaults in Warp's `settings_schema.json`, and they match the user
 ### 5.3 Terminal-first layout
 
 - When a workspace opens with no items to restore (for example, `photon .` on a new folder, or the
-  first launch), Photon opens a **terminal in the center pane** (`workspace::NewCenterTerminal { local: true }`,
+  first launch), Photon opens a **terminal in the center pane** (`workspace::NewCenterTerminal { local: false }` so remote projects get a remote shell,
   `workspace.rs:627`). Today Zed opens an empty file (`zed/src/main.rs:1535-1575`). That's one hook.
 - Zed's onboarding view (`main.rs:1556`), which is mostly sign-in and Zed AI setup, is skipped.
 - The bottom terminal dock is still there but its status-bar button is hidden (`terminal.button: false`).
