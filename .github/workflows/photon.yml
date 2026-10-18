@@ -44,9 +44,11 @@ jobs:
           -p photon_blocks -p photon_terminal -p terminal -p terminal_view
           -E 'package(photon_brand) | package(paths) | package(release_channel) | package(cli)
           | package(settings) | package(theme_settings) | package(zed_credentials_provider)
-          | package(photon_blocks) | package(photon_terminal) | package(terminal_view)
+          | package(photon_blocks) | package(photon_terminal) | package(terminal) | package(terminal_view)
           | test(photon) | test(new_window)
           | test(agent_registry) | test(default_agent_is_claude)'
+      - name: Tests (vendored alacritty_terminal marks patch)
+        run: cargo test --manifest-path vendor/alacritty_terminal/Cargo.toml --test photon_marks
 
   perf:
     if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
