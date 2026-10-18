@@ -168,6 +168,9 @@ pub struct TerminalView {
     rename_editor_subscription: Option<Subscription>,
     // photon: the block picked with cmd-up/down or a click.
     selected_block: Option<photon_blocks::BlockId>,
+    // photon: the editor-style command line of a block terminal.
+    block_input: Option<Entity<photon_terminal::BlockInput>>,
+    block_input_shown: bool,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -269,6 +272,7 @@ impl TerminalView {
         let cursor_shape = TerminalSettings::get_global(cx).cursor_shape;
 
         let scroll_handle = TerminalScrollHandle::new(terminal.read(cx));
+        let block_input = Self::new_block_input(&terminal, window, cx); // photon: block input box
 
         let blink_manager = cx.new(|cx| {
             BlinkManager::new(
@@ -319,6 +323,8 @@ impl TerminalView {
             rename_editor: None,
             rename_editor_subscription: None,
             selected_block: None,
+            block_input,
+            block_input_shown: false,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -1064,8 +1070,9 @@ impl TerminalView {
         });
     }
 
-    fn send_text(&mut self, text: &SendText, _: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
+    fn send_text(&mut self, text: &SendText, window: &mut Window, cx: &mut Context<Self>) {
+        // photon: terminal key bindings must not type into the shell behind the input box.
+        if self.read_only || self.block_input_focused(window, cx) {
             return;
         }
         self.clear_bell(cx);
@@ -1075,7 +1082,16 @@ impl TerminalView {
         });
     }
 
-    fn send_keystroke(&mut self, text: &SendKeystroke, _: &mut Window, cx: &mut Context<Self>) {
+    fn send_keystroke(
+        &mut self,
+        text: &SendKeystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // photon: terminal key bindings must not type into the shell behind the input box.
+        if self.block_input_focused(window, cx) {
+            return;
+        }
         if let Some(keystroke) = Keystroke::parse(&text.0).log_err() {
             self.clear_bell(cx);
             self.blink_manager.update(cx, BlinkManager::pause_blinking);
@@ -1232,6 +1248,7 @@ fn subscribe_for_terminal_events(
             match event {
                 Event::Wakeup => {
                     terminal_view.sync_selected_block(cx); // photon: trims and clears drop blocks
+                    terminal_view.sync_block_input_focus(window, cx); // photon: alt screen hides the input
                     cx.notify();
                     window.invalidate_character_coordinates();
                     cx.emit(Event::Wakeup);
@@ -1344,6 +1361,7 @@ fn subscribe_for_terminal_events(
                 // photon: block chrome follows the block list.
                 Event::BlocksChanged(_) => {
                     terminal_view.sync_selected_block(cx);
+                    terminal_view.sync_block_input_focus(window, cx);
                     cx.notify();
                 }
                 Event::SelectionsChanged => {
@@ -1408,6 +1426,10 @@ impl TerminalView {
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
+        // photon: keys typed at a block prompt belong to the input box.
+        if self.block_input_key_down(event, window, cx) {
+            return;
+        }
 
         if event.prefer_character_input
             && event.keystroke.key_char.is_some()
@@ -1562,7 +1584,11 @@ impl Render for TerminalView {
                                 self.should_show_cursor(focused, cx),
                                 self.block_below_cursor.clone(),
                                 self.mode.clone(),
-                            )),
+                            ))
+                            // photon: the input box sits below the grid at a block prompt.
+                            .when_some(self.visible_block_input(cx), |this, input| {
+                                this.flex().flex_col().child(input)
+                            }),
                     )
                     .when(content_mode.is_scrollable(), |div| {
                         let colors = cx.theme().colors();
@@ -3881,6 +3907,129 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(selected(&terminal_view, &mut cx), None);
+    }
+
+    fn input_text(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> String {
+        terminal_view.read_with(cx, |view, cx| {
+            view.block_input
+                .as_ref()
+                .map(|input| input.read(cx).text(cx))
+                .unwrap_or_default()
+        })
+    }
+
+    fn take_pty_writes(terminal: &Entity<Terminal>, cx: &mut VisualTestContext) -> Vec<Vec<u8>> {
+        terminal.update(cx, |terminal, _| terminal.take_pty_write_log())
+    }
+
+    fn grid_focused(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> bool {
+        cx.update(|window, cx| terminal_view.read(cx).focus_handle.is_focused(window))
+    }
+
+    #[gpui::test]
+    async fn enter_runs_and_clears(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_input("echo 'a; b'");
+        assert_eq!(input_text(&terminal_view, &mut cx), "echo 'a; b'");
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
+
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            take_pty_writes(&terminal, &mut cx),
+            vec![b"\x1b[200~echo 'a; b'\x1b[201~\r".to_vec()]
+        );
+        assert_eq!(input_text(&terminal_view, &mut cx), "");
+
+        cx.simulate_keystrokes("enter");
+        assert_eq!(take_pty_writes(&terminal, &mut cx), vec![b"\r".to_vec()]);
+    }
+
+    #[gpui::test]
+    async fn multiline_command_is_sent_as_one_paste(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        take_pty_writes(&terminal, &mut cx);
+        let input = terminal_view.read_with(&cx, |view, _| view.block_input.clone().unwrap());
+        input.update_in(&mut cx, |input, window, cx| {
+            input.set_text("for f in a b\ndo echo $f\ndone", window, cx)
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            take_pty_writes(&terminal, &mut cx),
+            vec![b"\x1b[200~for f in a b\ndo echo $f\ndone\x1b[201~\r".to_vec()]
+        );
+    }
+
+    #[gpui::test]
+    async fn shift_enter_inserts_newline(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_input("a");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("b");
+        assert_eq!(input_text(&terminal_view, &mut cx), "a\nb");
+        // Off the first line, up moves the cursor instead of walking history.
+        cx.simulate_keystrokes("up");
+        assert_eq!(input_text(&terminal_view, &mut cx), "a\nb");
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn up_on_first_line_walks_history(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.simulate_input("pwd");
+        cx.simulate_keystrokes("enter");
+        feed_block_output(
+            &terminal,
+            b"pwd\r\n\x1b]633;E;pwd\x07\x1b]133;C\x07/tmp\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07",
+            &mut cx,
+        );
+        cx.simulate_keystrokes("up");
+        assert_eq!(input_text(&terminal_view, &mut cx), "pwd");
+        cx.simulate_keystrokes("up");
+        assert_eq!(input_text(&terminal_view, &mut cx), "ls");
+        cx.simulate_keystrokes("down");
+        assert_eq!(input_text(&terminal_view, &mut cx), "pwd");
+        cx.simulate_keystrokes("down");
+        assert_eq!(input_text(&terminal_view, &mut cx), "");
+    }
+
+    #[gpui::test]
+    async fn input_hidden_while_running(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        assert!(!grid_focused(&terminal_view, &mut cx));
+        feed_block_output(
+            &terminal,
+            b"sleep 5\r\n\x1b]633;E;sleep 5\x07\x1b]133;C\x07",
+            &mut cx,
+        );
+        assert!(grid_focused(&terminal_view, &mut cx));
+        assert!(terminal_view.read_with(&cx, |view, cx| view.visible_block_input(cx).is_none()));
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_input("y");
+        assert_eq!(take_pty_writes(&terminal, &mut cx).concat(), b"y");
+
+        feed_block_output(
+            &terminal,
+            b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07",
+            &mut cx,
+        );
+        assert!(!grid_focused(&terminal_view, &mut cx));
+        assert!(terminal_view.read_with(&cx, |view, cx| view.visible_block_input(cx).is_some()));
+    }
+
+    #[gpui::test]
+    async fn typing_on_grid_at_prompt_goes_to_input(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.update(|window, cx| {
+            let focus_handle = terminal_view.read(cx).focus_handle.clone();
+            focus_handle.focus(window, cx);
+        });
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_input("ls");
+        assert_eq!(input_text(&terminal_view, &mut cx), "ls");
+        assert!(!grid_focused(&terminal_view, &mut cx));
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
     }
 
     #[test]

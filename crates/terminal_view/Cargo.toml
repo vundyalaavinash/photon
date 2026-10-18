@@ -30,6 +30,7 @@ language.workspace = true
 log.workspace = true
 menu.workspace = true
 photon_blocks.workspace = true # photon: command block chrome
+photon_terminal.workspace = true # photon: editor-style input box
 project.workspace = true
 regex.workspace = true
 schemars.workspace = true

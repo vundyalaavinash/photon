@@ -60,8 +60,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             self.scroll_up(&(Line(0)..Line(target as i32)), delta);
         }
 
-        // photon: lines pulled back out of history are no longer scrolled away.
-        self.lines_scrolled_into_history -= from_history as i64;
+        // photon: lines pulled back out of history are no longer scrolled away, and the
+        // scroll above only makes room at the bottom (its scrollback is taken back below).
+        self.lines_scrolled_into_history -= lines_added as i64;
 
         // Move cursor down for every line pulled from history.
         self.saved_cursor.point.line += from_history;

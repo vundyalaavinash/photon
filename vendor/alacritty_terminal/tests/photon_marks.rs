@@ -86,3 +86,10 @@ fn absolute_line_is_stable_across_row_shrink_and_grow() {
     assert_eq!(marks.len(), 2);
     assert_eq!(marks[0].1, marks[1].1);
 }
+
+#[test]
+fn absolute_line_is_stable_when_growing_without_history() {
+    let marks = feed_with_resize(100, 10, &["a\r\nb\r\n\x1b]133;A\x07"], 13);
+    assert_eq!(marks.len(), 2);
+    assert_eq!(marks[0].1, marks[1].1);
+}

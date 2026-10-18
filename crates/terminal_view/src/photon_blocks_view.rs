@@ -1,15 +1,17 @@
 use std::{ops::Range, time::Duration};
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, FontWeight, Hsla, Pixels, Point, SharedString, Stateful,
-    TextRun, TextStyle, Window, actions, fill, point, px, rgb, rgba, size,
+    App, Bounds, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla, KeyDownEvent,
+    Pixels, Point, SharedString, Stateful, TextRun, TextStyle, Window, actions, fill, point, px,
+    rgb, rgba, size,
 };
 use photon_blocks::{Block, BlockId, BlockList, Phase, VisibleBlock, visible_blocks};
+use photon_terminal::BlockInput;
 use terminal::{BlockPart, InputTarget, Modes, Terminal, TerminalBounds};
 use ui::prelude::*;
 use util::{ResultExt as _, paths::PathExt as _};
 
-use crate::TerminalView;
+use crate::{TerminalMode, TerminalView};
 
 actions!(
     photon_terminal,
@@ -358,5 +360,79 @@ impl TerminalView {
         {
             self.selected_block = None;
         }
+    }
+}
+
+impl TerminalView {
+    pub(crate) fn new_block_input(
+        terminal: &Entity<Terminal>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<BlockInput>> {
+        terminal.read(cx).blocks()?;
+        let terminal = terminal.clone();
+        Some(cx.new(|cx| BlockInput::new(terminal, window, cx)))
+    }
+
+    /// The input box, shown only while the shell waits at a block prompt.
+    pub(crate) fn visible_block_input(&self, cx: &App) -> Option<Entity<BlockInput>> {
+        let shown = !self.read_only
+            && !matches!(self.mode, TerminalMode::Embedded { .. })
+            && self.terminal.read(cx).input_target() == InputTarget::BlockInput;
+        self.block_input.clone().filter(|_| shown)
+    }
+
+    pub(crate) fn block_input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.block_input
+            .as_ref()
+            .is_some_and(|input| input.focus_handle(cx).contains_focused(window, cx))
+    }
+
+    /// Moves focus between the grid and the input box as the input appears or hides,
+    /// but only within this terminal so other panes keep their focus.
+    pub(crate) fn sync_block_input_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.block_input.clone() else {
+            return;
+        };
+        let shown = self.visible_block_input(cx).is_some();
+        if shown == self.block_input_shown {
+            return;
+        }
+        self.block_input_shown = shown;
+        if shown && self.focus_handle.is_focused(window) {
+            window.focus(&input.focus_handle(cx), cx);
+        } else if !shown && self.block_input_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
+    /// Whether a key reaching the grid belongs to the input box instead of the PTY.
+    /// Printable keys typed on the grid at a prompt move into the input box.
+    pub(crate) fn block_input_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(input) = self.visible_block_input(cx) else {
+            return false;
+        };
+        if self.block_input_focused(window, cx) {
+            return true;
+        }
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        let Some(text) = keystroke.key_char.as_deref().filter(|text| {
+            !modifiers.control
+                && !modifiers.platform
+                && !modifiers.function
+                && !text.chars().any(char::is_control)
+        }) else {
+            return false;
+        };
+        window.focus(&input.focus_handle(cx), cx);
+        input.update(cx, |input, cx| input.insert(text, window, cx));
+        cx.stop_propagation();
+        true
     }
 }

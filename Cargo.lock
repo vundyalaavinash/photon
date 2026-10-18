@@ -13469,6 +13469,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "photon_terminal"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "gpui",
+ "terminal",
+]
+
+[[package]]
 name = "picker"
 version = "0.1.0"
 dependencies = [
@@ -18167,6 +18176,7 @@ dependencies = [
  "log",
  "menu",
  "photon_blocks",
+ "photon_terminal",
  "pretty_assertions",
  "project",
  "regex",

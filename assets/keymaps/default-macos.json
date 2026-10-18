@@ -1419,6 +1419,19 @@
     },
   },
   {
+    // photon: the block terminal's input box runs on enter and walks history from its first/last line.
+    "context": "PhotonBlockInput > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "photon_terminal::RunInput",
+      "shift-enter": "editor::Newline",
+      "up": "photon_terminal::HistoryPrevious",
+      "down": "photon_terminal::HistoryNext",
+      "cmd-up": "photon_terminal::SelectPreviousBlock",
+      "cmd-down": "photon_terminal::SelectNextBlock",
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {
