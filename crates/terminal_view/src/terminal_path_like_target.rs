@@ -1,7 +1,7 @@
 use super::{HoverTarget, HoveredWord, TerminalView};
 use anyhow::Result;
 use editor::items::open_resolved_target;
-use gpui::{Context, Task, TaskExt, WeakEntity, Window};
+use gpui::{Context, EntityId, Focusable as _, Task, TaskExt, WeakEntity, Window};
 use std::path::PathBuf;
 use terminal::PathLikeTarget;
 use workspace::path_link::PathMatching;
@@ -150,9 +150,33 @@ fn possibly_open_target(
             return Ok(None);
         };
 
+        // photon: a center terminal stays visible; the file opens in the pane to its right.
+        if open_target.is_file() {
+            let terminal_id = terminal_view.entity_id();
+            workspace.update_in(cx, |workspace, window, cx| {
+                focus_pane_beside_center_terminal(workspace, terminal_id, window, cx)
+            })?;
+        }
         let opened = open_resolved_target(&workspace, &open_target, cx).await?;
         Ok(opened.then_some(open_target))
     })
+}
+
+/// Does nothing for the dock terminal, which already opens files in the center.
+fn focus_pane_beside_center_terminal(
+    workspace: &mut Workspace,
+    terminal_id: EntityId,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(terminal_pane) = workspace.pane_for_item_id(terminal_id) else {
+        return;
+    };
+    if !workspace.panes().contains(&terminal_pane) {
+        return;
+    }
+    let target_pane = workspace.adjacent_pane_of(&terminal_pane, window, cx);
+    window.focus(&target_pane.focus_handle(cx), cx);
 }
 
 #[cfg(test)]
@@ -201,7 +225,7 @@ mod tests {
             .add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
-        let terminal = app_cx.new(|cx| {
+        let terminal = cx.new(|cx| {
             TerminalBuilder::new_display_only(
                 CursorShape::default(),
                 AlternateScroll::On,
@@ -1009,5 +1033,122 @@ mod tests {
                 }
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod photon_split_tests {
+    use super::*;
+    use editor::Editor;
+    use gpui::{AppContext as _, TestAppContext};
+    use project::Project;
+    use serde_json::json;
+    use std::path::Path;
+    use terminal::{
+        HoveredWord, Point, Range, TerminalBuilder,
+        terminal_settings::{AlternateScroll, CursorShape},
+    };
+    use util::path;
+    use util::paths::PathStyle;
+    use workspace::{AppState, MultiWorkspace};
+
+    #[gpui::test]
+    async fn path_click_opens_beside_center_terminal(app_cx: &mut TestAppContext) {
+        let fs = app_cx.update(AppState::test).fs.as_fake().clone();
+        app_cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        fs.insert_tree(path!("/project"), json!({ "main.rs": "one\ntwo\nthree\n" }))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], app_cx).await;
+        let (multi_workspace, cx) = app_cx
+            .add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let terminal_view = workspace.update_in(cx, |workspace, window, cx| {
+            let terminal_view = cx.new(|cx| {
+                TerminalView::new(
+                    terminal,
+                    workspace.weak_handle(),
+                    None,
+                    project.downgrade(),
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(
+                Box::new(terminal_view.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+            terminal_view
+        });
+        let terminal_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        let target = PathLikeTarget {
+            maybe_path: format!("{}:2:3", path!("/project/main.rs")),
+            working_directory: None,
+        };
+        let hovered_word = HoveredWord {
+            word: target.maybe_path.clone(),
+            word_match: Range::new(Point::new(0, 0), Point::new(0, 0)),
+            id: 0,
+        };
+        let checks = BackgroundPathChecks::LocalFileSystem;
+        // Opening twice checks that the right-hand pane is reused, not split again.
+        for _ in 0..2 {
+            terminal_view
+                .update(cx, |_, cx| {
+                    possible_hover_target(
+                        &workspace.downgrade(),
+                        hovered_word.clone(),
+                        &target,
+                        cx,
+                        checks,
+                    )
+                })
+                .await;
+            terminal_view
+                .update_in(cx, |terminal_view, window, cx| {
+                    possibly_open_target(
+                        &workspace.downgrade(),
+                        terminal_view,
+                        &target,
+                        window,
+                        cx,
+                        checks,
+                    )
+                })
+                .await
+                .expect("open target");
+        }
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes().len(), 2);
+            let terminal_item = terminal_pane.read(cx).active_item().expect("terminal item");
+            assert_eq!(terminal_item.item_id(), terminal_view.entity_id());
+            let editor_pane = workspace
+                .panes()
+                .iter()
+                .find(|pane| pane.entity_id() != terminal_pane.entity_id())
+                .expect("editor pane");
+            let editor_item = editor_pane.read(cx).active_item().expect("editor item");
+            assert!(editor_item.downcast::<Editor>().is_some());
+            assert_eq!(editor_pane.read(cx).items_len(), 1);
+        });
     }
 }

@@ -1299,6 +1299,7 @@ fn register_actions(
                 |_, _, _| None,
             );
         })
+        .register_action(photon::toggle_terminal_editor_focus) // photon: terminal/editor focus toggle
         .register_action(open_project_settings_file)
         .register_action(open_project_tasks_file)
         .register_action(open_worktree_setup_tasks_file)
@@ -6019,6 +6020,8 @@ mod tests {
                 "onboarding",
                 "outline",
                 "outline_panel",
+                "photon",          // photon: terminal/editor focus toggle
+                "photon_terminal", // photon: block terminal actions
                 "pane",
                 "picker",
                 "project_panel",
