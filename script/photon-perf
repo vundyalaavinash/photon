@@ -1,0 +1,85 @@
+#!/usr/bin/env zsh
+# Measures Photon's cold start (launch -> first frame) and idle memory, and compares them with the
+# committed baseline.
+#
+#   script/photon-perf                       # build release, measure, compare (10% threshold)
+#   script/photon-perf --threshold 20        # looser threshold (CI)
+#   script/photon-perf --update-baseline     # write the medians to the baseline file
+#   script/photon-perf --binary PATH --no-build
+set -euo pipefail
+zmodload zsh/datetime zsh/mathfunc
+cd "$(dirname "$0")/.."
+
+binary=target/release/zed
+threshold=10
+update_baseline=0
+build=1
+runs=5
+baseline=tooling/photon-perf/baseline.json
+budget_rss_mb=150
+budget_start_ms=300
+
+while (( $# )); do
+  case $1 in
+    --threshold) threshold=$2; shift 2 ;;
+    --update-baseline) update_baseline=1; shift ;;
+    --binary) binary=$2; shift 2 ;;
+    --no-build) build=0; shift ;;
+    --runs) runs=$2; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+(( build )) && cargo build --release -p zed -p cli
+
+median() { print -l -- "$@" | sort -n | awk '{ values[NR] = $1 } END { print values[int((NR + 1) / 2)] }'; }
+
+start_times=()
+rss_values=()
+for (( run = 1; run <= runs; run++ )); do
+  scratch=$(mktemp -d)
+  launched_ms=$(( int(EPOCHREALTIME * 1000) ))
+  PHOTON_PERF=1 "$binary" --user-data-dir "$scratch/data" tooling/photon-perf/sample \
+    >"$scratch/stdout.log" 2>"$scratch/stderr.log" &
+  pid=$!
+  first_frame_ms=""
+  for (( wait = 0; wait < 100; wait++ )); do
+    first_frame_ms=$(awk '/photon-perf first-frame-epoch-ms/ { print $3; exit }' "$scratch/stderr.log")
+    [[ -n $first_frame_ms ]] && break
+    sleep 0.1
+  done
+  if [[ -z $first_frame_ms ]]; then
+    kill $pid 2>/dev/null || true
+    echo "no first frame within 10s; see $scratch/stderr.log" >&2
+    exit 2
+  fi
+  sleep 10
+  rss_kb=$(ps -o rss= -p $pid | tr -d ' ')
+  kill $pid; wait $pid 2>/dev/null || true
+  start_times+=($(( first_frame_ms - launched_ms )))
+  rss_values+=($(( rss_kb / 1024 )))
+  echo "run $run: cold start ${start_times[-1]} ms, idle RSS ${rss_values[-1]} MB"
+done
+
+start_ms=$(median "${start_times[@]}")
+rss_mb=$(median "${rss_values[@]}")
+echo "median: cold start ${start_ms} ms, idle RSS ${rss_mb} MB"
+
+if (( update_baseline )); then
+  machine="$(sysctl -n machdep.cpu.brand_string), $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+  printf '{\n  "idle_rss_mb": %d,\n  "cold_start_ms": %d,\n  "measured_on": "%s",\n  "date": "%s"\n}\n' \
+    "$rss_mb" "$start_ms" "$machine" "$(date +%F)" > "$baseline"
+  echo "baseline written to $baseline"
+fi
+
+failed=0
+(( rss_mb > budget_rss_mb )) && { echo "FAIL: idle RSS ${rss_mb} MB exceeds budget ${budget_rss_mb} MB"; failed=1; }
+(( start_ms > budget_start_ms )) && { echo "FAIL: cold start ${start_ms} ms exceeds budget ${budget_start_ms} ms"; failed=1; }
+if [[ -f $baseline ]] && (( ! update_baseline )); then
+  base_rss=$(awk -F'[:,]' '/idle_rss_mb/ { print $2 + 0 }' "$baseline")
+  base_start=$(awk -F'[:,]' '/cold_start_ms/ { print $2 + 0 }' "$baseline")
+  (( rss_mb * 100 > base_rss * (100 + threshold) )) && { echo "FAIL: idle RSS regressed >${threshold}% (baseline ${base_rss} MB)"; failed=1; }
+  (( start_ms * 100 > base_start * (100 + threshold) )) && { echo "FAIL: cold start regressed >${threshold}% (baseline ${base_start} ms)"; failed=1; }
+fi
+(( failed )) && exit 1
+echo "OK"

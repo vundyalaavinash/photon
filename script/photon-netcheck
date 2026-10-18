@@ -1,0 +1,54 @@
+#!/usr/bin/env zsh
+# Fails if the app (or any child process) opens a non-loopback network connection while idle.
+#
+#   script/photon-netcheck                 # checks target/release/zed
+#   script/photon-netcheck --binary PATH   # checks another build
+#   script/photon-netcheck -- CMD ARGS...  # checks an arbitrary command (used to prove the check works)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+binary=target/release/zed
+seconds=30
+command=()
+while (( $# )); do
+  case $1 in
+    --binary) binary=$2; shift 2 ;;
+    --seconds) seconds=$2; shift 2 ;;
+    --) shift; command=("$@"); break ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+scratch=$(mktemp -d)
+if (( ${#command} == 0 )); then
+  command=("$binary" --user-data-dir "$scratch/data" tooling/photon-perf/sample)
+fi
+
+"${command[@]}" >"$scratch/stdout.log" 2>&1 &
+root_pid=$!
+trap 'kill $root_pid 2>/dev/null || true' EXIT
+
+descendants() {
+  local pid=$1 child
+  echo $pid
+  for child in $(pgrep -P $pid 2>/dev/null); do descendants $child; done
+}
+
+offending=()
+for (( second = 0; second < seconds; second++ )); do
+  sleep 1
+  kill -0 $root_pid 2>/dev/null || { echo "process exited early; see $scratch/stdout.log" >&2; exit 2; }
+  pids=$(descendants $root_pid | paste -sd, -)
+  while read -r line; do
+    [[ -z $line ]] && continue
+    offending+=("$line")
+  done < <(lsof -nP -i -a -p "$pids" 2>/dev/null | awk 'NR > 1 { print $1, $9 }' \
+             | grep -vE '(127\.0\.0\.1|\[::1\]|localhost)(:[0-9]+)?(->(127\.0\.0\.1|\[::1\]|localhost):[0-9]+)?$' || true)
+done
+
+if (( ${#offending} )); then
+  echo "FAIL: non-loopback connections during ${seconds}s idle:"
+  printf '  %s\n' "${(u)offending[@]}"
+  exit 1
+fi
+echo "OK: no non-loopback connections during ${seconds}s idle"

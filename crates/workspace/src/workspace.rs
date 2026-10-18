@@ -9574,6 +9574,14 @@ impl Render for Workspace {
         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
         if FIRST_PAINT.swap(false, std::sync::atomic::Ordering::Relaxed) {
             log::info!("Rendered first frame");
+            // photon: first-frame timestamp for script/photon-perf.
+            if std::env::var_os("PHOTON_PERF").is_some() {
+                let epoch_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis())
+                    .unwrap_or_default();
+                eprintln!("photon-perf first-frame-epoch-ms {epoch_ms}");
+            }
         }
 
         let pad_center_pane = self.centered_layout
