@@ -13451,6 +13451,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "photon_blocks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "percent-encoding",
+]
+
+[[package]]
 name = "photon_brand"
 version = "0.1.0"
 dependencies = [

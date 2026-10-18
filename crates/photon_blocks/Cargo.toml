@@ -1,0 +1,18 @@
+[package]
+name = "photon_blocks"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/photon_blocks.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+percent-encoding.workspace = true
