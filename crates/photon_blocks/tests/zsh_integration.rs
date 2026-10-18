@@ -219,3 +219,72 @@ fn non_interactive_zsh_does_not_leak_integration() {
     assert_eq!(lines.get(1), Some(&"unset"), "{stdout}");
     assert_eq!(lines.first().map(Path::new), Some(home.path()), "{stdout}");
 }
+
+/// Wall time of an interactive zsh running `commands` × `true`, and how many
+/// command-end marks it printed.
+fn time_true_commands(
+    env: &HashMap<String, String>,
+    commands: usize,
+) -> (std::time::Duration, usize) {
+    let mut child = Command::new("zsh")
+        .arg("-i")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .envs(env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn zsh");
+    let started = std::time::Instant::now();
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(format!("{}exit\n", "true\n".repeat(commands)).as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("zsh output");
+    let elapsed = started.elapsed();
+    let ends = osc_sequences(&output.stdout)
+        .iter()
+        .filter(|params| matches!(parse_shell_mark(params), Some(ShellMark::CommandEnd { .. })))
+        .count();
+    (elapsed, ends)
+}
+
+#[test]
+fn zsh_integration_overhead_under_1ms_per_command() {
+    if !zsh_available() {
+        return;
+    }
+    const COMMANDS: usize = 200;
+    const RUNS: usize = 5;
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(home.path().join(".zshrc"), "").expect("write zshrc");
+    let (with_env, _data) = photon_env(home.path());
+    // Same startup files; without PHOTON_BLOCKS they install no hooks and print no marks.
+    let mut without_env = with_env.clone();
+    without_env.remove("PHOTON_BLOCKS");
+
+    let mut with = Vec::new();
+    let mut without = Vec::new();
+    for _ in 0..RUNS {
+        let (elapsed, ends) = time_true_commands(&with_env, COMMANDS);
+        assert!(ends >= COMMANDS, "{ends} command-end marks");
+        with.push(elapsed);
+        let (elapsed, ends) = time_true_commands(&without_env, COMMANDS);
+        assert_eq!(ends, 0);
+        without.push(elapsed);
+    }
+    with.sort();
+    without.sort();
+    let (with, without) = (with[RUNS / 2], without[RUNS / 2]);
+    let per_command = with.saturating_sub(without) / COMMANDS as u32;
+    eprintln!(
+        "{COMMANDS} commands: blocks on {with:?}, off {without:?}, {per_command:?} per command"
+    );
+    assert!(
+        per_command < std::time::Duration::from_millis(1),
+        "{per_command:?} per command"
+    );
+}

@@ -1,0 +1,2 @@
+# photon: vendored upstream code keeps its own formatting; `cargo fmt --all` must not rewrite it.
+disable_all_formatting = true

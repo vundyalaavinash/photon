@@ -34,6 +34,12 @@ workspace.workspace = true
 
 [dev-dependencies]
 db = { workspace = true, features = ["test-support"] }
+editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+libc.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+terminal = { workspace = true, features = ["test-support"] }
+theme.workspace = true
+theme_settings.workspace = true
 tempfile.workspace = true
 which.workspace = true

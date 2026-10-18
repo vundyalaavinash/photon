@@ -681,3 +681,105 @@ impl CompletionProvider for ShellCompletionProvider {
         false
     }
 }
+
+// Timed with a Unix thread clock.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use gpui::{AnyWindowHandle, TestAppContext};
+    use std::time::Duration;
+
+    // 1,000 keystrokes per side, typed as command-length lines.
+    const KEYSTROKES_PER_ROUND: usize = 100;
+    const ROUNDS: usize = 10;
+
+    /// CPU time of the calling thread, which runs the whole test app: time spent
+    /// preempted on a busy machine does not count.
+    fn thread_cpu_time() -> Duration {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `time` is a valid, writable timespec for the duration of the call.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+        assert_eq!(result, 0, "clock_gettime failed");
+        Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+    }
+
+    /// Types one command-length line, a key at a time, letting the window redraw after each.
+    fn type_keys(window: AnyWindowHandle, cx: &mut TestAppContext) -> Duration {
+        let started = thread_cpu_time();
+        for index in 0..KEYSTROKES_PER_ROUND {
+            let key = ["a", "b", "c", "space"][index % 4];
+            cx.simulate_keystrokes(window, key);
+        }
+        thread_cpu_time() - started
+    }
+
+    #[gpui::test]
+    async fn typing_latency_matches_editor(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let terminal = cx.new(|cx| {
+            let mut terminal = terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx);
+            terminal.enable_blocks_for_test(cx);
+            terminal
+        });
+        let input_window = cx.add_window(|window, cx| {
+            BlockInput::new(terminal.clone(), WeakEntity::new_invalid(), window, cx)
+        });
+        let editor_window =
+            cx.add_window(|window, cx| Editor::auto_height(1, MAX_LINES, window, cx));
+        input_window
+            .update(cx, |input, window, cx| {
+                window.focus(&input.focus_handle(cx), cx)
+            })
+            .expect("focus input");
+        editor_window
+            .update(cx, |editor, window, cx| {
+                window.focus(&editor.focus_handle(cx), cx)
+            })
+            .expect("focus editor");
+
+        let mut input_times = Vec::new();
+        let mut editor_times = Vec::new();
+        // Interleaved, so a burst of load on the machine hits both sides.
+        for _ in 0..ROUNDS {
+            input_times.push(type_keys(input_window.into(), cx));
+            editor_times.push(type_keys(editor_window.into(), cx));
+            input_window
+                .update(cx, |input, window, cx| {
+                    assert_eq!(input.text(cx).len(), KEYSTROKES_PER_ROUND);
+                    input.set_text("", window, cx)
+                })
+                .expect("clear input");
+            editor_window
+                .update(cx, |editor, window, cx| {
+                    assert_eq!(editor.text(cx).len(), KEYSTROKES_PER_ROUND);
+                    editor.set_text("", window, cx)
+                })
+                .expect("clear editor");
+        }
+        input_times.sort();
+        editor_times.sort();
+        let (input, editor) = (input_times[ROUNDS / 2], editor_times[ROUNDS / 2]);
+        eprintln!(
+            "median of {ROUNDS} rounds of {KEYSTROKES_PER_ROUND} keystrokes: input box {input:?}, editor {editor:?}"
+        );
+        assert!(
+            input.as_secs_f64() <= editor.as_secs_f64() * 1.10,
+            "input box {input:?} vs editor {editor:?}"
+        );
+    }
+}

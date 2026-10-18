@@ -365,4 +365,40 @@ mod tests {
         let branches: Vec<_> = list.blocks().map(|block| block.branch.clone()).collect();
         assert_eq!(branches, [None, Some("main".to_string())]);
     }
+
+    #[test]
+    fn per_command_overhead_under_1ms() {
+        const COMMANDS: u32 = 10_000;
+        // What zsh sends for one command, as the terminal hands it over: raw OSC params.
+        let cycle: Vec<Vec<Vec<u8>>> = [
+            &["file://host/Users/me/project"][..],
+            &["A"],
+            &["B"],
+            &["E", "git status \\x3b ls"],
+            &["C"],
+            &["D", "0"],
+        ]
+        .iter()
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|field| field.as_bytes().to_vec())
+                .collect()
+        })
+        .collect();
+        let mut list = BlockList::new(1000);
+        let started = Instant::now();
+        for command in 0..COMMANDS {
+            let line = i64::from(command) * 3;
+            for params in &cycle {
+                if let Some(mark) = crate::marks::parse_shell_mark(params) {
+                    list.apply(mark, line, Instant::now());
+                }
+            }
+        }
+        let mean = started.elapsed() / COMMANDS;
+        eprintln!("mean per-command mark handling: {mean:?}");
+        assert_eq!(list.blocks().count(), 1000);
+        assert!(mean < std::time::Duration::from_millis(1), "{mean:?}");
+    }
 }

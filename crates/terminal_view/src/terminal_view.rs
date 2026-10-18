@@ -290,7 +290,13 @@ impl TerminalView {
         let subscriptions = vec![
             focus_in,
             focus_out,
-            cx.observe(&blink_manager, |_, _, cx| cx.notify()),
+            // photon: the cursor only blinks while the grid itself has focus; with the block
+            // input focused, a redraw per blink would cost ~2% CPU at an idle prompt.
+            cx.observe_in(&blink_manager, window, |terminal_view, _, window, cx| {
+                if terminal_view.focus_handle.is_focused(window) {
+                    cx.notify();
+                }
+            }),
             cx.observe_global::<SettingsStore>(Self::settings_changed),
             Self::redirect_grid_focus_to_block_input(&focus_handle, window, cx), // photon: block input owns prompt keys
         ];
@@ -4251,6 +4257,31 @@ mod tests {
         terminal.read_with(cx, |terminal, _| {
             terminal.last_content.terminal_bounds.num_lines()
         })
+    }
+
+    #[gpui::test]
+    async fn hidden_grid_cursor_does_not_redraw_on_blink(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let redraws = Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            let redraws = redraws.clone();
+            cx.observe(&terminal_view, move |_, _| redraws.set(redraws.get() + 1))
+        });
+        // At a prompt the input box has focus and the grid cursor is drawn without blinking.
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+        assert_eq!(redraws.get(), 0);
+
+        // A running command hands focus back to the grid, whose cursor blinks again.
+        feed_block_output(
+            &terminal,
+            b"sleep 5\r\n\x1b]633;E;sleep 5\x07\x1b]133;C\x07",
+            &mut cx,
+        );
+        redraws.set(0);
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+        assert!(redraws.get() >= 5, "{} redraws", redraws.get());
     }
 
     #[gpui::test]

@@ -1,6 +1,10 @@
 #!/usr/bin/env zsh
-# Measures Photon's cold start (launch -> first frame) and idle memory (macOS physical footprint, the
-# number Activity Monitor shows), and compares them with the committed baseline.
+# Measures Photon's cold start (launch -> first frame), idle memory (macOS physical footprint, the
+# number Activity Monitor shows) and idle CPU, and compares them with the committed baseline.
+#
+# The sample project opens with one block terminal at a zsh prompt. Idle CPU covers the whole process
+# tree (app plus shells) over 10 s after 5 s of settling. Footprint is the app process only; the zsh
+# Tab-completion helper (two extra zsh processes per terminal, spawned on the first Tab) is not started.
 #
 #   script/photon-perf                       # build release, measure, compare (10% threshold)
 #   script/photon-perf --threshold 20        # looser threshold (CI)
@@ -18,6 +22,7 @@ runs=5
 baseline=tooling/photon-perf/baseline.json
 budget_footprint_mb=200
 budget_start_ms=300
+budget_idle_cpu_percent=1
 
 while (( $# )); do
   case $1 in
@@ -34,10 +39,27 @@ done
 
 median() { print -l -- "$@" | sort -n | awk '{ values[NR] = $1 } END { print values[int((NR + 1) / 2)] }'; }
 
+descendants() {
+  local pid=$1 child
+  echo $pid
+  for child in $(pgrep -P $pid 2>/dev/null); do descendants $child; done
+}
+
+# CPU seconds used so far by the process and its descendants (ps prints [[h:]m:]s.cc).
+tree_cpu_seconds() {
+  ps -o time= -p "$(descendants $1 | paste -sd, -)" \
+    | awk -F: '{ seconds = 0; for (i = 1; i <= NF; i++) seconds = seconds * 60 + $i; total += seconds }
+               END { printf "%.2f", total }'
+}
+
 start_times=()
 footprint_values=()
+cpu_values=()
 for (( run = 1; run <= runs; run++ )); do
   scratch=$(mktemp -d)
+  # The terminal's zsh would otherwise run the user's rc files, whose prompt workers are not Photon's.
+  mkdir "$scratch/zdotdir"
+  export ZDOTDIR="$scratch/zdotdir"
   launched_ms=$(( int(EPOCHREALTIME * 1000) ))
   PHOTON_PERF=1 "$binary" --user-data-dir "$scratch/data" tooling/photon-perf/sample \
     >"$scratch/stdout.log" 2>"$scratch/stderr.log" &
@@ -53,7 +75,15 @@ for (( run = 1; run <= runs; run++ )); do
     echo "no first frame within 10s; see $scratch/stderr.log" >&2
     exit 2
   fi
+  sleep 5
+  if ! ps -o comm= -p "$(descendants $pid | paste -sd, -)" | grep -q zsh; then
+    kill $pid 2>/dev/null || true
+    echo "no terminal shell under pid $pid; see $scratch/stderr.log" >&2
+    exit 2
+  fi
+  cpu_before=$(tree_cpu_seconds $pid)
   sleep 10
+  cpu_after=$(tree_cpu_seconds $pid)
   footprint_bytes=$(footprint -p $pid -f bytes | awk '/phys_footprint:/ { print $2; exit }')
   if [[ ! $footprint_bytes == <-> ]]; then
     kill $pid 2>/dev/null || true
@@ -63,23 +93,27 @@ for (( run = 1; run <= runs; run++ )); do
   kill $pid; wait $pid 2>/dev/null || true
   start_times+=($(( first_frame_ms - launched_ms )))
   footprint_values+=($(( footprint_bytes / 1048576 )))
-  echo "run $run: cold start ${start_times[-1]} ms, idle footprint ${footprint_values[-1]} MB"
+  cpu_values+=($(printf '%.2f' $(( (cpu_after - cpu_before) * 100.0 / 10 ))))
+  echo "run $run: cold start ${start_times[-1]} ms, idle footprint ${footprint_values[-1]} MB, idle CPU ${cpu_values[-1]}%"
 done
 
 start_ms=$(median "${start_times[@]}")
 footprint_mb=$(median "${footprint_values[@]}")
-echo "median: cold start ${start_ms} ms, idle footprint ${footprint_mb} MB"
+cpu_percent=$(median "${cpu_values[@]}")
+echo "median: cold start ${start_ms} ms, idle footprint ${footprint_mb} MB, idle CPU ${cpu_percent}%"
 
 if (( update_baseline )); then
   machine="$(sysctl -n machdep.cpu.brand_string), $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
-  printf '{\n  "idle_footprint_mb": %d,\n  "cold_start_ms": %d,\n  "measured_on": "%s",\n  "date": "%s"\n}\n' \
-    "$footprint_mb" "$start_ms" "$machine" "$(date +%F)" > "$baseline"
+  printf '{\n  "idle_footprint_mb": %d,\n  "cold_start_ms": %d,\n  "idle_cpu_percent": %s,\n  "measured_on": "%s",\n  "date": "%s"\n}\n' \
+    "$footprint_mb" "$start_ms" "$cpu_percent" "$machine" "$(date +%F)" > "$baseline"
   echo "baseline written to $baseline"
 fi
 
 failed=0
 (( footprint_mb > budget_footprint_mb )) && { echo "FAIL: idle footprint ${footprint_mb} MB exceeds budget ${budget_footprint_mb} MB"; failed=1; }
 (( start_ms > budget_start_ms )) && { echo "FAIL: cold start ${start_ms} ms exceeds budget ${budget_start_ms} ms"; failed=1; }
+# A budget, not a baseline comparison: near 0%, a relative change is noise.
+(( cpu_percent >= budget_idle_cpu_percent )) && { echo "FAIL: idle CPU ${cpu_percent}% is not under ${budget_idle_cpu_percent}%"; failed=1; }
 if [[ -f $baseline ]] && (( ! update_baseline )); then
   base_footprint=$(awk -F'[:,]' '/idle_footprint_mb/ { print $2 + 0 }' "$baseline")
   base_start=$(awk -F'[:,]' '/cold_start_ms/ { print $2 + 0 }' "$baseline")
