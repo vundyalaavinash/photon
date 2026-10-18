@@ -7,9 +7,9 @@
   // - "light": Use the theme indicated by the "light" field
   // - "dark": Use the theme indicated by the "dark" field
   "theme": {
-    "mode": "system",
+    "mode": "dark", // photon: Warp-style dark by default
     "light": "One Light",
-    "dark": "One Dark",
+    "dark": "Photon Black",
   },
   "icon_theme": "Zed (Default)",
   // The name of a base set of key bindings to use.
@@ -28,7 +28,7 @@
   // The name of a font to use for rendering text in the editor
   // ".ZedMono" currently aliases to Lilex
   // but this may change in the future.
-  "buffer_font_family": ".ZedMono",
+  "buffer_font_family": "Hack", // photon: Warp's default font
   // Set the buffer text's font fallbacks, this will be merged with
   // the platform's default fallbacks.
   "buffer_font_fallbacks": null,
@@ -38,7 +38,7 @@
     // "calt": false
   },
   // The default font size for text in the editor
-  "buffer_font_size": 15,
+  "buffer_font_size": 13, // photon: Warp default
   // The weight of the editor font in standard CSS units from 100 to 900.
   "buffer_font_weight": 400,
   // Set the buffer's line height.
@@ -51,7 +51,7 @@
   //         "buffer_line_height": {
   //           "custom": 2
   //         },
-  "buffer_line_height": "comfortable",
+  "buffer_line_height": { "custom": 1.2 }, // photon: Warp default
   // The name of a font to use for rendering text in the UI
   // You can set this to ".SystemUIFont" to use the system font
   // ".ZedSans" currently aliases to "IBM Plex Sans", but this may
@@ -68,7 +68,7 @@
   // The weight of the UI font in standard CSS units from 100 to 900.
   "ui_font_weight": 400,
   // The default font size for text in the UI
-  "ui_font_size": 16,
+  "ui_font_size": 13, // photon: Warp default
   // The font family for agent responses in the agent panel. Falls back to the UI font family if unset.
   "agent_ui_font_family": null,
   // The default font size for agent responses in the agent panel. Falls back to the UI font size if unset.
@@ -2050,6 +2050,10 @@
     "shell": "system",
     // Where to dock terminals panel. Can be `left`, `right`, `bottom`.
     "dock": "bottom",
+    // photon: Warp's default typography (Hack 13, line height 1.2).
+    "font_family": "Hack",
+    "font_size": 13,
+    "font_fallbacks": ["Symbols Nerd Font Mono", "Apple Symbols"],
     // Whether the terminal panel should open on startup.
     //
     // Default: false
@@ -2092,7 +2096,7 @@
     //         "blinking": "terminal_controlled",
     //  3. Always blink the cursor, ignoring the terminal mode
     //         "blinking": "on",
-    "blinking": "terminal_controlled",
+    "blinking": "on", // photon: Warp default
     // Default cursor shape for the terminal.
     //  1. A block that surrounds the following character
     //     "block"
@@ -2104,7 +2108,7 @@
     //     "hollow"
     //
     // Default: "block"
-    "cursor_shape": "block",
+    "cursor_shape": "bar", // photon: Warp default
     // Set whether Alternate Scroll mode (code: ?1007) is active by default.
     // Alternate Scroll mode converts mouse scroll events into up / down key
     // presses when in the alternate screen (e.g. when running applications
@@ -2152,7 +2156,7 @@
     //         "line_height": {
     //           "custom": 2
     //         },
-    "line_height": "standard",
+    "line_height": { "custom": 1.2 }, // photon: Warp default
     // Activate the python virtual environment, if one is found, in the
     // terminal's working directory (as resolved by the working_directory
     // setting). Set this to "off" to disable this behavior.

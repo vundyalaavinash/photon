@@ -342,7 +342,8 @@ pub enum ThemeSelection {
 }
 
 pub const DEFAULT_LIGHT_THEME: &'static str = "One Light";
-pub const DEFAULT_DARK_THEME: &'static str = "One Dark";
+// photon: Warp-style default dark theme.
+pub const DEFAULT_DARK_THEME: &'static str = "Photon Black";
 
 impl Default for ThemeSelection {
     fn default() -> Self {
