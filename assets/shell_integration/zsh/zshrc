@@ -9,7 +9,16 @@ ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
 if [[ $PHOTON_COMPLETER == 1 ]]; then
   source $PHOTON_ZDOTDIR/photon-complete.zsh
 elif [[ $PHOTON_BLOCKS == 1 ]]; then
-  __photon_capture_status() { __photon_status=$? }
+  # A zsh started by a command (`exec zsh`, a nested `zsh`) ends that command's block.
+  if [[ -n $__photon_command_ran ]]; then
+    printf '\e]133;D;0\a'
+    unset __photon_command_ran
+  fi
+
+  __photon_capture_status() {
+    __photon_status=$?
+    ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
+  }
 
   __photon_precmd() {
     [[ -n $__photon_command_ran ]] && printf '\e]133;D;%s\a' "$__photon_status"
@@ -31,13 +40,17 @@ elif [[ $PHOTON_BLOCKS == 1 ]]; then
     if [[ $1 == ' '* ]] || [[ -n $HISTORY_IGNORE && $1 == ${~HISTORY_IGNORE} ]]; then
       flag=';nohist'
     fi
-    __photon_command_ran=1
+    # Exported, with Photon's ZDOTDIR, so a zsh this command starts loads the hooks again;
+    # the user's ZDOTDIR is back by the next prompt.
+    typeset -gx __photon_command_ran=1
+    ZDOTDIR=$PHOTON_ZDOTDIR
     printf '\e]633;E;%s%s\a' "$command" "$flag"
     printf '\e]133;C\a'
   }
 
   precmd_functions=(__photon_capture_status ${precmd_functions:#__photon_*} __photon_precmd)
-  preexec_functions=(${preexec_functions:#__photon_*} __photon_preexec)
+  # First, so the command text is sent before any C another integration's preexec prints.
+  preexec_functions=(__photon_preexec ${preexec_functions:#__photon_*})
 fi
 
 if [[ -o login ]]; then

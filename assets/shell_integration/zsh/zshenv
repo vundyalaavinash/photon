@@ -14,7 +14,7 @@ PHOTON_USER_ZDOTDIR=$ZDOTDIR
 if [[ ! -o interactive && ! -o login ]]; then
   # Only zshenv runs here, so nothing would hand ZDOTDIR back; don't let children inherit ours.
   ZDOTDIR=$PHOTON_USER_ZDOTDIR
-  unset PHOTON_BLOCKS PHOTON_USER_ZDOTDIR PHOTON_ZDOTDIR
+  unset PHOTON_BLOCKS PHOTON_USER_ZDOTDIR PHOTON_ZDOTDIR __photon_command_ran
 else
   ZDOTDIR=$PHOTON_ZDOTDIR
 fi

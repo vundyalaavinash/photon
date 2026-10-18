@@ -288,3 +288,79 @@ fn zsh_integration_overhead_under_1ms_per_command() {
         "{per_command:?} per command"
     );
 }
+
+/// Replays the marks into a block list, as the terminal would. The B mark lives in the
+/// prompt, which zsh prints to stderr, so here it is put back right after each A.
+fn block_list(marks: Vec<ShellMark>) -> photon_blocks::BlockList {
+    let mut list = photon_blocks::BlockList::new(100);
+    let now = std::time::Instant::now();
+    for (line, mark) in marks.into_iter().enumerate() {
+        let line = line as i64;
+        match mark {
+            ShellMark::CommandStart => {}
+            ShellMark::PromptStart => {
+                list.apply(ShellMark::PromptStart, line, now);
+                list.apply(ShellMark::CommandStart, line, now);
+            }
+            mark => {
+                list.apply(mark, line, now);
+            }
+        }
+    }
+    list
+}
+
+fn finished_commands(list: &photon_blocks::BlockList) -> Vec<(String, Option<i32>)> {
+    list.blocks()
+        .filter(|block| block.end_line.is_some())
+        .map(|block| (block.command.clone(), block.exit_code))
+        .collect()
+}
+
+#[test]
+fn preexec_that_sends_output_start_first_keeps_command_text() {
+    if !zsh_available() {
+        return;
+    }
+    // What iTerm2's shell integration and p10k's term-shell-integration install.
+    let rc = "__other_preexec() { printf '\\e]133;C\\a' }\npreexec_functions+=(__other_preexec)\n";
+    let (marks, output, _home) = run_zsh(rc, "echo hi\nexit\n");
+    let text = marks
+        .iter()
+        .position(|mark| matches!(mark, ShellMark::CommandText { .. }));
+    let output_start = marks
+        .iter()
+        .position(|mark| *mark == ShellMark::OutputStart);
+    assert!(text < output_start, "{marks:?}");
+    let list = block_list(marks);
+    assert!(
+        !matches!(list.phase(), photon_blocks::Phase::Degraded(_)),
+        "{output}"
+    );
+    assert_eq!(
+        finished_commands(&list)[0],
+        ("echo hi".to_string(), Some(0))
+    );
+}
+
+#[test]
+fn exec_zsh_keeps_blocks_going() {
+    if !zsh_available() {
+        return;
+    }
+    // `-i` because stdin is a pipe here; in a terminal plain `exec zsh` is interactive.
+    let (marks, output, _home) = run_zsh("", "exec zsh -i\necho after\nexit\n");
+    let list = block_list(marks);
+    assert!(
+        !matches!(list.phase(), photon_blocks::Phase::Degraded(_)),
+        "{output}"
+    );
+    assert_eq!(
+        finished_commands(&list),
+        [
+            ("exec zsh -i".to_string(), Some(0)),
+            ("echo after".to_string(), Some(0))
+        ],
+        "{output}"
+    );
+}

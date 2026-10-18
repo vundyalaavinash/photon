@@ -93,11 +93,19 @@ impl BlockList {
             ShellMark::CommandText {
                 command,
                 save_to_history,
-            } => {
-                if self.phase == Phase::Prompt {
-                    self.pending_command = Some((command, save_to_history));
+            } => match self.phase {
+                Phase::Prompt => self.pending_command = Some((command, save_to_history)),
+                // Another integration's preexec ran before ours and already sent C.
+                Phase::Running => {
+                    if let Some(block) = self.blocks.back_mut()
+                        && block.command.is_empty()
+                    {
+                        block.command = command;
+                        block.save_to_history = save_to_history;
+                    }
                 }
-            }
+                _ => {}
+            },
             ShellMark::OutputStart => match self.phase {
                 Phase::Prompt if self.command_started => {
                     return Some(self.start_block(absolute_line, now));
@@ -353,6 +361,31 @@ mod tests {
             Some(BlockEvent::Started(_))
         ));
         assert_eq!(list.blocks().next().map(|block| block.prompt_line), Some(0));
+    }
+
+    #[test]
+    fn command_text_after_output_start_names_the_block() {
+        // Another integration (iTerm2, p10k) whose preexec runs before ours sends C first.
+        let now = Instant::now();
+        let mut list = BlockList::new(10);
+        list.apply(PromptStart, 0, now);
+        list.apply(CommandStart, 0, now);
+        list.apply(OutputStart, 1, now);
+        list.apply(
+            CommandText {
+                command: " secret".into(),
+                save_to_history: false,
+            },
+            1,
+            now,
+        );
+        list.apply(OutputStart, 1, now);
+        // A later command's text must not rename a block that already has one.
+        list.apply(text("other"), 1, now);
+        let block = list.blocks().next().expect("block");
+        assert_eq!(block.command, " secret");
+        assert!(!block.save_to_history);
+        assert_eq!(list.phase(), &Phase::Running);
     }
 
     #[test]
