@@ -7626,6 +7626,9 @@ mod tests {
         use workspace::{OpenMode, Workspace};
 
         let app_state = init_test(cx);
+        // photon: empty workspaces open a block terminal whose real shell reports its cwd,
+        // and the git chips then run `git` on the process reaper's thread.
+        cx.executor().allow_parking();
         cx.update(init);
 
         let dir1 = path!("/dir1");

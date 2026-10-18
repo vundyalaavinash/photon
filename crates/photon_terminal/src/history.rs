@@ -240,7 +240,12 @@ impl HistoryStore {
     }
 
     #[cfg(test)]
-    fn in_memory() -> Self {
+    pub(crate) fn set_global(store: Entity<Self>, cx: &mut App) {
+        cx.set_global(GlobalHistoryStore(store));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
         Self {
             entries: VecDeque::new(),
             db: None,

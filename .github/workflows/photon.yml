@@ -44,7 +44,7 @@ jobs:
           -p photon_blocks -p photon_terminal -p terminal -p terminal_view
           -E 'package(photon_brand) | package(paths) | package(release_channel) | package(cli)
           | package(settings) | package(theme_settings) | package(zed_credentials_provider)
-          | package(photon_blocks) | package(photon_terminal)
+          | package(photon_blocks) | package(photon_terminal) | package(terminal_view)
           | test(photon) | test(new_window)
           | test(agent_registry) | test(default_agent_is_claude)'
 

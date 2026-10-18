@@ -689,9 +689,10 @@ mod tests {
     use gpui::{AnyWindowHandle, TestAppContext};
     use std::time::Duration;
 
-    // 1,000 keystrokes per side, typed as command-length lines.
+    // 500 keystrokes per side, typed as command-length lines.
     const KEYSTROKES_PER_ROUND: usize = 100;
-    const ROUNDS: usize = 10;
+    const ROUNDS: usize = 5;
+    const HISTORY_ENTRIES: usize = 10_000;
 
     /// CPU time of the calling thread, which runs the whole test app: time spent
     /// preempted on a busy machine does not count.
@@ -722,6 +723,19 @@ mod tests {
             let store = settings::SettingsStore::test(cx);
             cx.set_global(store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            // A full history that the typed text never prefixes, so every keystroke's
+            // suggestion lookup scans all of it.
+            let history = cx.new(|cx| {
+                let mut history = HistoryStore::in_memory();
+                for index in 0..HISTORY_ENTRIES {
+                    history.record(
+                        HistoryEntry::imported(format!("zzz --flag {index} | grep something")),
+                        cx,
+                    );
+                }
+                history
+            });
+            HistoryStore::set_global(history, cx);
         });
         let terminal = cx.new(|cx| {
             let mut terminal = terminal::TerminalBuilder::new_display_only(
