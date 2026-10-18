@@ -1,0 +1,14 @@
+# photon: Photon's ZDOTDIR shim; sources the user's real .zshenv, never edits it.
+# Announce the cwd before anything user-controlled runs, so a slow rc file
+# cannot look like "no shell integration" to the terminal.
+if [[ -o interactive && $PHOTON_BLOCKS == 1 ]]; then
+  __photon_url=${PWD//\%/%25}
+  printf '\e]7;file://%s%s\a' "$HOST" "${__photon_url// /%20}"
+  unset __photon_url
+fi
+typeset -g PHOTON_ZDOTDIR=$ZDOTDIR
+ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
+[[ -f $ZDOTDIR/.zshenv ]] && source "$ZDOTDIR/.zshenv"
+# The user's .zshenv may relocate ZDOTDIR; later files must come from there.
+PHOTON_USER_ZDOTDIR=$ZDOTDIR
+ZDOTDIR=$PHOTON_ZDOTDIR

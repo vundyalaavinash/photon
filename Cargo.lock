@@ -13457,6 +13457,7 @@ dependencies = [
  "anyhow",
  "log",
  "percent-encoding",
+ "tempfile",
 ]
 
 [[package]]
@@ -18106,6 +18107,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "assets",
  "async-channel 2.5.0",
  "collections",
  "futures 0.3.34",
@@ -18115,7 +18117,9 @@ dependencies = [
  "libc",
  "log",
  "parking_lot",
+ "paths",
  "percent-encoding",
+ "photon_blocks",
  "rand 0.9.4",
  "regex",
  "release_channel",

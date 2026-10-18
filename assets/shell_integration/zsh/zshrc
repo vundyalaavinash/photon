@@ -1,0 +1,43 @@
+# photon: see zshenv.
+# /etc/zshrc on macOS derives HISTFILE from the ZDOTDIR we pointed at Photon's dir.
+[[ $HISTFILE == $PHOTON_ZDOTDIR/* ]] && HISTFILE=${PHOTON_USER_ZDOTDIR:-$HOME}/${HISTFILE:t}
+ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
+[[ -f $ZDOTDIR/.zshrc ]] && source "$ZDOTDIR/.zshrc"
+
+if [[ $PHOTON_BLOCKS == 1 ]]; then
+  __photon_capture_status() { __photon_status=$? }
+
+  __photon_precmd() {
+    [[ -n $__photon_command_ran ]] && printf '\e]133;D;%s\a' "$__photon_status"
+    unset __photon_command_ran
+    local url=${PWD//\%/%25}
+    printf '\e]7;file://%s%s\a' "$HOST" "${url// /%20}"
+    printf '\e]133;A\a'
+    PROMPT=$'%{\e]133;B\a%}'
+    RPROMPT=''
+  }
+
+  __photon_preexec() {
+    local command=${1//\\/\\x5c}
+    command=${command//;/\\x3b}
+    command=${command//$'\a'/\\x07}
+    command=${command//$'\e'/\\x1b}
+    command=${command//$'\n'/\\x0a}
+    local flag=''
+    if [[ $1 == ' '* ]] || [[ -n $HISTORY_IGNORE && $1 == ${~HISTORY_IGNORE} ]]; then
+      flag=';nohist'
+    fi
+    __photon_command_ran=1
+    printf '\e]633;E;%s%s\a' "$command" "$flag"
+    printf '\e]133;C\a'
+  }
+
+  precmd_functions=(__photon_capture_status ${precmd_functions:#__photon_*} __photon_precmd)
+  preexec_functions=(${preexec_functions:#__photon_*} __photon_preexec)
+fi
+
+if [[ -o login ]]; then
+  ZDOTDIR=$PHOTON_ZDOTDIR
+else
+  ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
+fi

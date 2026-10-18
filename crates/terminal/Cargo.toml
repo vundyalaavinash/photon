@@ -22,6 +22,9 @@ doctest = false
 [dependencies]
 async-channel.workspace = true
 alacritty_terminal.workspace = true
+assets.workspace = true # photon: bundled shell integration files
+paths.workspace = true # photon: shell integration install dir
+photon_blocks.workspace = true # photon: zsh integration
 anyhow.workspace = true
 collections.workspace = true
 futures.workspace = true

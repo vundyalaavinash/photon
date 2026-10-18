@@ -19,6 +19,7 @@ util::fs_embed! {
         "sounds/**/*",
         "prompts/**/*",
         "*.md",
+        "shell_integration/**/*", // photon: bundled zsh integration files
     ],
     exclude = ["themes/src/*", "*.DS_Store"],
 }

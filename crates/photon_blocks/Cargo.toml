@@ -16,3 +16,6 @@ doctest = false
 anyhow.workspace = true
 log.workspace = true
 percent-encoding.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

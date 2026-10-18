@@ -236,6 +236,11 @@ pub struct TerminalSettingsContent {
     ///
     /// Default: "system"
     pub bell: Option<TerminalBell>,
+    // photon: command blocks for zsh terminals.
+    /// Whether new zsh terminals show commands as blocks.
+    ///
+    /// Default: true
+    pub blocks: Option<bool>,
 }
 
 crate::fallible_options::flattened_deserialize!(TerminalSettingsContent {
@@ -246,6 +251,7 @@ crate::fallible_options::flattened_deserialize!(TerminalSettingsContent {
         keep_selection_on_copy, open_links_in_mouse_mode, button, dock, starts_open, flexible,
         default_width, default_height, max_scroll_history_lines, scroll_multiplier, toolbar,
         scrollbar, minimum_contrast, show_count_badge, bell,
+        blocks, // photon: command blocks
     },
     defaults: {},
 });

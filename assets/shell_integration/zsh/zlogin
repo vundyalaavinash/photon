@@ -1,0 +1,3 @@
+# photon: see zshenv. Last startup file, so hand ZDOTDIR back to the user.
+ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
+[[ -f $ZDOTDIR/.zlogin ]] && source "$ZDOTDIR/.zlogin"

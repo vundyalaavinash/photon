@@ -1053,6 +1053,7 @@ impl TerminalBuilder {
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
             is_remote_terminal: false,
+            shell_integration: false,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
@@ -1110,6 +1111,9 @@ impl TerminalBuilder {
     ) -> Task<Result<TerminalBuilder>> {
         let version = release_channel::AppVersion::global(cx);
         let background_executor = cx.background_executor().clone();
+        // photon: command blocks are zsh-only and never apply to remote terminals.
+        let blocks_enabled = !is_remote_terminal
+            && TerminalSettings::try_get(cx).is_some_and(|settings| settings.blocks);
         // Headless hosts (e.g. the eval CLI) have no controlling TTY, so PTY
         // allocation / acquiring a controlling terminal fails with `ENOTTY`.
         // When set, run the command as a plain subprocess instead.
@@ -1191,6 +1195,24 @@ impl TerminalBuilder {
             };
             let terminal_title_override =
                 shell_params.as_ref().and_then(|e| e.title_override.clone());
+
+            // photon: point zsh at Photon's ZDOTDIR so it emits shell marks.
+            let shell_integration = blocks_enabled
+                && task.is_none()
+                && !no_pty
+                && match install_photon_zsh_integration() {
+                    Ok(integration_dir) => {
+                        let program = shell_params
+                            .as_ref()
+                            .map(|params| params.program.clone())
+                            .unwrap_or_else(util::shell::get_system_shell);
+                        photon_blocks::prepare_zsh_env(&program, &integration_dir, &mut env)
+                    }
+                    Err(error) => {
+                        log::error!("shell integration disabled: {error:#}");
+                        false
+                    }
+                };
 
             #[cfg(windows)]
             let shell_program = shell_params.as_ref().map(|params| {
@@ -1343,6 +1365,7 @@ impl TerminalBuilder {
                 ),
                 vi_mode_enabled: false,
                 is_remote_terminal,
+                shell_integration,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
@@ -1549,6 +1572,9 @@ pub struct Terminal {
     task: Option<TaskState>,
     vi_mode_enabled: bool,
     is_remote_terminal: bool,
+    /// photon: whether the shell was launched with zsh integration (see `photon_blocks`).
+    #[allow(dead_code)] // consumed by the block UI
+    shell_integration: bool,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<GpuiPoint<Pixels>>,
     mouse_down_hyperlink: Option<HyperlinkMatch>,
@@ -1635,6 +1661,29 @@ const FIND_HYPERLINK_THROTTLE: Duration = Duration::from_millis(100);
 /// from starting a selection and, with `copy_on_select` enabled, clobbering the
 /// clipboard. Mirrors the drag threshold used by gpui's `div` element.
 const SELECTION_DRAG_THRESHOLD: f64 = 2.0;
+
+// photon: installs the bundled zsh files under the data dir and returns their directory.
+fn install_photon_zsh_integration() -> Result<PathBuf> {
+    use gpui::AssetSource as _;
+    const FILES: [(&str, &str); 4] = [
+        (".zshenv", "shell_integration/zsh/zshenv"),
+        (".zprofile", "shell_integration/zsh/zprofile"),
+        (".zshrc", "shell_integration/zsh/zshrc"),
+        (".zlogin", "shell_integration/zsh/zlogin"),
+    ];
+    let mut loaded = Vec::with_capacity(FILES.len());
+    for (name, asset_path) in FILES {
+        let bytes = assets::Assets
+            .load(asset_path)?
+            .with_context(|| format!("missing bundled asset {asset_path}"))?;
+        loaded.push((name, bytes));
+    }
+    let files: Vec<(&str, &[u8])> = loaded
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.as_ref()))
+        .collect();
+    photon_blocks::install_zsh_integration(paths::data_dir(), &files)
+}
 
 impl Terminal {
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {

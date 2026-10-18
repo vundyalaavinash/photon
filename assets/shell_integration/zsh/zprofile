@@ -1,0 +1,4 @@
+# photon: see zshenv.
+ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
+[[ -f $ZDOTDIR/.zprofile ]] && source "$ZDOTDIR/.zprofile"
+ZDOTDIR=$PHOTON_ZDOTDIR

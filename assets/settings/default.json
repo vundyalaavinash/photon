@@ -2296,6 +2296,8 @@
     "show_count_badge": false,
     // Whether to invoke the OS-specific alert sound when the terminal bell (BEL character) is printed.
     "bell": "off",
+    // photon: show commands as blocks in zsh terminals. Applies to newly opened terminals only.
+    "blocks": true,
   },
   "code_actions_on_format": {},
   // Settings related to running tasks.
