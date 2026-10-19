@@ -1,0 +1,391 @@
+use gpui::{Action, Anchor, AnyElement, Hsla, SharedString, actions, anchored, point, rgb};
+use photon_blocks::{Block, Insight, RunDelta, rerun_failed_command, url_label};
+use photon_terminal::SmartBlocks;
+use settings::Settings as _;
+use terminal::terminal_settings::TerminalSettings;
+use ui::{ButtonSize, prelude::*};
+
+use crate::{
+    TerminalView,
+    photon_blocks_view::{active_blocks, layout_block_chrome},
+};
+
+actions!(
+    photon_terminal,
+    [
+        /// Runs only the failed tests of the selected block again.
+        RerunFailedTests,
+        /// Opens the source locations of the selected block's errors.
+        OpenBlockErrors,
+        /// Stages every change listed by the selected `git status` block.
+        StageAllChanges,
+        /// Opens the Git panel for the selected `git status` block.
+        OpenInGitPanel,
+        /// Opens the selected block's JSON output in an editor.
+        OpenBlockAsJson,
+        /// Opens the selected block's table output as a table.
+        OpenBlockAsTable,
+        /// Copies the selected block's table output as CSV.
+        CopyBlockAsCsv,
+        /// Opens the local URL the selected running block printed.
+        OpenBlockUrl,
+        /// Stops the selected running block.
+        StopBlock,
+    ]
+);
+
+const FAILURE: u32 = 0xFF8272;
+const SUCCESS: u32 = 0xB4FA72;
+const ACCENT: u32 = 0x19AAD8;
+const BUTTON_BORDER: u32 = 0x333333;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolbarButton {
+    RerunFailed,
+    OpenErrors,
+    StageAll,
+    OpenInGitPanel,
+    OpenAsJson,
+    OpenAsTable,
+    CopyAsCsv,
+    OpenUrl,
+    Stop,
+}
+
+impl ToolbarButton {
+    pub(crate) fn label(self, local_url: Option<&str>) -> String {
+        match self {
+            Self::RerunFailed => "Re-run failed".to_string(),
+            Self::OpenErrors => "Open errors".to_string(),
+            Self::StageAll => "Stage all".to_string(),
+            Self::OpenInGitPanel => "Open in Git panel".to_string(),
+            Self::OpenAsJson => "Open as JSON".to_string(),
+            Self::OpenAsTable => "Open as table".to_string(),
+            Self::CopyAsCsv => "Copy as CSV".to_string(),
+            Self::OpenUrl => format!("Open {}", local_url.map(url_label).unwrap_or_default()),
+            Self::Stop => "Stop".to_string(),
+        }
+    }
+
+    fn action(self) -> Box<dyn Action> {
+        match self {
+            Self::RerunFailed => Box::new(RerunFailedTests),
+            Self::OpenErrors => Box::new(OpenBlockErrors),
+            Self::StageAll => Box::new(StageAllChanges),
+            Self::OpenInGitPanel => Box::new(OpenInGitPanel),
+            Self::OpenAsJson => Box::new(OpenBlockAsJson),
+            Self::OpenAsTable => Box::new(OpenBlockAsTable),
+            Self::CopyAsCsv => Box::new(CopyBlockAsCsv),
+            Self::OpenUrl => Box::new(OpenBlockUrl),
+            Self::Stop => Box::new(StopBlock),
+        }
+    }
+}
+
+/// `local_url` is passed only while the block runs.
+pub(crate) fn summary_chip(
+    insight: Option<&Insight>,
+    local_url: Option<&str>,
+) -> Option<(SharedString, Hsla)> {
+    let (text, color) = match insight {
+        Some(Insight::Tests(run)) if run.failed > 0 => (
+            format!("{} failed · {} passed", run.failed, run.passed),
+            FAILURE,
+        ),
+        Some(Insight::Tests(run)) => (format!("{} passed", run.passed), SUCCESS),
+        Some(Insight::Build { errors }) if errors.len() == 1 => ("1 error".to_string(), FAILURE),
+        Some(Insight::Build { errors }) => (format!("{} errors", errors.len()), FAILURE),
+        _ => (format!("● {}", url_label(local_url?)), ACCENT),
+    };
+    Some((text.into(), rgb(color).into()))
+}
+
+pub(crate) fn toolbar_buttons(
+    insight: Option<&Insight>,
+    rerun_available: bool,
+    local_url: Option<&str>,
+    running: bool,
+) -> Vec<ToolbarButton> {
+    let mut buttons = match insight {
+        Some(Insight::Tests(run)) => {
+            let located = run
+                .failures
+                .iter()
+                .any(|failure| failure.location.is_some());
+            [
+                rerun_available.then_some(ToolbarButton::RerunFailed),
+                located.then_some(ToolbarButton::OpenErrors),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        }
+        Some(Insight::Build { .. }) => vec![ToolbarButton::OpenErrors],
+        Some(Insight::GitStatus { .. }) => {
+            vec![ToolbarButton::StageAll, ToolbarButton::OpenInGitPanel]
+        }
+        Some(Insight::Json) => vec![ToolbarButton::OpenAsJson],
+        Some(Insight::Table(_)) => vec![ToolbarButton::OpenAsTable, ToolbarButton::CopyAsCsv],
+        Some(Insight::GitLog { .. }) | None => Vec::new(),
+    };
+    if running && local_url.is_some() {
+        buttons.extend([ToolbarButton::OpenUrl, ToolbarButton::Stop]);
+    }
+    buttons
+}
+
+pub(crate) fn delta_text(delta: &RunDelta) -> Option<String> {
+    let new_failures = delta.new_failures.len();
+    let fixed = delta.fixed.len();
+    let plural = if new_failures == 1 { "" } else { "s" };
+    (new_failures + fixed > 0)
+        .then(|| format!("{new_failures} new failure{plural} · {fixed} fixed"))
+}
+
+fn running_url<'a>(block: &Block, smart_blocks: &'a SmartBlocks) -> Option<&'a str> {
+    smart_blocks
+        .local_url(block.id)
+        .filter(|_| block.end_line.is_none())
+}
+
+pub(crate) fn block_summary(
+    block: &Block,
+    smart_blocks: &SmartBlocks,
+) -> Option<(SharedString, Hsla)> {
+    summary_chip(
+        smart_blocks.insight(block.id),
+        running_url(block, smart_blocks),
+    )
+}
+
+pub(crate) fn block_toolbar(block: &Block, smart_blocks: &SmartBlocks) -> Vec<ToolbarButton> {
+    let insight = smart_blocks.insight(block.id);
+    let rerun_available = matches!(
+        insight,
+        Some(Insight::Tests(run)) if rerun_failed_command(&block.command, run).is_some()
+    );
+    toolbar_buttons(
+        insight,
+        rerun_available,
+        running_url(block, smart_blocks),
+        block.end_line.is_none(),
+    )
+}
+
+impl TerminalView {
+    /// Insights recorded before `terminal.smart_blocks` was turned off stay hidden.
+    pub(crate) fn enabled_smart_blocks<'a>(&'a self, cx: &'a App) -> Option<&'a SmartBlocks> {
+        let (smart_blocks, _) = self.smart_blocks.as_ref()?;
+        TerminalSettings::get_global(cx)
+            .smart_blocks
+            .then(|| smart_blocks.read(cx))
+    }
+
+    pub(crate) fn selected_block_delta(&self, cx: &App) -> Option<String> {
+        self.enabled_smart_blocks(cx)?
+            .delta(self.selected_block?)
+            .and_then(delta_text)
+    }
+
+    /// The selected block's buttons, right-aligned on its metadata row (Photon's prompt) or its
+    /// header row, placed from the last frame's grid bounds.
+    pub(crate) fn smart_block_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let selected = self.selected_block?;
+        let smart_blocks = self.enabled_smart_blocks(cx)?;
+        let terminal = self.terminal.read(cx);
+        let block = active_blocks(terminal)?.block(selected)?;
+        let buttons = block_toolbar(block, smart_blocks);
+        if buttons.is_empty() {
+            return None;
+        }
+        let local_url = running_url(block, smart_blocks).map(str::to_string);
+        let dimensions = terminal.last_content.terminal_bounds;
+        let chrome = layout_block_chrome(terminal, Some(selected), None, dimensions.num_lines())
+            .into_iter()
+            .find(|chrome| chrome.selected)?;
+        let row = chrome.metadata_row.unwrap_or(chrome.header_row);
+        let line_height = dimensions.line_height();
+        let position = point(
+            dimensions.bounds.origin.x + dimensions.width() - dimensions.cell_width(),
+            dimensions.bounds.origin.y + line_height * row as f32,
+        );
+        let focus_handle = self.focus_handle.clone();
+        Some(
+            anchored()
+                .anchor(Anchor::TopRight)
+                .position(position)
+                .child(
+                    h_flex()
+                        .id("smart-block-toolbar")
+                        // The grid underneath must not also see clicks on a button.
+                        .occlude()
+                        .h(line_height)
+                        .gap_1()
+                        .children(buttons.into_iter().map(|button| {
+                            let focus_handle = focus_handle.clone();
+                            Button::new(
+                                SharedString::from(format!("smart-block-{button:?}")),
+                                button.label(local_url.as_deref()),
+                            )
+                            .style(ButtonStyle::OutlinedCustom(rgb(BUTTON_BORDER).into()))
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .on_click(move |_, window, cx| {
+                                focus_handle.dispatch_action(button.action().as_ref(), window, cx)
+                            })
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::rgb;
+    use photon_blocks::{
+        FileState, SourceLocation, StatusFile, Table, TestFailure, TestRun, TestTool,
+    };
+
+    fn run(passed: usize, failed: usize, located: bool) -> Insight {
+        Insight::Tests(TestRun {
+            tool: TestTool::Cargo,
+            passed,
+            failed,
+            failures: (0..failed)
+                .map(|index| TestFailure {
+                    name: format!("test_{index}"),
+                    location: located.then(|| SourceLocation {
+                        path: "src/lib.rs".into(),
+                        line: 3,
+                        column: None,
+                    }),
+                })
+                .collect(),
+            packages: Vec::new(),
+        })
+    }
+
+    fn build(errors: usize) -> Insight {
+        Insight::Build {
+            errors: (0..errors)
+                .map(|line| SourceLocation {
+                    path: "src/main.rs".into(),
+                    line: line as u32,
+                    column: Some(1),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn summary_chip_texts() {
+        let red: Hsla = rgb(0xFF8272).into();
+        let green: Hsla = rgb(0xB4FA72).into();
+        let accent: Hsla = rgb(0x19AAD8).into();
+        let chip = |insight: Option<&Insight>, url| {
+            summary_chip(insight, url).map(|(text, color)| (text.to_string(), color))
+        };
+        assert_eq!(
+            chip(Some(&run(41, 2, true)), None),
+            Some(("2 failed · 41 passed".to_string(), red))
+        );
+        assert_eq!(
+            chip(Some(&run(7, 0, false)), None),
+            Some(("7 passed".to_string(), green))
+        );
+        assert_eq!(
+            chip(Some(&build(1)), None),
+            Some(("1 error".to_string(), red))
+        );
+        assert_eq!(
+            chip(Some(&build(3)), None),
+            Some(("3 errors".to_string(), red))
+        );
+        assert_eq!(
+            chip(None, Some("http://localhost:5173/")),
+            Some(("● localhost:5173".to_string(), accent))
+        );
+        assert_eq!(chip(Some(&Insight::Json), None), None);
+        assert_eq!(chip(None, None), None);
+
+        let delta = |new: usize, fixed: usize| RunDelta {
+            new_failures: vec!["a".to_string(); new],
+            fixed: vec!["b".to_string(); fixed],
+        };
+        assert_eq!(
+            delta_text(&delta(1, 2)).as_deref(),
+            Some("1 new failure · 2 fixed")
+        );
+        assert_eq!(
+            delta_text(&delta(3, 0)).as_deref(),
+            Some("3 new failures · 0 fixed")
+        );
+        assert_eq!(delta_text(&delta(0, 0)), None);
+    }
+
+    #[test]
+    fn toolbar_buttons_per_insight() {
+        use ToolbarButton::*;
+        let url = Some("http://localhost:3000");
+        assert_eq!(
+            toolbar_buttons(Some(&run(1, 2, true)), true, None, false),
+            [RerunFailed, OpenErrors]
+        );
+        assert_eq!(
+            toolbar_buttons(Some(&run(1, 2, false)), true, None, false),
+            [RerunFailed]
+        );
+        assert_eq!(
+            toolbar_buttons(Some(&run(1, 2, true)), false, None, false),
+            [OpenErrors]
+        );
+        assert_eq!(
+            toolbar_buttons(Some(&run(3, 0, false)), false, None, false),
+            []
+        );
+        assert_eq!(
+            toolbar_buttons(Some(&build(2)), false, None, false),
+            [OpenErrors]
+        );
+        let status = Insight::GitStatus {
+            files: vec![StatusFile {
+                absolute_line: 0,
+                path: "a.txt".to_string(),
+                state: FileState::Unstaged,
+            }],
+        };
+        assert_eq!(
+            toolbar_buttons(Some(&status), false, None, false),
+            [StageAll, OpenInGitPanel]
+        );
+        assert_eq!(
+            toolbar_buttons(Some(&Insight::Json), false, None, false),
+            [OpenAsJson]
+        );
+        let table = Insight::Table(Table {
+            headers: vec!["NAME".to_string()],
+            rows: Vec::new(),
+        });
+        assert_eq!(
+            toolbar_buttons(Some(&table), false, None, false),
+            [OpenAsTable, CopyAsCsv]
+        );
+        assert_eq!(
+            toolbar_buttons(
+                Some(&Insight::GitLog {
+                    commits: Vec::new()
+                }),
+                false,
+                None,
+                false
+            ),
+            []
+        );
+        assert_eq!(toolbar_buttons(None, false, url, true), [OpenUrl, Stop]);
+        assert_eq!(toolbar_buttons(None, false, url, false), []);
+        assert_eq!(ToolbarButton::OpenUrl.label(url), "Open localhost:3000");
+        assert_eq!(ToolbarButton::RerunFailed.label(None), "Re-run failed");
+    }
+}

@@ -1,5 +1,6 @@
 mod persistence;
 mod photon_blocks_view; // photon: command block chrome and actions
+mod photon_smart_blocks_view; // photon: smart block chip and toolbar
 pub mod terminal_element;
 pub mod terminal_panel;
 mod terminal_path_like_target;
@@ -619,6 +620,7 @@ impl TerminalView {
             .upgrade()
             .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
             .is_some_and(|terminal_panel| terminal_panel.read(cx).assistant_enabled());
+        let test_delta = self.selected_block_delta(cx); // photon: the selected test run's changes
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .when(self.shows_workspace_actions(), |menu| {
@@ -643,10 +645,9 @@ impl TerminalView {
                     |menu| menu.action("Clear", Box::new(Clear)),
                 )
                 // photon: the selected block's actions.
-                .when(
-                    self.selected_block.is_some(),
-                    photon_blocks_view::block_menu_items,
-                )
+                .when(self.selected_block.is_some(), |menu| {
+                    photon_blocks_view::block_menu_items(menu, test_delta)
+                })
                 .when(
                     assistant_enabled && !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| {
@@ -1614,7 +1615,9 @@ impl Render for TerminalView {
                             // photon: the input box's slot sits below the grid while blocks are drawn.
                             .when_some(self.block_input_slot(cx), |this, slot| {
                                 this.flex().flex_col().child(slot)
-                            }),
+                            })
+                            // photon: the selected smart block's toolbar, drawn over its header.
+                            .children(self.smart_block_overlay(cx)),
                     )
                     .when(content_mode.is_scrollable(), |div| {
                         let colors = cx.theme().colors();
@@ -3932,6 +3935,98 @@ mod tests {
         assert!(text.is_some_and(|text| !text.is_empty()));
     }
 
+    const FAILED_CARGO_TEST: &[u8] = b"\x1b]133;A\x07\x1b]133;B\x07cargo test\r\n\x1b]633;E;cargo test\x07\x1b]133;C\x07---- bad_one stdout ----\r\nthread 'bad_one' panicked at src/lib.rs:3:23:\r\n---- bad_two stdout ----\r\ntest result: FAILED. 41 passed; 2 failed; 0 ignored\r\n\x1b]133;D;101\x07\x1b]133;A\x07\x1b]133;B\x07";
+
+    /// Adds a finished `cargo test` block with failures and waits for its insight.
+    async fn init_smart_block_view(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Terminal>, Entity<TerminalView>, VisualTestContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(&terminal, FAILED_CARGO_TEST, &mut cx);
+        cx.run_until_parked();
+        (terminal, terminal_view, cx)
+    }
+
+    #[gpui::test]
+    async fn chip_painted_for_failed_test_block(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, cx) = init_smart_block_view(cx).await;
+        let summaries = terminal_view.read_with(&cx, |view, cx| {
+            let terminal = terminal.read(cx);
+            let screen_rows = terminal.last_content.terminal_bounds.num_lines();
+            photon_blocks_view::layout_block_chrome(
+                terminal,
+                None,
+                view.enabled_smart_blocks(cx),
+                screen_rows,
+            )
+            .into_iter()
+            .map(|chrome| chrome.summary)
+            .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            summaries.last(),
+            Some(&Some((
+                SharedString::from("2 failed · 41 passed"),
+                gpui::rgb(0xFF8272).into()
+            )))
+        );
+    }
+
+    #[gpui::test]
+    async fn toolbar_only_on_selected_block(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_smart_block_view(cx).await;
+        let ids = block_ids(&terminal, &mut cx);
+        let overlay_shown = |cx: &mut VisualTestContext| {
+            terminal_view.update(cx, |view, cx| view.smart_block_overlay(cx).is_some())
+        };
+        assert!(!overlay_shown(&mut cx));
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(selected(&terminal_view, &mut cx), ids.last().copied());
+        assert!(overlay_shown(&mut cx));
+        cx.simulate_keystrokes("cmd-up");
+        assert!(!overlay_shown(&mut cx), "the `ls` block has no insight");
+    }
+
+    #[gpui::test]
+    async fn drag_selection_unaffected_by_overlay(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_smart_block_view(cx).await;
+        cx.simulate_keystrokes("cmd-up");
+        let smart_block = selected(&terminal_view, &mut cx);
+        assert!(terminal_view.update(&mut cx, |view, cx| view.smart_block_overlay(cx).is_some()));
+        let bounds = terminal.read_with(&cx, |terminal, _| terminal.last_content.terminal_bounds);
+        let position = |column: f32, row: f32| {
+            bounds.bounds.origin + gpui::point(bounds.cell_width * column, bounds.line_height * row)
+        };
+        let header_row = terminal.read_with(&cx, |terminal, _| {
+            photon_blocks_view::layout_block_chrome(terminal, smart_block, None, bounds.num_lines())
+                .into_iter()
+                .find(|chrome| chrome.selected)
+                .map(|chrome| chrome.header_row as f32 + 0.5)
+        });
+        let header_row = header_row.expect("selected block is on screen");
+        let last_column = bounds.num_columns() as f32 - 0.5;
+        let modifiers = gpui::Modifiers::default();
+        // From the command into the toolbar at the row's right end.
+        cx.simulate_mouse_down(position(0.5, header_row), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(
+            position(last_column, header_row),
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_up(
+            position(last_column, header_row),
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.run_until_parked();
+        assert_eq!(selected(&terminal_view, &mut cx), smart_block);
+        terminal.update_in(&mut cx, |terminal, window, cx| terminal.sync(window, cx));
+        let text = terminal.read_with(&cx, |terminal, _| {
+            terminal.last_content.selection_text.clone()
+        });
+        assert!(text.is_some_and(|text| !text.is_empty()));
+    }
+
     #[gpui::test]
     async fn escape_clears_block_selection(cx: &mut TestAppContext) {
         let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
@@ -3954,7 +4049,7 @@ mod tests {
         );
         let rows = terminal.read_with(&cx, |terminal, _| {
             let screen_rows = terminal.last_content.terminal_bounds.num_lines();
-            photon_blocks_view::layout_block_chrome(terminal, None, screen_rows)
+            photon_blocks_view::layout_block_chrome(terminal, None, None, screen_rows)
                 .iter()
                 .map(|chrome| (chrome.header_row, chrome.metadata_row))
                 .collect::<Vec<_>>()

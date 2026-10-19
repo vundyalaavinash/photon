@@ -1598,9 +1598,11 @@ impl Element for TerminalElement {
                 };
 
                 // photon: command block chrome.
+                let terminal_view = self.terminal_view.read(cx);
                 let block_chrome = crate::photon_blocks_view::layout_block_chrome(
                     self.terminal.read(cx),
-                    self.terminal_view.read(cx).selected_block(),
+                    terminal_view.selected_block(),
+                    terminal_view.enabled_smart_blocks(cx),
                     dimensions.num_lines(),
                 );
 
