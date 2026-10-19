@@ -10,7 +10,16 @@ use workspace::{AppState, SerializedWorkspaceLocation, WorkspaceDb};
 
 use crate::PrKey;
 
-const CREDENTIAL_HELPER: [&str; 2] = ["-c", "credential.helper=!gh auth git-credential"];
+// The empty helper resets the configured list so that e.g. osxkeychain cannot store gh's token.
+// Hooks are disabled because a PR's repository must never run code during checkout.
+const SAFE_GIT_CONFIG: [&str; 6] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "credential.helper=!gh auth git-credential",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoId {
@@ -148,6 +157,31 @@ pub struct Checkout {
     pub merge_base: String,
 }
 
+fn ensure_safe_segment(label: &str, segment: &str) -> Result<()> {
+    if segment.is_empty()
+        || segment == "."
+        || segment == ".."
+        || segment.contains(['/', '\\', '\0'])
+    {
+        bail!("unsafe {label} {segment:?}");
+    }
+    Ok(())
+}
+
+async fn safe_git(dir: &Path, args: &[&str]) -> Result<String> {
+    let arguments: Vec<&str> = SAFE_GIT_CONFIG.iter().chain(args).copied().collect();
+    git(dir, &arguments).await
+}
+
+async fn common_git_dir(dir: &Path) -> Result<PathBuf> {
+    let common_dir = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await?;
+    Ok(std::fs::canonicalize(common_dir)?)
+}
+
 pub async fn prepare_checkout(
     key: &PrKey,
     base_ref: &str,
@@ -155,7 +189,18 @@ pub async fn prepare_checkout(
     clone: Option<PathBuf>,
     root: &Path,
 ) -> Result<Checkout> {
-    let repo_dir = match clone {
+    ensure_safe_segment("host", &key.host)?;
+    ensure_safe_segment("owner", &key.owner)?;
+    ensure_safe_segment("repo", &key.repo)?;
+
+    let worktree = worktree_path(root, key);
+    let worktree_exists = worktree.exists();
+    if worktree_exists && !worktree.join(".git").exists() {
+        // Without its own `.git`, git would walk up and operate on an enclosing repository.
+        bail!("{} exists but is not a git worktree", worktree.display());
+    }
+
+    let mut repo_dir = match clone {
         Some(clone) => clone,
         None => {
             let repo = RepoId {
@@ -169,38 +214,51 @@ pub async fn prepare_checkout(
                     bail!("invalid clone path {}", target.display());
                 };
                 std::fs::create_dir_all(parent)?;
-                let target_arg = target.to_string_lossy();
-                git(
+                let partial = parent.join(format!(".{}.partial", key.repo.to_lowercase()));
+                if partial.exists() {
+                    std::fs::remove_dir_all(&partial)?;
+                }
+                let cloned = safe_git(
                     parent,
                     &[
-                        CREDENTIAL_HELPER[0],
-                        CREDENTIAL_HELPER[1],
                         "clone",
                         "--bare",
                         "--filter=blob:none",
                         "--no-tags",
                         fetch_url,
-                        &target_arg,
+                        &partial.to_string_lossy(),
                     ],
                 )
-                .await?;
+                .await;
+                if let Err(error) = cloned {
+                    std::fs::remove_dir_all(&partial).log_err();
+                    return Err(error);
+                }
+                std::fs::rename(&partial, &target)?;
             }
             target
         }
     };
+
+    // An existing worktree belongs to one repository; operating on another would strand it.
+    if worktree_exists {
+        let worktree_repo = common_git_dir(&worktree).await?;
+        if common_git_dir(&repo_dir).await? != worktree_repo {
+            repo_dir = worktree_repo;
+        }
+    }
 
     let number = key.number;
     let head_ref = format!("refs/photon/pr/{number}/head");
     let base_private_ref = format!("refs/photon/pr/{number}/base");
     let head_refspec = format!("+refs/pull/{number}/head:{head_ref}");
     let base_refspec = format!("+refs/heads/{base_ref}:{base_private_ref}");
-    git(
+    safe_git(
         &repo_dir,
         &[
-            CREDENTIAL_HELPER[0],
-            CREDENTIAL_HELPER[1],
             "fetch",
             "--no-tags",
+            "--no-recurse-submodules",
             "--no-write-fetch-head",
             "--no-auto-maintenance",
             fetch_url,
@@ -210,40 +268,24 @@ pub async fn prepare_checkout(
     )
     .await?;
 
-    let head_sha = git(&repo_dir, &["rev-parse", &head_ref]).await?;
-    let merge_base = git(&repo_dir, &["merge-base", &head_ref, &base_private_ref]).await?;
+    let head_sha = safe_git(&repo_dir, &["rev-parse", &head_ref]).await?;
+    let merge_base = safe_git(&repo_dir, &["merge-base", &head_ref, &base_private_ref]).await?;
 
-    let worktree = worktree_path(root, key);
-    if worktree.exists() {
-        // Without its own `.git`, git would walk up and operate on an enclosing repository.
-        if !worktree.join(".git").exists() {
-            bail!("{} exists but is not a git worktree", worktree.display());
-        }
-        git(
-            &worktree,
-            &[
-                CREDENTIAL_HELPER[0],
-                CREDENTIAL_HELPER[1],
-                "checkout",
-                "--detach",
-                &head_sha,
-            ],
-        )
-        .await?;
+    if worktree_exists {
+        safe_git(&worktree, &["checkout", "--detach", &head_sha]).await?;
     } else {
         if let Some(parent) = worktree.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let worktree_arg = worktree.to_string_lossy();
-        git(
+        // `--force` only overrides git's missing-but-registered check for this Photon path.
+        safe_git(
             &repo_dir,
             &[
-                CREDENTIAL_HELPER[0],
-                CREDENTIAL_HELPER[1],
                 "worktree",
                 "add",
+                "--force",
                 "--detach",
-                &worktree_arg,
+                &worktree.to_string_lossy(),
                 &head_sha,
             ],
         )
@@ -260,14 +302,16 @@ pub async fn prepare_checkout(
 
 /// Fails, leaving the worktree and refs in place, when the worktree has local changes.
 pub async fn cleanup_checkout(checkout_repo: &Path, key: &PrKey, worktree: &Path) -> Result<()> {
-    git(
-        checkout_repo,
-        &["worktree", "remove", &worktree.to_string_lossy()],
-    )
-    .await?;
+    if worktree.exists() {
+        safe_git(
+            checkout_repo,
+            &["worktree", "remove", &worktree.to_string_lossy()],
+        )
+        .await?;
+    }
     for name in ["head", "base", "reviewed"] {
         let reference = format!("refs/photon/pr/{}/{name}", key.number);
-        git(checkout_repo, &["update-ref", "-d", &reference]).await?;
+        safe_git(checkout_repo, &["update-ref", "-d", &reference]).await?;
     }
     Ok(())
 }
@@ -334,7 +378,10 @@ mod tests {
     }
 
     impl Fixture {
-        fn new() -> Self {
+        fn new() -> Option<Self> {
+            if Command::new("git").arg("--version").output().is_err() {
+                return None;
+            }
             let temp = tempfile::tempdir().expect("tempdir");
             let base = temp.path().canonicalize().expect("canonical");
             let upstream = base.join("upstream.git");
@@ -365,7 +412,7 @@ mod tests {
             run(&user, &["stash", "push"]);
             std::fs::write(user.join("a.txt"), "dirty\n").expect("write");
             std::fs::write(user.join("untracked.txt"), "untracked\n").expect("write");
-            Self {
+            Some(Self {
                 _temp: temp,
                 upstream,
                 seed,
@@ -373,7 +420,7 @@ mod tests {
                 root,
                 main_sha,
                 pr_sha,
-            }
+            })
         }
 
         fn url(&self) -> String {
@@ -466,7 +513,9 @@ mod tests {
     #[gpui::test]
     async fn find_clone_picks_matching_remote(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
-        let fixture = Fixture::new();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
         run(
             &fixture.user,
             &["remote", "add", "github", "git@github.com:Acme/App.git"],
@@ -486,7 +535,9 @@ mod tests {
     #[gpui::test]
     async fn checkout_fetches_private_refs_and_creates_worktree(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
-        let fixture = Fixture::new();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
         let checkout = prepare_checkout(
             &fixture.key(),
             "main",
@@ -530,6 +581,12 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["-c", "credential.helper=!gh auth git-credential"])
         );
+        let position = |needle: &str| fetch.iter().position(|arg| arg == needle);
+        let reset = position("credential.helper=").expect("helper reset");
+        let gh = position("credential.helper=!gh auth git-credential").expect("gh helper");
+        assert!(reset < gh);
+        assert_eq!(fetch[reset - 1], "-c");
+        assert!(fetch.iter().any(|arg| arg == "core.hooksPath=/dev/null"));
         for flag in [
             "--no-tags",
             "--no-write-fetch-head",
@@ -542,7 +599,9 @@ mod tests {
     #[gpui::test]
     async fn checkout_never_touches_user_checkout(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
-        let fixture = Fixture::new();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
         let before = fixture.user_state();
         let checkout = prepare_checkout(
             &fixture.key(),
@@ -566,7 +625,9 @@ mod tests {
     #[gpui::test]
     async fn checkout_reuses_worktree_and_moves_to_new_head(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
-        let fixture = Fixture::new();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
         let first = prepare_checkout(
             &fixture.key(),
             "main",
@@ -608,7 +669,9 @@ mod tests {
     #[gpui::test]
     async fn fork_pr_fetches_pull_ref(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
-        let fixture = Fixture::new();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
         assert!(
             Command::new("git")
                 .arg("-C")
@@ -635,7 +698,9 @@ mod tests {
     #[gpui::test]
     async fn no_local_clone_makes_blobless_bare_clone(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
-        let fixture = Fixture::new();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
         let checkout =
             prepare_checkout(&fixture.key(), "main", &fixture.url(), None, &fixture.root)
                 .await
@@ -668,7 +733,9 @@ mod tests {
     #[gpui::test]
     async fn cleanup_removes_worktree_and_refs(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
-        let fixture = Fixture::new();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
         let checkout = prepare_checkout(
             &fixture.key(),
             "main",
@@ -689,13 +756,15 @@ mod tests {
         assert_eq!(run(&fixture.user, &["for-each-ref", "refs/photon/"]), "");
         cleanup_checkout(&checkout.repo_dir, &fixture.key(), &checkout.worktree)
             .await
-            .expect_err("worktree already gone is reported, refs stay deleted");
+            .expect("cleanup is idempotent");
     }
 
     #[gpui::test]
     async fn cleanup_keeps_dirty_worktree(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
-        let fixture = Fixture::new();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
         let checkout = prepare_checkout(
             &fixture.key(),
             "main",
@@ -713,5 +782,180 @@ mod tests {
         assert!(
             run(&fixture.user, &["for-each-ref", "refs/photon/"]).contains("refs/photon/pr/7/head")
         );
+    }
+
+    #[gpui::test]
+    async fn cleanup_after_directory_deleted_still_removes_refs(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let checkout = prepare_checkout(
+            &fixture.key(),
+            "main",
+            &fixture.url(),
+            Some(fixture.user.clone()),
+            &fixture.root,
+        )
+        .await
+        .expect("checkout");
+        std::fs::remove_dir_all(&checkout.worktree).expect("delete worktree");
+        cleanup_checkout(&checkout.repo_dir, &fixture.key(), &checkout.worktree)
+            .await
+            .expect("cleanup");
+        assert_eq!(run(&fixture.user, &["for-each-ref", "refs/photon/"]), "");
+    }
+
+    #[gpui::test]
+    async fn checkout_recovers_when_worktree_directory_was_deleted(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let first = prepare_checkout(
+            &fixture.key(),
+            "main",
+            &fixture.url(),
+            Some(fixture.user.clone()),
+            &fixture.root,
+        )
+        .await
+        .expect("first");
+        std::fs::remove_dir_all(&first.worktree).expect("delete worktree");
+        let second = prepare_checkout(
+            &fixture.key(),
+            "main",
+            &fixture.url(),
+            Some(fixture.user.clone()),
+            &fixture.root,
+        )
+        .await
+        .expect("second");
+        assert_eq!(
+            run(&second.worktree, &["rev-parse", "HEAD"]),
+            fixture.pr_sha
+        );
+    }
+
+    #[gpui::test]
+    async fn existing_worktree_keeps_its_own_repository(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let first = prepare_checkout(&fixture.key(), "main", &fixture.url(), None, &fixture.root)
+            .await
+            .expect("first");
+        let second = prepare_checkout(
+            &fixture.key(),
+            "main",
+            &fixture.url(),
+            Some(fixture.user.clone()),
+            &fixture.root,
+        )
+        .await
+        .expect("second");
+        assert_eq!(
+            std::fs::canonicalize(&second.repo_dir).expect("canonical"),
+            std::fs::canonicalize(&first.repo_dir).expect("canonical")
+        );
+        cleanup_checkout(&second.repo_dir, &fixture.key(), &second.worktree)
+            .await
+            .expect("cleanup");
+        assert!(!second.worktree.exists());
+        assert_eq!(run(&fixture.user, &["for-each-ref", "refs/photon/"]), "");
+    }
+
+    #[gpui::test]
+    async fn hooks_never_run(cx: &mut gpui::TestAppContext) {
+        use std::os::unix::fs::PermissionsExt as _;
+        cx.executor().allow_parking();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let marker = fixture.root.parent().expect("parent").join("hook-ran");
+        for name in ["post-checkout", "reference-transaction"] {
+            let hook = fixture.user.join(".git/hooks").join(name);
+            std::fs::create_dir_all(hook.parent().expect("hooks dir")).expect("mkdir");
+            std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))
+                .expect("write hook");
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let checkout = prepare_checkout(
+            &fixture.key(),
+            "main",
+            &fixture.url(),
+            Some(fixture.user.clone()),
+            &fixture.root,
+        )
+        .await
+        .expect("checkout");
+        cleanup_checkout(&checkout.repo_dir, &fixture.key(), &checkout.worktree)
+            .await
+            .expect("cleanup");
+        assert!(!marker.exists());
+    }
+
+    #[gpui::test]
+    async fn stale_partial_clone_is_discarded(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let partial = fixture.root.join("clones/github.com/acme/.app.partial");
+        std::fs::create_dir_all(&partial).expect("mkdir");
+        std::fs::write(partial.join("junk"), "x").expect("write");
+        let checkout =
+            prepare_checkout(&fixture.key(), "main", &fixture.url(), None, &fixture.root)
+                .await
+                .expect("checkout");
+        assert!(!partial.exists());
+        assert_eq!(checkout.head_sha, fixture.pr_sha);
+
+        let failing = PrKey {
+            repo: "missing".into(),
+            ..fixture.key()
+        };
+        prepare_checkout(
+            &failing,
+            "main",
+            "file:///nonexistent/repo",
+            None,
+            &fixture.root,
+        )
+        .await
+        .expect_err("clone fails");
+        let repo = RepoId {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            repo: "missing".into(),
+        };
+        assert!(!clone_path(&fixture.root, &repo).exists());
+    }
+
+    #[gpui::test]
+    async fn unsafe_path_segments_are_rejected(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        for (host, owner, repo) in [
+            ("github.com", "..", "app"),
+            ("github.com", "acme", "a/b"),
+            ("", "acme", "app"),
+            ("github.com", "acme", "."),
+            ("github.com", "a\\b", "app"),
+        ] {
+            let key = PrKey {
+                host: host.into(),
+                owner: owner.into(),
+                repo: repo.into(),
+                number: 7,
+            };
+            prepare_checkout(&key, "main", &fixture.url(), None, &fixture.root)
+                .await
+                .expect_err("unsafe segment");
+        }
+        assert!(!fixture.root.exists());
     }
 }
