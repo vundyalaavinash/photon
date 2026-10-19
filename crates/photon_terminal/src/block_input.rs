@@ -16,10 +16,7 @@ use gpui::{
 };
 use photon_blocks::BlockEvent;
 use terminal::{Event, InputTarget, Terminal};
-use ui::{
-    ButtonCommon as _, ButtonLike, ButtonSize, ButtonStyle, Color, Label, LabelCommon as _,
-    LabelSize, PopoverMenu, PopoverMenuHandle,
-};
+use ui::{ButtonCommon as _, ButtonLike, ButtonSize, ButtonStyle, PopoverMenu, PopoverMenuHandle};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -661,9 +658,11 @@ fn chip(id: &'static str, text: String, color: u32) -> ButtonLike {
         .style(ButtonStyle::OutlinedCustom(rgb(CHIP_BORDER_COLOR).into()))
         .size(ButtonSize::Compact)
         .child(
-            Label::new(text)
-                .size(LabelSize::Small)
-                .color(Color::Custom(rgb(color).into())),
+            div()
+                .font_family(FONT_FAMILY)
+                .text_size(px(FONT_SIZE))
+                .text_color(rgb(color))
+                .child(text),
         )
 }
 

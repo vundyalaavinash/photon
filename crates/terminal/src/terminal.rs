@@ -1828,8 +1828,8 @@ impl Terminal {
                 let new_bounds = normalize_terminal_bounds(new_bounds);
                 trace!("Resizing: new_bounds={new_bounds:?}");
 
-                let columns_changed =
-                    self.last_content.terminal_bounds.num_columns() != new_bounds.num_columns();
+                // photon: `set_size` already stored the new bounds, so compare with the grid.
+                let columns_changed = term.columns() != new_bounds.num_columns();
                 self.last_content.terminal_bounds = new_bounds;
 
                 if let TerminalType::Pty {
@@ -1840,7 +1840,16 @@ impl Terminal {
                     pty_tx.resize(new_bounds);
                 }
 
+                // photon: re-wrapping moves lines between rows; blocks follow their lines.
+                let block_distances = self
+                    .blocks
+                    .as_ref()
+                    .filter(|_| columns_changed && !crate::alacritty::is_alt_screen(term))
+                    .map(|blocks| blocks.distances_from_cursor(term));
                 resize(term, new_bounds);
+                if let (Some(blocks), Some(distances)) = (&mut self.blocks, block_distances) {
+                    blocks.restore_from_cursor(term, &distances);
+                }
                 if columns_changed {
                     self.reset_cwd_history();
                 }
@@ -6643,6 +6652,50 @@ mod tests {
                 Some("git status\nOn branch main\nnothing to commit")
             );
         });
+    }
+
+    #[gpui::test]
+    async fn blocks_follow_their_lines_when_width_changes(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        let size = |columns: f32| {
+            TerminalBounds::new(
+                px(20.),
+                px(10.),
+                bounds(
+                    point(px(0.), px(0.)),
+                    size(px(10. * columns), px(20. * 30.)),
+                ),
+            )
+        };
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.set_size(size(40.));
+            terminal.sync(window, cx);
+        });
+        let long = "x".repeat(35);
+        let output = format!(
+            "\x1b]133;A\x07\x1b]133;B\x07one\r\n\x1b]633;E;one\x07\x1b]133;C\x07{long}\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07two\r\n\x1b]633;E;two\x07\x1b]133;C\x07second\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07"
+        );
+        feed_pty_output(&terminal, output.as_bytes(), cx);
+        let outputs = |cx: &mut VisualTestContext| {
+            terminal.read_with(cx, |terminal, _| {
+                let blocks = terminal.blocks().expect("blocks");
+                blocks
+                    .blocks()
+                    .map(|block| terminal.block_text(block.id, BlockPart::Output))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let expected = vec![Some(long), Some("second".to_string())];
+        assert_eq!(outputs(cx), expected);
+
+        // A panel opening narrows the terminal: the long line now wraps onto two rows.
+        for columns in [20., 40.] {
+            terminal.update_in(cx, |terminal, window, cx| {
+                terminal.set_size(size(columns));
+                terminal.sync(window, cx);
+            });
+            assert_eq!(outputs(cx), expected, "at {columns} columns");
+        }
     }
 
     #[gpui::test]

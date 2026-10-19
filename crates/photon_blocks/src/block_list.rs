@@ -199,6 +199,40 @@ impl BlockList {
         }
     }
 
+    /// Every line a block or the pending prompt starts or ends on.
+    pub fn mark_lines(&self) -> Vec<i64> {
+        let mut lines = vec![self.prompt_line, self.command_line];
+        for block in &self.blocks {
+            lines.extend([block.prompt_line, block.command_line]);
+            lines.extend(block.output_line);
+            lines.extend(block.end_line);
+        }
+        lines
+    }
+
+    /// Moves every line through `map` after the grid re-wrapped; blocks with a line that no
+    /// longer exists are dropped.
+    pub fn remap_lines(&mut self, map: impl Fn(i64) -> Option<i64>) {
+        self.prompt_line = map(self.prompt_line).unwrap_or(self.prompt_line);
+        self.command_line = map(self.command_line).unwrap_or(self.command_line);
+        self.blocks.retain_mut(|block| {
+            let (Some(prompt), Some(command)) = (map(block.prompt_line), map(block.command_line))
+            else {
+                return false;
+            };
+            let output = block.output_line.map(&map);
+            let end = block.end_line.map(&map);
+            if output == Some(None) || end == Some(None) {
+                return false;
+            }
+            block.prompt_line = prompt;
+            block.command_line = command;
+            block.output_line = output.flatten();
+            block.end_line = end.flatten();
+            true
+        });
+    }
+
     /// Drops finished blocks but keeps the phase, so a command running through
     /// cmd-K or `clear` still owns the keyboard and a pending prompt still runs.
     pub fn clear(&mut self) {

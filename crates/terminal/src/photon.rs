@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::grid::Dimensions as _;
+use alacritty_terminal::{grid::Dimensions as _, index::Line, term::cell::Flags};
+use collections::{HashMap, HashSet};
 use gpui::{Context, Task};
 use photon_blocks::{BlockEvent, BlockId, BlockList, Phase, ShellMark, parse_shell_mark};
 use util::ResultExt as _;
@@ -94,6 +95,39 @@ impl TerminalBlocks {
             self.awaiting_shell = false;
         }
         Some(self.list.apply(mark, absolute_line, Instant::now()))
+    }
+
+    /// How many logical lines (wrapped rows joined) each mark line is above the cursor's line.
+    /// Re-wrapping keeps this distance, so it finds the marks again after a width change.
+    pub(crate) fn distances_from_cursor(&self, term: &AlacrittyTerm) -> HashMap<i64, usize> {
+        let wanted: HashSet<i64> = self.list.mark_lines().into_iter().collect();
+        let mut distances = HashMap::default();
+        walk_logical_lines_up(term, |absolute_line, distance, _| {
+            if wanted.contains(&absolute_line) {
+                distances.entry(absolute_line).or_insert(distance);
+            }
+        });
+        distances
+    }
+
+    /// Puts each mark on the first row of the logical line it was on before the grid re-wrapped.
+    pub(crate) fn restore_from_cursor(
+        &mut self,
+        term: &AlacrittyTerm,
+        distances: &HashMap<i64, usize>,
+    ) {
+        let mut starts: HashMap<usize, i64> = HashMap::default();
+        walk_logical_lines_up(term, |absolute_line, distance, is_start| {
+            if is_start {
+                starts.insert(distance, absolute_line);
+            }
+        });
+        self.list.remap_lines(|line| {
+            distances
+                .get(&line)
+                .and_then(|distance| starts.get(distance).copied())
+        });
+        self.oldest_line = oldest_absolute_line(term).unwrap_or(self.oldest_line);
     }
 
     /// Called after the grid may have changed under the block list.
@@ -551,5 +585,28 @@ mod tests {
         let integrated = launch_env_probe(true, cx).await;
         assert!(integrated.contains("zdotdir=photon"), "{integrated}");
         assert!(integrated.contains("blocks=1"), "{integrated}");
+    }
+}
+
+/// Walks rows from the cursor's row up to the oldest row in history, calling `visit` with each
+/// row's absolute line, its distance in logical lines from the cursor's line, and whether it
+/// starts a logical line (the row above it did not wrap into it).
+fn walk_logical_lines_up(term: &AlacrittyTerm, mut visit: impl FnMut(i64, usize, bool)) {
+    let grid = term.grid();
+    let last_column = grid.last_column();
+    let top = grid.topmost_line();
+    let mut distance = 0;
+    let mut line = grid.cursor.point.line;
+    loop {
+        let above: Line = line - 1;
+        let starts_line = line == top || !grid[above][last_column].flags.contains(Flags::WRAPLINE);
+        visit(term.absolute_line(line), distance, starts_line);
+        if line == top {
+            break;
+        }
+        if starts_line {
+            distance += 1;
+        }
+        line = line - 1;
     }
 }
