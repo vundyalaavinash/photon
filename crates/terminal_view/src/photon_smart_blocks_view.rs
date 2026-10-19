@@ -1,13 +1,19 @@
-use gpui::{Action, Anchor, AnyElement, Hsla, SharedString, actions, anchored, point, rgb};
-use photon_blocks::{Block, Insight, RunDelta, rerun_failed_command, url_label};
+use gpui::{
+    Action, Anchor, AnyElement, Div, Hsla, SharedString, Stateful, actions, anchored, point, rgb,
+};
+use photon_blocks::{
+    Block, BlockId, Insight, RunDelta, SourceLocation, rerun_failed_command, url_label,
+};
 use photon_terminal::SmartBlocks;
 use settings::Settings as _;
+use terminal::PathLikeTarget;
 use terminal::terminal_settings::TerminalSettings;
-use ui::{ButtonSize, prelude::*};
+use ui::{ButtonSize, ContextMenu, prelude::*};
 
 use crate::{
     TerminalView,
     photon_blocks_view::{active_blocks, layout_block_chrome},
+    terminal_path_like_target::open_location_beside_terminal,
 };
 
 actions!(
@@ -17,6 +23,10 @@ actions!(
         RerunFailedTests,
         /// Opens the source locations of the selected block's errors.
         OpenBlockErrors,
+        /// Opens the next error of the selected block, or of the newest block with errors.
+        NextBlockError,
+        /// Opens the previous error of the selected block, or of the newest block with errors.
+        PreviousBlockError,
         /// Stages every change listed by the selected `git status` block.
         StageAllChanges,
         /// Opens the Git panel for the selected `git status` block.
@@ -172,7 +182,147 @@ pub(crate) fn block_toolbar(block: &Block, smart_blocks: &SmartBlocks) -> Vec<To
     )
 }
 
+fn block_locations(insight: Option<&Insight>) -> Vec<&SourceLocation> {
+    match insight {
+        Some(Insight::Tests(run)) => run
+            .failures
+            .iter()
+            .filter_map(|failure| failure.location.as_ref())
+            .collect(),
+        Some(Insight::Build { errors }) => errors.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ErrorStep {
+    First,
+    Next,
+    Previous,
+}
+
+impl ErrorStep {
+    fn index(self, current: Option<usize>, count: usize) -> usize {
+        match (self, current) {
+            (Self::Next, Some(index)) => (index + 1) % count,
+            (Self::Previous, Some(index)) => (index + count - 1) % count,
+            (Self::Previous, None) => count - 1,
+            (Self::First | Self::Next, _) => 0,
+        }
+    }
+}
+
+pub(crate) fn register_smart_block_actions(
+    element: Stateful<Div>,
+    cx: &mut Context<TerminalView>,
+) -> Stateful<Div> {
+    element
+        .on_action(cx.listener(TerminalView::rerun_failed_tests))
+        .on_action(cx.listener(|this, _: &OpenBlockErrors, window, cx| {
+            this.open_block_error(ErrorStep::First, window, cx)
+        }))
+        .on_action(cx.listener(|this, _: &NextBlockError, window, cx| {
+            this.open_block_error(ErrorStep::Next, window, cx)
+        }))
+        .on_action(cx.listener(|this, _: &PreviousBlockError, window, cx| {
+            this.open_block_error(ErrorStep::Previous, window, cx)
+        }))
+}
+
+pub(crate) fn smart_block_menu_items(
+    menu: ContextMenu,
+    buttons: Vec<ToolbarButton>,
+) -> ContextMenu {
+    buttons
+        .into_iter()
+        .filter(|button| {
+            matches!(
+                button,
+                ToolbarButton::RerunFailed | ToolbarButton::OpenErrors
+            )
+        })
+        .fold(menu, |menu, button| {
+            menu.action(button.label(None), button.action())
+        })
+}
+
 impl TerminalView {
+    pub(crate) fn selected_block_buttons(&self, cx: &App) -> Vec<ToolbarButton> {
+        let (Some(smart_blocks), Some(selected)) =
+            (self.enabled_smart_blocks(cx), self.selected_block)
+        else {
+            return Vec::new();
+        };
+        active_blocks(self.terminal.read(cx))
+            .and_then(|blocks| blocks.block(selected))
+            .map(|block| block_toolbar(block, smart_blocks))
+            .unwrap_or_default()
+    }
+
+    fn rerun_failed_tests(&mut self, _: &RerunFailedTests, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected_block else {
+            return;
+        };
+        if self.read_only {
+            return;
+        }
+        let Some(smart_blocks) = self.enabled_smart_blocks(cx) else {
+            return;
+        };
+        let Some(Insight::Tests(run)) = smart_blocks.insight(selected) else {
+            return;
+        };
+        let Some(command) = self
+            .terminal
+            .read(cx)
+            .blocks()
+            .and_then(|blocks| blocks.block(selected))
+            .and_then(|block| rerun_failed_command(&block.command, run))
+        else {
+            return;
+        };
+        self.terminal
+            .update(cx, |terminal, cx| terminal.run_command(&command, cx));
+    }
+
+    fn open_block_error(&mut self, step: ErrorStep, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(smart_blocks) = self.enabled_smart_blocks(cx) else {
+            return;
+        };
+        let Some(blocks) = active_blocks(self.terminal.read(cx)) else {
+            return;
+        };
+        let has_locations = |id: BlockId| !block_locations(smart_blocks.insight(id)).is_empty();
+        let Some(block) = (match self.selected_block {
+            Some(selected) => blocks.block(selected),
+            None => blocks.blocks().rev().find(|block| has_locations(block.id)),
+        }) else {
+            return;
+        };
+        let locations = block_locations(smart_blocks.insight(block.id));
+        if locations.is_empty() {
+            return;
+        }
+        let current = self
+            .block_error_cursor
+            .filter(|(id, _)| *id == block.id)
+            .map(|(_, index)| index);
+        let index = step.index(current, locations.len());
+        let Some(location) = locations.get(index) else {
+            return;
+        };
+        let mut maybe_path = format!("{}:{}", location.path.display(), location.line);
+        if let Some(column) = location.column {
+            maybe_path.push_str(&format!(":{column}"));
+        }
+        let target = PathLikeTarget {
+            maybe_path,
+            working_directory: block.cwd.clone(),
+        };
+        self.block_error_cursor = Some((block.id, index));
+        open_location_beside_terminal(&self.workspace, &target, window, cx);
+    }
+
     /// Insights recorded before `terminal.smart_blocks` was turned off stay hidden.
     pub(crate) fn enabled_smart_blocks<'a>(&'a self, cx: &'a App) -> Option<&'a SmartBlocks> {
         let (smart_blocks, _) = self.smart_blocks.as_ref()?;

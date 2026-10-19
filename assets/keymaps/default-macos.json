@@ -1429,6 +1429,16 @@
       "cmd-alt-c": "photon_terminal::CopyBlockOutput",
       "cmd-alt-shift-c": "photon_terminal::CopyBlock",
       "cmd-shift-r": "photon_terminal::RerunBlock",
+      "ctrl-cmd-r": "photon_terminal::RerunFailedTests",
+    },
+  },
+  {
+    // photon: step through the errors of the selected (or newest) test or build block.
+    "context": "Terminal && photon_blocks",
+    "use_key_equivalents": true,
+    "bindings": {
+      "f8": "photon_terminal::NextBlockError",
+      "shift-f8": "photon_terminal::PreviousBlockError",
     },
   },
   {
@@ -1451,6 +1461,8 @@
       "ctrl-r": "photon_terminal::SearchHistory",
       "cmd-up": "photon_terminal::SelectPreviousBlock",
       "cmd-down": "photon_terminal::SelectNextBlock",
+      "f8": "photon_terminal::NextBlockError",
+      "shift-f8": "photon_terminal::PreviousBlockError",
       "tab": "photon_terminal::Complete",
       "right": "photon_terminal::AcceptSuggestion",
       "ctrl-c": "photon_terminal::Interrupt",

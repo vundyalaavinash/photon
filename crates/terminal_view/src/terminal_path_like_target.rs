@@ -118,6 +118,41 @@ fn possibly_open_target(
     if terminal_view.hover.is_none() {
         return Task::ready(Ok(None));
     }
+    open_target_beside_terminal(
+        workspace,
+        path_like_target,
+        window,
+        cx,
+        #[cfg(test)]
+        background_path_checks,
+    )
+}
+
+// photon: also opens smart-block error locations, which are not hovered first.
+pub(super) fn open_location_beside_terminal(
+    workspace: &WeakEntity<Workspace>,
+    path_like_target: &PathLikeTarget,
+    window: &mut Window,
+    cx: &mut Context<TerminalView>,
+) {
+    open_target_beside_terminal(
+        workspace,
+        path_like_target,
+        window,
+        cx,
+        #[cfg(test)]
+        BackgroundPathChecks::ProjectPathResolution,
+    )
+    .detach_and_log_err(cx)
+}
+
+fn open_target_beside_terminal(
+    workspace: &WeakEntity<Workspace>,
+    path_like_target: &PathLikeTarget,
+    window: &mut Window,
+    cx: &mut Context<TerminalView>,
+    #[cfg(test)] background_path_checks: BackgroundPathChecks,
+) -> Task<Result<Option<OpenTarget>>> {
     let workspace = workspace.clone();
     let path_like_target = path_like_target.clone();
     cx.spawn_in(window, async move |terminal_view, cx| {

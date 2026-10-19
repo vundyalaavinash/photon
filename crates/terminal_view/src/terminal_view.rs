@@ -176,6 +176,8 @@ pub struct TerminalView {
     // block chrome reads it in later SP1b tasks.
     #[allow(dead_code)]
     smart_blocks: Option<(Entity<photon_terminal::SmartBlocks>, Subscription)>,
+    // photon: the error F8 / shift-F8 last opened, as (block, index into its locations).
+    block_error_cursor: Option<(photon_blocks::BlockId, usize)>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -339,6 +341,7 @@ impl TerminalView {
             block_input,
             block_input_shown: false,
             smart_blocks,
+            block_error_cursor: None, // photon: next/previous error
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -621,6 +624,7 @@ impl TerminalView {
             .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
             .is_some_and(|terminal_panel| terminal_panel.read(cx).assistant_enabled());
         let test_delta = self.selected_block_delta(cx); // photon: the selected test run's changes
+        let smart_buttons = self.selected_block_buttons(cx); // photon: test and build actions
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .when(self.shows_workspace_actions(), |menu| {
@@ -646,7 +650,10 @@ impl TerminalView {
                 )
                 // photon: the selected block's actions.
                 .when(self.selected_block.is_some(), |menu| {
-                    photon_blocks_view::block_menu_items(menu, test_delta)
+                    photon_smart_blocks_view::smart_block_menu_items(
+                        photon_blocks_view::block_menu_items(menu, test_delta),
+                        smart_buttons,
+                    )
                 })
                 .when(
                     assistant_enabled && !matches!(self.mode, TerminalMode::Embedded { .. }),
@@ -4747,5 +4754,121 @@ mod tests {
         assert_eq!(format(12_800), "12.8s");
         assert_eq!(format(252_000), "4m 12s");
         assert_eq!(format(3_720_000), "1h 2m");
+    }
+
+    const TWO_LOCATED_FAILURES: &[u8] = b"\x1b]133;A\x07\x1b]133;B\x07cargo test\r\n\x1b]633;E;cargo test\x07\x1b]133;C\x07---- first stdout ----\r\nthread 'first' panicked at src/a.rs:2:3:\r\n---- second stdout ----\r\nthread 'second' panicked at /project/src/b.rs:1:1:\r\ntest result: FAILED. 0 passed; 2 failed; 0 ignored\r\n\x1b]133;D;101\x07\x1b]133;A\x07\x1b]133;B\x07";
+
+    #[gpui::test]
+    async fn rerun_failed_writes_command_to_pty(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_smart_block_view(cx).await;
+        cx.simulate_keystrokes("cmd-up");
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_keystrokes("ctrl-cmd-r");
+        let expected = photon_blocks::rerun_failed_command(
+            "cargo test",
+            &photon_blocks::TestRun {
+                tool: photon_blocks::TestTool::Cargo,
+                passed: 41,
+                failed: 2,
+                failures: ["bad_one", "bad_two"]
+                    .map(|name| photon_blocks::TestFailure {
+                        name: name.to_string(),
+                        location: None,
+                    })
+                    .to_vec(),
+                packages: Vec::new(),
+            },
+        )
+        .expect("cargo test can be re-run");
+        assert_eq!(
+            take_pty_writes(&terminal, &mut cx).concat(),
+            format!("\x15\x1b[200~{expected}\x1b[201~\r").into_bytes()
+        );
+    }
+
+    #[gpui::test]
+    async fn open_errors_opens_location_beside_terminal(cx: &mut TestAppContext) {
+        use crate::photon_smart_blocks_view::OpenBlockErrors;
+        use editor::ToPoint as _;
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let workspace = terminal_view.read_with(&cx, |view, _| view.workspace.clone());
+        let workspace = workspace.upgrade().expect("workspace");
+        cx.update(|_, cx| editor::init(cx));
+        let fs = workspace
+            .read_with(&cx, |workspace, cx| {
+                workspace.project().read(cx).fs().clone()
+            })
+            .as_fake()
+            .clone();
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({ "src": { "a.rs": "one\ntwo\nthree\n" } }),
+        )
+        .await;
+        workspace
+            .update(&mut cx, |workspace, cx| {
+                workspace.project().update(cx, |project, cx| {
+                    project.find_or_create_worktree("/project", true, cx)
+                })
+            })
+            .await
+            .expect("worktree");
+        feed_block_output(&terminal, TWO_LOCATED_FAILURES, &mut cx);
+        cx.run_until_parked();
+
+        // Nothing selected: the newest block with locations is used.
+        cx.simulate_keystrokes("cmd-up");
+        cx.dispatch_action(OpenBlockErrors);
+        cx.run_until_parked();
+
+        let terminal_pane = workspace.read_with(&cx, |workspace, _| {
+            workspace
+                .pane_for_item_id(terminal_view.entity_id())
+                .expect("terminal pane")
+        });
+        workspace.read_with(&cx, |workspace, cx| {
+            assert_eq!(workspace.panes().len(), 2);
+            let editor_pane = workspace
+                .panes()
+                .iter()
+                .find(|pane| pane.entity_id() != terminal_pane.entity_id())
+                .expect("editor pane");
+            let editor = editor_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<Editor>())
+                .expect("editor item");
+            let editor = editor.read(cx);
+            assert_eq!(editor.text(cx), "one\ntwo\nthree\n");
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let row = editor
+                .selections
+                .newest_anchor()
+                .head()
+                .to_point(&snapshot)
+                .row;
+            assert_eq!(row, 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn next_error_cycles_and_wraps(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(&terminal, TWO_LOCATED_FAILURES, &mut cx);
+        cx.run_until_parked();
+        let cursor = |cx: &mut VisualTestContext| {
+            terminal_view.read_with(cx, |view, _| {
+                view.block_error_cursor.map(|(_, index)| index)
+            })
+        };
+        assert_eq!(cursor(&mut cx), None);
+        for expected in [0, 1, 0] {
+            cx.simulate_keystrokes("f8");
+            assert_eq!(cursor(&mut cx), Some(expected));
+        }
+        cx.simulate_keystrokes("shift-f8");
+        assert_eq!(cursor(&mut cx), Some(1));
+        cx.simulate_keystrokes("shift-f8");
+        assert_eq!(cursor(&mut cx), Some(0));
     }
 }

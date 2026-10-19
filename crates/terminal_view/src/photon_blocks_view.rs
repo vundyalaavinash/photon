@@ -374,6 +374,7 @@ pub(crate) fn register_block_actions(
         )
         .on_action(cx.listener(TerminalView::rerun_block))
         .on_action(cx.listener(TerminalView::clear_block_selection))
+        .map(|element| crate::photon_smart_blocks_view::register_smart_block_actions(element, cx))
 }
 
 /// The selected block's actions in the terminal's right-click menu.
