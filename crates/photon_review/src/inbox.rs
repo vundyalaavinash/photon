@@ -176,6 +176,7 @@ pub struct InboxPanel {
     in_flight_cleanups: InFlightCleanups,
     // Dock restoration calls `set_active(true)` at startup; nothing may load until the user acts.
     user_activated: bool,
+    with_drafts: HashSet<PrKey>,
     load_task: Task<()>,
 }
 
@@ -193,6 +194,7 @@ impl InboxPanel {
                     refreshing: false,
                     in_flight_cleanups: Arc::default(),
                     user_activated: false,
+                    with_drafts: HashSet::default(),
                     load_task: Task::ready(()),
                 })
             })
@@ -213,10 +215,14 @@ impl InboxPanel {
             self.state = InboxState::Loading;
         }
         self.load_task = cx.spawn(async move |this, cx| {
-            let (state, closed) = cx
+            let (state, closed, with_drafts) = cx
                 .background_spawn({
                     let database = database.clone();
-                    load_inbox(runner, database)
+                    async move {
+                        let (state, closed) = load_inbox(runner, database.clone()).await;
+                        let with_drafts = prs_with_drafts(&state, &database);
+                        (state, closed, with_drafts)
+                    }
                 })
                 .await;
             // Detached so a newer refresh never cancels a half-finished cleanup.
@@ -224,6 +230,7 @@ impl InboxPanel {
                 .detach();
             this.update(cx, |this, cx| {
                 this.state = state;
+                this.with_drafts = with_drafts;
                 this.refreshing = false;
                 cx.notify();
             })
@@ -237,6 +244,25 @@ fn failed(error: anyhow::Error) -> GhError {
     GhError::Failed {
         message: format!("{error:#}"),
     }
+}
+
+fn prs_with_drafts(state: &InboxState, database: &ReviewDb) -> HashSet<PrKey> {
+    let InboxState::Loaded(hosts) = state else {
+        return HashSet::default();
+    };
+    hosts
+        .iter()
+        .filter_map(|host| host.result.as_ref().ok())
+        .flat_map(|inbox| inbox.sections.iter())
+        .flat_map(|(_, summaries)| summaries.iter())
+        .filter(|summary| {
+            database
+                .drafts(&summary.key)
+                .log_err()
+                .is_some_and(|drafts| !drafts.is_empty())
+        })
+        .map(|summary| summary.key.clone())
+        .collect()
 }
 
 async fn load_inbox(runner: Arc<dyn GhRunner>, database: ReviewDb) -> (InboxState, Vec<Tracked>) {
@@ -422,8 +448,12 @@ impl InboxPanel {
         Label::new(text).color(color).size(LabelSize::Small)
     }
 
+    fn row(&self, summary: &PrSummary) -> RowMeta {
+        row_meta(summary, self.with_drafts.contains(&summary.key))
+    }
+
     fn render_row(&self, summary: &PrSummary, cx: &mut Context<Self>) -> impl IntoElement {
-        let row = row_meta(summary, false);
+        let row = self.row(summary);
         let key = &summary.key;
         let id = format!("{}/{}/{}#{}", key.host, key.owner, key.repo, key.number);
         let primary_summary = summary.clone();
@@ -1138,5 +1168,49 @@ mod tests {
         assert_eq!(section_label(InboxGroup::Yours, 2), "Yours · 2");
         assert_eq!(section_label(InboxGroup::Mentioned, 0), "Mentioned · 0");
         assert_eq!(EMPTY_INBOX_TEXT, "No open pull requests.");
+    }
+
+    #[gpui::test]
+    async fn drafts_make_the_row_continue_review(cx: &mut TestAppContext) {
+        let fake = FakeGh::new();
+        init_test(cx, &fake);
+        respond_auth(&fake, AUTH_ONE_HOST);
+        respond_inbox(&fake, "github.com");
+        let (_workspace, panel, mut cx) = add_panel(cx).await;
+        set_active(&panel, true, &mut cx);
+        let first_row = |panel: &InboxPanel| {
+            let InboxState::Loaded(hosts) = panel.state() else {
+                panic!("expected Loaded");
+            };
+            let inbox = hosts[0].result.as_ref().expect("inbox");
+            let summary = inbox.sections[0].1[0].clone();
+            (summary.key.clone(), panel.row(&summary).primary_action)
+        };
+        let (key, action) = panel.read_with(&cx, |panel, _| first_row(panel));
+        assert_eq!(action, "Start review");
+
+        let database = cx.update(|_, cx| ReviewDb::global(cx));
+        database
+            .save_draft(crate::Draft {
+                id: None,
+                key,
+                path: "src/a.rs".into(),
+                side: crate::Side::Right,
+                start_line: 1,
+                end_line: 1,
+                commit: "a1".into(),
+                anchor_text: "fn a() {}".into(),
+                body: "Why?".into(),
+                outdated: false,
+                general: false,
+            })
+            .await
+            .expect("save");
+        respond_auth(&fake, AUTH_ONE_HOST);
+        respond_inbox(&fake, "github.com");
+        panel.update(&mut cx, |panel, cx| panel.refresh(cx));
+        cx.run_until_parked();
+        let (_, action) = panel.read_with(&cx, |panel, _| first_row(panel));
+        assert_eq!(action, "Continue review");
     }
 }

@@ -1,3 +1,4 @@
+mod anchoring;
 mod checkout;
 mod context;
 mod diff;
@@ -9,6 +10,7 @@ mod review;
 mod review_map;
 mod store;
 
+pub use anchoring::*;
 pub use checkout::*;
 pub use context::*;
 pub use diff::*;

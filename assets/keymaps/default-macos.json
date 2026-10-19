@@ -1433,6 +1433,14 @@
     },
   },
   {
+    // photon: start a draft comment on the selected lines of a pull request review.
+    "context": "PhotonReview > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-alt-m": "photon_review::AddComment",
+    },
+  },
+  {
     // photon: step through the errors of the selected (or newest) test or build block; a running program gets F8.
     "context": "Terminal && photon_blocks && !photon_keys_to_pty",
     "use_key_equivalents": true,

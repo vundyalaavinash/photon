@@ -1,16 +1,18 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use db::sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection};
 
-use crate::PrKey;
+use crate::{PrKey, Side};
 
 pub struct ReviewDb(ThreadSafeConnection);
 
 impl Domain for ReviewDb {
     const NAME: &str = "photon_review";
 
-    const MIGRATIONS: &[&str] = &["CREATE TABLE IF NOT EXISTS reviews(
+    const MIGRATIONS: &[&str] = &[
+        "CREATE TABLE IF NOT EXISTS reviews(
             host TEXT NOT NULL,
             owner TEXT NOT NULL,
             repo TEXT NOT NULL,
@@ -20,7 +22,32 @@ impl Domain for ReviewDb {
             worktree TEXT NOT NULL,
             last_review_commit TEXT,
             PRIMARY KEY(host, owner, repo, number)
-        ) STRICT;"];
+        ) STRICT;",
+        "CREATE TABLE drafts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            side TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            commit_sha TEXT NOT NULL,
+            anchor_text TEXT NOT NULL,
+            body TEXT NOT NULL,
+            outdated INTEGER NOT NULL,
+            general INTEGER NOT NULL
+        ) STRICT;
+        CREATE TABLE viewed_steps(
+            host TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            step_key TEXT NOT NULL,
+            PRIMARY KEY(host, owner, repo, number, step_key)
+        ) STRICT;",
+    ];
 }
 
 db::static_connection!(ReviewDb, []);
@@ -32,6 +59,27 @@ pub struct Tracked {
     pub repo_dir: PathBuf,
     pub worktree: PathBuf,
 }
+
+/// A review comment the user is writing. Lines are 1-based; `Side::Left` lines are base lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Draft {
+    pub id: Option<i64>,
+    pub key: PrKey,
+    pub path: String,
+    pub side: Side,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub commit: String,
+    pub anchor_text: String,
+    pub body: String,
+    pub outdated: bool,
+    pub general: bool,
+}
+
+type DraftRow = (
+    (i64, String, String, i64, i64),
+    (String, String, String, bool, bool),
+);
 
 type TrackedRow = (String, String, String, i64, String, String, String);
 
@@ -116,6 +164,136 @@ impl ReviewDb {
         })
         .await
     }
+
+    pub fn drafts(&self, key: &PrKey) -> Result<Vec<Draft>> {
+        let number = i64::try_from(key.number)?;
+        self.select_bound::<(String, String, String, i64), DraftRow>(
+            "SELECT id, path, side, start_line, end_line,
+                    commit_sha, anchor_text, body, outdated, general
+             FROM drafts WHERE host = ?1 AND owner = ?2 AND repo = ?3 AND number = ?4
+             ORDER BY id",
+        )?((
+            key.host.clone(),
+            key.owner.clone(),
+            key.repo.clone(),
+            number,
+        ))?
+        .into_iter()
+        .map(
+            |(
+                (id, path, side, start_line, end_line),
+                (commit, anchor_text, body, outdated, general),
+            )| {
+                Ok(Draft {
+                    id: Some(id),
+                    key: key.clone(),
+                    path,
+                    side: match side.as_str() {
+                        "LEFT" => Side::Left,
+                        _ => Side::Right,
+                    },
+                    start_line: u32::try_from(start_line)?,
+                    end_line: u32::try_from(end_line)?,
+                    commit,
+                    anchor_text,
+                    body,
+                    outdated,
+                    general,
+                })
+            },
+        )
+        .collect()
+    }
+
+    /// Inserts a draft without an id, otherwise updates the row with its id. Returns the id.
+    pub async fn save_draft(&self, draft: Draft) -> Result<i64> {
+        let number = i64::try_from(draft.key.number)?;
+        let side = match draft.side {
+            Side::Left => "LEFT",
+            Side::Right => "RIGHT",
+        };
+        let fields = (
+            (
+                draft.path,
+                side.to_string(),
+                i64::from(draft.start_line),
+                i64::from(draft.end_line),
+            ),
+            (
+                draft.commit,
+                draft.anchor_text,
+                draft.body,
+                draft.outdated,
+                draft.general,
+            ),
+        );
+        let key = draft.key;
+        self.write(move |connection| match draft.id {
+            Some(id) => {
+                connection.exec_bound::<(_, i64)>(
+                    "UPDATE drafts SET path = ?1, side = ?2, start_line = ?3, end_line = ?4,
+                        commit_sha = ?5, anchor_text = ?6, body = ?7, outdated = ?8, general = ?9
+                     WHERE id = ?10",
+                )?((fields, id))?;
+                Ok(id)
+            }
+            None => connection.select_row_bound::<_, i64>(
+                "INSERT INTO drafts(host, owner, repo, number, path, side, start_line,
+                        end_line, commit_sha, anchor_text, body, outdated, general)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     RETURNING id",
+            )?(((key.host, key.owner, key.repo, number), fields))?
+            .context("insert returned no id"),
+        })
+        .await
+    }
+
+    pub async fn delete_draft(&self, id: i64) -> Result<()> {
+        self.delete_drafts(vec![id]).await
+    }
+
+    pub async fn delete_drafts(&self, ids: Vec<i64>) -> Result<()> {
+        self.write(move |connection| {
+            let mut delete = connection.exec_bound::<i64>("DELETE FROM drafts WHERE id = ?1")?;
+            for id in ids {
+                delete(id)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub fn viewed_steps(&self, key: &PrKey) -> Result<HashSet<String>> {
+        let number = i64::try_from(key.number)?;
+        Ok(self.select_bound::<(String, String, String, i64), String>(
+            "SELECT step_key FROM viewed_steps
+                 WHERE host = ?1 AND owner = ?2 AND repo = ?3 AND number = ?4",
+        )?((
+            key.host.clone(),
+            key.owner.clone(),
+            key.repo.clone(),
+            number,
+        ))?
+        .into_iter()
+        .collect())
+    }
+
+    pub async fn set_step_viewed(&self, key: PrKey, step_key: String, viewed: bool) -> Result<()> {
+        let number = i64::try_from(key.number)?;
+        let query = if viewed {
+            "INSERT OR IGNORE INTO viewed_steps(host, owner, repo, number, step_key)
+             VALUES (?1, ?2, ?3, ?4, ?5)"
+        } else {
+            "DELETE FROM viewed_steps
+             WHERE host = ?1 AND owner = ?2 AND repo = ?3 AND number = ?4 AND step_key = ?5"
+        };
+        self.write(move |connection| {
+            connection.exec_bound::<(String, String, String, i64, String)>(query)?((
+                key.host, key.owner, key.repo, number, step_key,
+            ))
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +343,83 @@ mod tests {
         db.untrack(key(7)).await.unwrap();
         assert_eq!(db.tracked().unwrap(), vec![tracked(9)]);
         assert_eq!(db.last_review(&key(7)).unwrap(), None);
+    }
+
+    fn draft(number: u64, path: &str, start_line: u32) -> Draft {
+        Draft {
+            id: None,
+            key: key(number),
+            path: path.into(),
+            side: Side::Right,
+            start_line,
+            end_line: start_line + 1,
+            commit: "abc".into(),
+            anchor_text: "a\nb".into(),
+            body: "Why?".into(),
+            outdated: false,
+            general: false,
+        }
+    }
+
+    #[gpui::test]
+    async fn drafts_round_trip(cx: &mut gpui::TestAppContext) {
+        let db = cx
+            .foreground_executor()
+            .block_test(ReviewDb::open_test_db("drafts_round_trip"));
+        assert_eq!(db.drafts(&key(7)).unwrap(), vec![]);
+
+        let mut first = draft(7, "src/b.rs", 3);
+        first.id = Some(db.save_draft(first.clone()).await.unwrap());
+        let mut second = draft(7, "src/a.rs", 9);
+        second.side = Side::Left;
+        second.outdated = true;
+        second.general = true;
+        second.id = Some(db.save_draft(second.clone()).await.unwrap());
+        let mut other = draft(8, "src/a.rs", 1);
+        other.id = Some(db.save_draft(other.clone()).await.unwrap());
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            db.drafts(&key(7)).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+
+        first.body = "Why not?".into();
+        first.start_line = 4;
+        first.commit = "def".into();
+        assert_eq!(
+            db.save_draft(first.clone()).await.unwrap(),
+            first.id.unwrap()
+        );
+        assert_eq!(
+            db.drafts(&key(7)).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+
+        db.delete_draft(second.id.unwrap()).await.unwrap();
+        assert_eq!(db.drafts(&key(7)).unwrap(), vec![first.clone()]);
+        db.delete_drafts(vec![first.id.unwrap(), other.id.unwrap()])
+            .await
+            .unwrap();
+        assert_eq!(db.drafts(&key(7)).unwrap(), vec![]);
+        assert_eq!(db.drafts(&key(8)).unwrap(), vec![]);
+
+        assert!(db.viewed_steps(&key(7)).unwrap().is_empty());
+        db.set_step_viewed(key(7), "src/a.rs::f".into(), true)
+            .await
+            .unwrap();
+        db.set_step_viewed(key(7), "src/a.rs::f".into(), true)
+            .await
+            .unwrap();
+        db.set_step_viewed(key(7), "src/b.rs".into(), true)
+            .await
+            .unwrap();
+        db.set_step_viewed(key(7), "src/b.rs".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.viewed_steps(&key(7)).unwrap(),
+            HashSet::from_iter(["src/a.rs::f".to_string()])
+        );
+        assert!(db.viewed_steps(&key(8)).unwrap().is_empty());
     }
 }

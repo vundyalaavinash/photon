@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use buffer_diff::BufferDiff;
 use editor::{
-    Editor, EditorEvent, ExcerptRange, MultiBuffer, PathKey, RowHighlightOptions,
+    Anchor, Editor, EditorEvent, ExcerptRange, MultiBuffer, MultiBufferSnapshot, PathKey,
+    RowHighlightOptions,
     display_map::{
         BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, RenderBlock,
     },
@@ -14,11 +15,11 @@ use editor::{
 use futures::future::{join_all, try_join_all};
 use gpui::{
     Action as _, AnyWindowHandle, App, AsyncApp, AsyncWindowContext, Context, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Global, HighlightStyle, Render, SharedString, StyledText,
-    Subscription, Task, WeakEntity, Window, actions, rgb,
+    EventEmitter, FocusHandle, Focusable, Global, HighlightStyle, PromptLevel, Render,
+    SharedString, Stateful, StyledText, Subscription, Task, WeakEntity, Window, actions, rgb,
 };
 use language::{Buffer, Capability, Point};
-use multi_buffer::build_excerpt_ranges;
+use multi_buffer::{ToPoint as _, build_excerpt_ranges};
 use parking_lot::Mutex;
 use project::{
     Project,
@@ -34,12 +35,13 @@ use workspace::{
 
 use crate::{
     CallerMark, ChangedFunction, Checkout, ChecksState, ContextCache, ContextError, ContextExcerpt,
-    FileAnalysis, FileDiff, FileKind, FileStatus, FunctionContext, GhError, GhRunner, LoadedFile,
-    MapFile, MapFunction, PrDetail, PrKey, PrSummary, RepoId, ReviewDb, Step, Tracked,
-    analyse_loaded_file, auth_status_request, base_text, build_loaded_file, build_review_map,
-    call_edges, caller_touched, candidate_repos, classify_caller, classify_path,
-    context::buffer_path, context_excerpts, detail_request, fetch_url, find_clone, functions,
-    gh_runner, git_diff, parse_auth_status, parse_detail, prepare_checkout, review_root,
+    Draft, FileAnalysis, FileDiff, FileKind, FileStatus, FunctionContext, GhError, GhRunner,
+    LoadedFile, MapFile, MapFunction, PrDetail, PrKey, PrSummary, Reanchor, RepoId, ReviewDb,
+    ReviewThread, Side, Step, Tracked, analyse_loaded_file, auth_status_request, base_text,
+    build_loaded_file, build_review_map, call_edges, caller_touched, candidate_repos,
+    classify_caller, classify_path, commentable_lines, context::buffer_path, context_excerpts,
+    detail_request, fetch_url, find_clone, functions, gh_runner, git_diff, landing_note,
+    parse_auth_status, parse_detail, place, prepare_checkout, reanchor, review_root,
 };
 
 actions!(
@@ -48,11 +50,14 @@ actions!(
         /// Shows the next step of the pull request review map.
         NextStep,
         /// Shows the previous step of the pull request review map.
-        PreviousStep
+        PreviousStep,
+        /// Starts a draft review comment on the selected lines.
+        AddComment
     ]
 );
 
 const HUNK_CONTEXT_LINES: u32 = 3;
+const COMPOSER_MAX_LINES: u32 = 4;
 const TRUST_REASON: &str = "Trust this worktree to find callers";
 const UNCHANGED_BACKGROUND: u32 = 0x07090b;
 const IMPACT_LEGEND: &str = "Every caller in the repo, not just the diff. Red: the signature \
@@ -73,6 +78,53 @@ pub struct ImpactRow {
 }
 
 struct UnchangedContext;
+
+/// The database side of one draft. Writes run one at a time; a newer body replaces a pending
+/// one, so the newest text always lands last without a timer.
+#[derive(Default)]
+struct DraftSync {
+    pending: Option<Draft>,
+    id: Option<i64>,
+    in_flight: bool,
+    deleted: bool,
+    error: Option<SharedString>,
+}
+
+enum SyncJob {
+    Save(Draft),
+    Delete(i64),
+}
+
+impl DraftSync {
+    fn next_job(&mut self) -> Option<SyncJob> {
+        if let Some(mut draft) = self.pending.take() {
+            draft.id = self.id;
+            return Some(SyncJob::Save(draft));
+        }
+        if self.deleted
+            && let Some(id) = self.id.take()
+        {
+            return Some(SyncJob::Delete(id));
+        }
+        self.in_flight = false;
+        None
+    }
+}
+
+struct DraftView {
+    local_id: usize,
+    composer: Option<Entity<Editor>>,
+    sync: Arc<Mutex<DraftSync>>,
+    _composer_subscription: Option<Subscription>,
+}
+
+struct SelectedLines {
+    path: String,
+    side: Side,
+    start_line: u32,
+    end_line: u32,
+    anchor_text: String,
+}
 
 pub struct ReviewItem {
     project: Entity<Project>,
@@ -96,6 +148,14 @@ pub struct ReviewItem {
     label_blocks: HashSet<CustomBlockId>,
     impact_function: Option<String>,
     impact: Vec<ImpactRow>,
+    database: ReviewDb,
+    commentable: HashMap<String, Vec<RangeInclusive<u32>>>,
+    drafts: Vec<Draft>,
+    draft_views: Vec<DraftView>,
+    next_draft_id: usize,
+    reply_editors: HashMap<String, Entity<Editor>>,
+    comment_blocks: HashSet<CustomBlockId>,
+    _reanchor_task: Task<()>,
     _lsp_handles: Vec<OpenLspBufferHandle>,
     _subscriptions: Vec<Subscription>,
     _context_task: Task<()>,
@@ -205,8 +265,11 @@ async fn open_in_new_window(
     let candidates = candidates.await;
     let url = fetch_url(&repo_id(&summary));
     let prepared = cx
-        .background_spawn(async move {
-            prepare_review(&summary, url, review_root(), candidates, runner, database).await
+        .background_spawn({
+            let database = database.clone();
+            async move {
+                prepare_review(&summary, url, review_root(), candidates, runner, database).await
+            }
         })
         .await?;
     let opened = cx
@@ -222,7 +285,14 @@ async fn open_in_new_window(
             )
         })?
         .await?;
-    place_review(opened.workspace, opened.window.into(), prepared, cx).await
+    place_review(
+        opened.workspace,
+        opened.window.into(),
+        prepared,
+        database,
+        cx,
+    )
+    .await
 }
 
 /// Adds the review to the workspace's active pane, or replaces an open review of the same pull
@@ -231,6 +301,7 @@ async fn place_review(
     workspace: Entity<Workspace>,
     window: AnyWindowHandle,
     prepared: PreparedReview,
+    database: ReviewDb,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let PreparedReview {
@@ -255,7 +326,8 @@ async fn place_review(
             let existing = workspace
                 .items_of_type::<ReviewItem>(cx)
                 .find(|item| item.read(cx).detail.summary.key == key);
-            let item = cx.new(|cx| ReviewItem::new(project, detail, checkout, files, window, cx));
+            let item = cx
+                .new(|cx| ReviewItem::new(project, detail, checkout, files, database, window, cx));
             let pane = existing.as_ref().and_then(|existing| {
                 workspace
                     .panes()
@@ -403,12 +475,119 @@ fn label_renderer(
     })
 }
 
+fn comment_card(id: ElementId, block: &BlockContext) -> Stateful<Div> {
+    let colors = block.app.theme().colors();
+    v_flex()
+        .id(id)
+        .ml(block.margins.gutter.full_width())
+        .mr_4()
+        .my_1()
+        .p_2()
+        .gap_1()
+        .rounded_md()
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.panel_background)
+}
+
+fn draft_renderer(
+    item: WeakEntity<ReviewItem>,
+    local_id: usize,
+    line: u32,
+    body: SharedString,
+    note: Option<SharedString>,
+    composer: Option<Entity<Editor>>,
+    sync: Arc<Mutex<DraftSync>>,
+) -> RenderBlock {
+    Arc::new(move |block: &mut BlockContext| {
+        let error = sync.lock().error.clone();
+        let add_item = item.clone();
+        let cancel_item = item.clone();
+        comment_card(("photon-review-draft", local_id).into(), block)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Label::new("you").size(LabelSize::Small))
+                    .child(
+                        Label::new(format!("· on line {line} · draft"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .map(|this| match &composer {
+                Some(editor) => this.child(editor.clone()),
+                None => this.child(Label::new(body.clone()).size(LabelSize::Small)),
+            })
+            .children(
+                note.clone()
+                    .map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
+            )
+            .children(error.map(|error| {
+                Label::new(error)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
+            }))
+            .when(composer.is_some(), |this| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("add", "Add to review")
+                                .style(ButtonStyle::Filled)
+                                .on_click(move |_, _, cx| {
+                                    add_item
+                                        .update(cx, |item, cx| item.collapse_draft(local_id, cx))
+                                        .log_err();
+                                }),
+                        )
+                        .child(
+                            Button::new("cancel", "Cancel").on_click(move |_, window, cx| {
+                                cancel_item
+                                    .update(cx, |item, cx| item.cancel_draft(local_id, window, cx))
+                                    .log_err();
+                            }),
+                        ),
+                )
+            })
+            .into_any_element()
+    })
+}
+
+/// Reply and Resolve are wired to GitHub in Task 11.
+fn thread_renderer(thread: ReviewThread, reply: Option<Entity<Editor>>) -> RenderBlock {
+    Arc::new(move |block: &mut BlockContext| {
+        let id = SharedString::from(format!("photon-review-thread-{}", thread.id));
+        comment_card(id.into(), block)
+            .children(thread.comments.iter().map(|comment| {
+                v_flex()
+                    .child(Label::new(comment.author.clone()).size(LabelSize::Small))
+                    .child(Label::new(comment.body.clone()).size(LabelSize::Small))
+            }))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .children(reply.clone().map(|editor| div().flex_1().child(editor)))
+                    .child(Button::new("reply", "Reply"))
+                    .child(Button::new(
+                        "resolve",
+                        if thread.is_resolved {
+                            "Unresolve"
+                        } else {
+                            "Resolve"
+                        },
+                    )),
+            )
+            .into_any_element()
+    })
+}
+
 impl ReviewItem {
     pub fn new(
         project: Entity<Project>,
         detail: PrDetail,
         checkout: Checkout,
         files: Vec<LoadedFile>,
+        database: ReviewDb,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -458,6 +637,26 @@ impl ReviewItem {
                 },
             ));
         }
+        let commentable = files
+            .iter()
+            .map(|file| (file.diff.path.clone(), commentable_lines(&file.diff)))
+            .collect();
+        let reply_editors = detail
+            .threads
+            .iter()
+            .map(|thread| {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text("Reply…", window, cx);
+                    editor
+                });
+                (thread.id.clone(), editor)
+            })
+            .collect();
+        let stored_drafts = database
+            .drafts(&detail.summary.key)
+            .log_err()
+            .unwrap_or_default();
         let mut this = Self {
             project,
             detail,
@@ -480,13 +679,463 @@ impl ReviewItem {
             label_blocks: HashSet::new(),
             impact_function: None,
             impact: Vec::new(),
+            database,
+            commentable,
+            drafts: Vec::new(),
+            draft_views: Vec::new(),
+            next_draft_id: 0,
+            reply_editors,
+            comment_blocks: HashSet::new(),
+            _reanchor_task: Task::ready(()),
             _lsp_handles: lsp_handles,
             _subscriptions: subscriptions,
             _context_task: Task::ready(()),
         };
+        for draft in stored_drafts {
+            this.push_draft(draft, None, cx);
+        }
         this.rebuild_map(&[], cx);
         this._context_task = this.load_context(cx);
+        this._reanchor_task = this.reanchor_drafts(cx);
         this
+    }
+
+    pub fn drafts(&self) -> &[Draft] {
+        &self.drafts
+    }
+
+    fn draft_index(&self, local_id: usize) -> Option<usize> {
+        self.draft_views
+            .iter()
+            .position(|view| view.local_id == local_id)
+    }
+
+    fn draft_note(&self, draft: &Draft) -> Option<String> {
+        landing_note(&place(draft, &self.commentable))
+    }
+
+    fn push_draft(
+        &mut self,
+        draft: Draft,
+        composer: Option<Entity<Editor>>,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let local_id = self.next_draft_id;
+        self.next_draft_id += 1;
+        let subscription = composer.as_ref().map(|composer| {
+            cx.subscribe(composer, move |this, editor, event: &EditorEvent, cx| {
+                if !matches!(event, EditorEvent::BufferEdited) {
+                    return;
+                }
+                let body = editor.read(cx).text(cx);
+                if let Some(index) = this.draft_index(local_id) {
+                    this.drafts[index].body = body;
+                    this.queue_save(local_id, cx);
+                }
+            })
+        });
+        let sync = Arc::new(Mutex::new(DraftSync {
+            id: draft.id,
+            ..DraftSync::default()
+        }));
+        self.drafts.push(draft);
+        self.draft_views.push(DraftView {
+            local_id,
+            composer,
+            sync,
+            _composer_subscription: subscription,
+        });
+        local_id
+    }
+
+    fn queue_save(&mut self, local_id: usize, cx: &mut Context<Self>) {
+        let Some(index) = self.draft_index(local_id) else {
+            return;
+        };
+        let sync = self.draft_views[index].sync.clone();
+        sync.lock().pending = Some(self.drafts[index].clone());
+        self.start_sync(local_id, sync, cx);
+    }
+
+    fn start_sync(&self, local_id: usize, sync: Arc<Mutex<DraftSync>>, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut sync.lock().in_flight, true) {
+            return;
+        }
+        let database = self.database.clone();
+        // Detached so closing the review never cancels the write of what the user typed.
+        cx.spawn(async move |this, cx| {
+            loop {
+                let job = sync.lock().next_job();
+                match job {
+                    None => return,
+                    Some(SyncJob::Delete(id)) => {
+                        database.delete_draft(id).await.log_err();
+                    }
+                    Some(SyncJob::Save(draft)) => {
+                        let result = database.save_draft(draft).await;
+                        let saved_id = {
+                            let mut state = sync.lock();
+                            match result {
+                                Ok(id) => {
+                                    state.id = Some(id);
+                                    state.error = None;
+                                    Some(id)
+                                }
+                                Err(error) => {
+                                    log::error!("saving a review draft failed: {error:#}");
+                                    state.error =
+                                        Some(format!("Couldn't save this draft: {error:#}").into());
+                                    None
+                                }
+                            }
+                        };
+                        // The review may be closed by now; the write itself already happened.
+                        this.update(cx, |this, cx| {
+                            if let (Some(id), Some(index)) = (saved_id, this.draft_index(local_id))
+                            {
+                                this.drafts[index].id = Some(id);
+                            }
+                            // Draft cards read the save error when the editor redraws them.
+                            this.editor.update(cx, |_, cx| cx.notify());
+                        })
+                        .ok();
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn discard_draft(&mut self, local_id: usize, cx: &mut Context<Self>) {
+        let Some(index) = self.draft_index(local_id) else {
+            return;
+        };
+        self.drafts.remove(index);
+        let view = self.draft_views.remove(index);
+        {
+            let mut state = view.sync.lock();
+            state.pending = None;
+            state.deleted = true;
+        }
+        self.start_sync(local_id, view.sync, cx);
+        self.show_comments(cx);
+        cx.notify();
+    }
+
+    pub fn cancel_draft(&mut self, local_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.draft_index(local_id) else {
+            return;
+        };
+        if self.drafts[index].body.trim().is_empty() {
+            self.discard_draft(local_id, cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Discard this draft?",
+            None,
+            &["Discard", "Keep"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await.ok() == Some(0) {
+                this.update(cx, |this, cx| this.discard_draft(local_id, cx))
+                    .log_err();
+            }
+        })
+        .detach();
+    }
+
+    fn collapse_draft(&mut self, local_id: usize, cx: &mut Context<Self>) {
+        let Some(index) = self.draft_index(local_id) else {
+            return;
+        };
+        if self.drafts[index].body.trim().is_empty() {
+            return;
+        }
+        let view = &mut self.draft_views[index];
+        view.composer = None;
+        view._composer_subscription = None;
+        self.show_comments(cx);
+        cx.notify();
+    }
+
+    /// The newest selection's lines in the buffer under it: the head buffer of any excerpt
+    /// (`Side::Right`), or the base text of deleted rows (`Side::Left`).
+    fn selected_lines(&self, cx: &App) -> Option<SelectedLines> {
+        let selection = *self.editor.read(cx).selections.newest_anchor();
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let start = selection.start.to_point(&snapshot);
+        let mut end = selection.end.to_point(&snapshot);
+        // A selection ending at the start of a line doesn't include that line.
+        if end.row > start.row && end.column == 0 {
+            end = Point::new(end.row - 1, 0);
+        }
+        let (buffer, start_point) = snapshot.point_to_buffer_point(Point::new(start.row, 0))?;
+        let end_row = snapshot
+            .point_to_buffer_point(Point::new(end.row, 0))
+            .filter(|(end_buffer, _)| end_buffer.remote_id() == buffer.remote_id())
+            .map_or(start_point.row, |(_, point)| point.row.max(start_point.row));
+        let anchor_text = (start_point.row..=end_row)
+            .map(|row| {
+                buffer
+                    .text_for_range(Point::new(row, 0)..Point::new(row, buffer.line_len(row)))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let buffer_id = buffer.remote_id();
+        let base_file = self.files.iter().find(|file| {
+            file.contents.as_ref().is_some_and(|(_, diff)| {
+                diff.read(cx).base_text_buffer().read(cx).remote_id() == buffer_id
+            })
+        });
+        let (path, side) = match base_file {
+            Some(file) => (file.diff.path.clone(), Side::Left),
+            None => {
+                let buffer = self.multibuffer.read(cx).buffer(buffer_id)?;
+                let path = buffer_path(&buffer, cx).or_else(|| {
+                    self.files
+                        .iter()
+                        .find(|file| file.contents.as_ref().is_some_and(|(b, _)| *b == buffer))
+                        .map(|file| file.diff.path.clone())
+                })?;
+                (path, Side::Right)
+            }
+        };
+        Some(SelectedLines {
+            path,
+            side,
+            start_line: start_point.row + 1,
+            end_line: end_row + 1,
+            anchor_text,
+        })
+    }
+
+    fn add_comment(&mut self, _: &AddComment, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(lines) = self.selected_lines(cx) else {
+            return;
+        };
+        let draft = Draft {
+            id: None,
+            key: self.detail.summary.key.clone(),
+            path: lines.path,
+            side: lines.side,
+            start_line: lines.start_line,
+            end_line: lines.end_line,
+            commit: self.checkout.head_sha.clone(),
+            anchor_text: lines.anchor_text,
+            body: String::new(),
+            outdated: false,
+            general: false,
+        };
+        let composer = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, COMPOSER_MAX_LINES as usize, window, cx);
+            editor.set_placeholder_text("Leave a comment", window, cx);
+            editor
+        });
+        self.push_draft(draft, Some(composer.clone()), cx);
+        self.show_comments(cx);
+        window.focus(&composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Moves a draft to the current selection, which also makes an outdated draft current again.
+    pub fn replace_draft(&mut self, local_id: usize, cx: &mut Context<Self>) {
+        let (Some(lines), Some(index)) = (self.selected_lines(cx), self.draft_index(local_id))
+        else {
+            return;
+        };
+        let draft = &mut self.drafts[index];
+        draft.path = lines.path;
+        draft.side = lines.side;
+        draft.start_line = lines.start_line;
+        draft.end_line = lines.end_line;
+        draft.anchor_text = lines.anchor_text;
+        draft.commit = self.checkout.head_sha.clone();
+        draft.outdated = false;
+        draft.general = false;
+        self.queue_save(local_id, cx);
+        self.show_comments(cx);
+        cx.notify();
+    }
+
+    fn post_as_general(&mut self, local_id: usize, cx: &mut Context<Self>) {
+        let Some(index) = self.draft_index(local_id) else {
+            return;
+        };
+        self.drafts[index].general = true;
+        self.queue_save(local_id, cx);
+        cx.notify();
+    }
+
+    /// Drafts written on an older head move to the same text at this head, or become outdated.
+    fn reanchor_drafts(&self, cx: &mut Context<Self>) -> Task<()> {
+        let head = &self.checkout.head_sha;
+        let fs = self.project.read(cx).fs().clone();
+        let mut jobs = Vec::new();
+        for (draft, view) in self.drafts.iter().zip(&self.draft_views) {
+            if draft.outdated || draft.commit == *head {
+                continue;
+            }
+            let file = self.files.iter().find(|file| file.diff.path == draft.path);
+            let contents = file.and_then(|file| file.contents.as_ref());
+            let text: Task<Option<String>> = match (draft.side, contents) {
+                (Side::Left, contents) => {
+                    Task::ready(contents.and_then(|(_, diff)| diff.read(cx).base_text_string(cx)))
+                }
+                (Side::Right, Some((buffer, _))) => Task::ready(Some(buffer.read(cx).text())),
+                (Side::Right, None) if file.is_some() => Task::ready(None),
+                (Side::Right, None) => {
+                    let path = self.checkout.worktree.join(&draft.path);
+                    let fs = fs.clone();
+                    cx.background_spawn(async move { fs.load(&path).await.ok() })
+                }
+            };
+            jobs.push((
+                view.local_id,
+                draft.anchor_text.clone(),
+                draft.start_line,
+                text,
+            ));
+        }
+        cx.spawn(async move |this, cx| {
+            for (local_id, anchor_text, start_line, text) in jobs {
+                let text = text.await;
+                let result = reanchor(&anchor_text, start_line, text.as_deref());
+                this.update(cx, |this, cx| this.apply_reanchor(local_id, result, cx))
+                    .log_err();
+            }
+        })
+    }
+
+    fn apply_reanchor(&mut self, local_id: usize, result: Reanchor, cx: &mut Context<Self>) {
+        let Some(index) = self.draft_index(local_id) else {
+            return;
+        };
+        let draft = &mut self.drafts[index];
+        match result {
+            Reanchor::Placed {
+                start_line,
+                end_line,
+            } => {
+                draft.start_line = start_line;
+                draft.end_line = end_line;
+                draft.commit = self.checkout.head_sha.clone();
+            }
+            Reanchor::Outdated => draft.outdated = true,
+        }
+        self.queue_save(local_id, cx);
+        self.show_comments(cx);
+        cx.notify();
+    }
+
+    /// The multibuffer position at the end of a 1-based line, when that line is shown.
+    fn line_anchor(
+        &self,
+        path: &str,
+        side: Side,
+        line: u32,
+        snapshot: &MultiBufferSnapshot,
+        cx: &App,
+    ) -> Option<Anchor> {
+        let row = line.checked_sub(1)?;
+        match side {
+            Side::Right => {
+                let buffer = self
+                    .multibuffer
+                    .read(cx)
+                    .all_buffers_iter()
+                    .find(|buffer| buffer_path(buffer, cx).as_deref() == Some(path))
+                    .or_else(|| buffer_for(&self.files, path).cloned())?;
+                let buffer = buffer.read(cx).snapshot();
+                if row > buffer.max_point().row {
+                    return None;
+                }
+                snapshot
+                    .anchor_in_excerpt(buffer.anchor_before(Point::new(row, buffer.line_len(row))))
+            }
+            Side::Left => {
+                let file = self.files.iter().find(|file| file.diff.path == path)?;
+                let (buffer, diff) = file.contents.as_ref()?;
+                let buffer = buffer.read(cx).snapshot();
+                let diff = diff.read(cx).snapshot(cx);
+                let base = diff.base_text();
+                if row > base.max_point().row {
+                    return None;
+                }
+                let base_point = Point::new(row, base.line_len(row));
+                let point = diff.base_text_point_to_buffer_point(base_point, &buffer);
+                let anchor = snapshot.anchor_in_excerpt(buffer.anchor_before(point))?;
+                Some(anchor.with_diff_base_anchor(base.anchor_before(base_point)))
+            }
+        }
+    }
+
+    fn show_comments(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let item = cx.weak_entity();
+        let mut blocks = Vec::new();
+        for (draft, view) in self.drafts.iter().zip(&self.draft_views) {
+            if draft.outdated || draft.general {
+                continue;
+            }
+            let Some(anchor) =
+                self.line_anchor(&draft.path, draft.side, draft.end_line, &snapshot, cx)
+            else {
+                continue;
+            };
+            let note = self.draft_note(draft);
+            let body_rows = draft.body.lines().count().max(1) as u32;
+            let height = match view.composer {
+                Some(_) => COMPOSER_MAX_LINES + 4,
+                None => 2 + body_rows,
+            } + if note.is_some() { 2 } else { 0 };
+            blocks.push(BlockProperties {
+                placement: BlockPlacement::Below(anchor),
+                height: Some(height),
+                style: BlockStyle::Sticky,
+                render: draft_renderer(
+                    item.clone(),
+                    view.local_id,
+                    draft.end_line,
+                    draft.body.clone().into(),
+                    note.map(SharedString::from),
+                    view.composer.clone(),
+                    view.sync.clone(),
+                ),
+                priority: 0,
+            });
+        }
+        for thread in &self.detail.threads {
+            let Some(line) = thread.line else {
+                continue;
+            };
+            let Some(anchor) = self.line_anchor(&thread.path, thread.side, line, &snapshot, cx)
+            else {
+                continue;
+            };
+            let body_rows: usize = thread
+                .comments
+                .iter()
+                .map(|comment| 1 + comment.body.lines().count().max(1))
+                .sum();
+            blocks.push(BlockProperties {
+                placement: BlockPlacement::Below(anchor),
+                height: Some(body_rows as u32 + 3),
+                style: BlockStyle::Sticky,
+                render: thread_renderer(
+                    thread.clone(),
+                    self.reply_editors.get(&thread.id).cloned(),
+                ),
+                priority: 0,
+            });
+        }
+        let stale = std::mem::take(&mut self.comment_blocks);
+        self.comment_blocks = self.editor.update(cx, |editor, cx| {
+            editor.remove_blocks(stale.into_iter().collect(), None, cx);
+            editor.insert_blocks(blocks, None, cx).into_iter().collect()
+        });
     }
 
     pub fn steps(&self) -> &[Step] {
@@ -848,6 +1497,7 @@ impl ReviewItem {
             editor.insert_blocks(blocks, None, cx).into_iter().collect()
         });
         self.shown_context = shown_context;
+        self.show_comments(cx);
     }
 
     fn update_impact(&mut self, cx: &mut Context<Self>) {
@@ -987,6 +1637,7 @@ impl ReviewItem {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             );
+        map = map.children(self.render_outdated_drafts(cx));
         for (index, step) in self.steps.iter().enumerate() {
             let selected = index == self.selected;
             let title = if self.viewed_steps.contains(&step.key) {
@@ -1061,6 +1712,77 @@ impl ReviewItem {
                     "unchanged, pulled in by the call graph",
                     Color::Disabled,
                 )),
+        )
+    }
+
+    fn render_outdated_drafts(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let outdated: Vec<_> = self
+            .drafts
+            .iter()
+            .zip(&self.draft_views)
+            .filter(|(draft, _)| draft.outdated)
+            .collect();
+        if outdated.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        Some(
+            v_flex()
+                .gap_1()
+                .pb_2()
+                .child(
+                    Label::new("Outdated drafts")
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+                .children(outdated.into_iter().map(|(draft, view)| {
+                    let local_id = view.local_id;
+                    v_flex()
+                        .id(("photon-review-outdated", local_id))
+                        .gap_1()
+                        .p_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .child(
+                            Label::new(format!("{}:{}", draft.path, draft.start_line))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(draft.anchor_text.clone())
+                                .size(LabelSize::XSmall)
+                                .buffer_font(cx),
+                        )
+                        .child(Label::new(draft.body.clone()).size(LabelSize::Small))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .flex_wrap()
+                                .child(Button::new("replace", "Re-place here").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.replace_draft(local_id, cx)
+                                    }),
+                                ))
+                                .map(|this| {
+                                    if draft.general {
+                                        this.child(
+                                            Label::new("posts as a general comment")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                    } else {
+                                        this.child(
+                                            Button::new("general", "Post as general comment")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.post_as_general(local_id, cx)
+                                                })),
+                                        )
+                                    }
+                                }),
+                        )
+                }))
+                .into_any_element(),
         )
     }
 
@@ -1164,9 +1886,14 @@ impl ReviewItem {
                             .color(Color::Muted),
                     )
                     .child(
-                        Label::new(format!("0 draft comments · {}", self.progress_text()))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        Label::new(format!(
+                            "{} draft comment{} · {}",
+                            self.drafts.len(),
+                            if self.drafts.len() == 1 { "" } else { "s" },
+                            self.progress_text()
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     )
                     .child(
                         h_flex()
@@ -1198,6 +1925,7 @@ impl Render for ReviewItem {
             .on_action(cx.listener(|this, _: &PreviousStep, window, cx| {
                 this.select_step(this.selected.saturating_sub(1), window, cx)
             }))
+            .on_action(cx.listener(Self::add_comment))
             .child(self.render_header(cx))
             .child(
                 h_flex()
@@ -1440,8 +2168,19 @@ mod tests {
         gate: Option<Gate>,
     ) -> (Entity<ReviewItem>, VisualTestContext) {
         let (item, cx, _) =
-            open_item_with(cx, tree, files, graph, call_hierarchy, gate, false).await;
+            open_item_with(cx, tree, files, graph, call_hierarchy, gate, false, None).await;
         (item, cx)
+    }
+
+    static DATABASE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_database(cx: &mut TestAppContext) -> ReviewDb {
+        let name = format!(
+            "review_item_{}",
+            DATABASE_COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+        cx.foreground_executor()
+            .block_test(ReviewDb::open_test_db(name.leak()))
     }
 
     /// `restricted` opens the project with worktree trust enforced and the worktree untrusted.
@@ -1454,8 +2193,10 @@ mod tests {
         call_hierarchy: bool,
         gate: Option<Gate>,
         restricted: bool,
+        database: Option<ReviewDb>,
     ) -> (Entity<ReviewItem>, VisualTestContext, Arc<AtomicUsize>) {
         init_test(cx);
+        let database = database.unwrap_or_else(|| test_database(cx));
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/repo"), tree).await;
         let project = if restricted {
@@ -1510,7 +2251,15 @@ mod tests {
         }
         let detail = parse_detail(&key(), DETAIL).expect("detail");
         let window = cx.add_window(|window, cx| {
-            ReviewItem::new(project.clone(), detail, checkout(), loaded, window, cx)
+            ReviewItem::new(
+                project.clone(),
+                detail,
+                checkout(),
+                loaded,
+                database,
+                window,
+                cx,
+            )
         });
         let item = window.root(cx).expect("item");
         let cx = VisualTestContext::from_window(window.into(), cx);
@@ -2064,6 +2813,7 @@ fn verify_password(user: &str, password: &str) -> bool {
             workspace.clone(),
             window.into(),
             prepared,
+            database.clone(),
             &mut cx.to_async(),
         )
         .await
@@ -2078,6 +2828,7 @@ fn verify_password(user: &str, password: &str) -> bool {
             workspace.clone(),
             window.into(),
             prepared,
+            database.clone(),
             &mut cx.to_async(),
         )
         .await
@@ -2110,6 +2861,7 @@ fn verify_password(user: &str, password: &str) -> bool {
             true,
             None,
             true,
+            None,
         )
         .await;
         settle(&mut cx);
@@ -2142,5 +2894,287 @@ fn verify_password(user: &str, password: &str) -> bool {
         });
         assert!(prepares.load(Ordering::SeqCst) > 0);
         assert!(text(&item, &mut cx).contains("user == password"));
+    }
+
+    fn select_text(item: &Entity<ReviewItem>, needle: &str, cx: &mut VisualTestContext) {
+        let offset = text(item, cx).find(needle).expect("text shown");
+        item.update_in(cx, |item, window, cx| {
+            window.focus(&item.editor().focus_handle(cx), cx);
+            item.editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([MultiBufferOffset(offset)..MultiBufferOffset(offset)])
+                })
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    fn composer(item: &Entity<ReviewItem>, cx: &mut VisualTestContext) -> Entity<Editor> {
+        item.read_with(cx, |item, _| {
+            item.draft_views
+                .last()
+                .and_then(|view| view.composer.clone())
+                .expect("composer")
+        })
+    }
+
+    fn type_text(editor: &Entity<Editor>, text: &str, cx: &mut VisualTestContext) {
+        editor.update_in(cx, |editor, window, cx| editor.insert(text, window, cx));
+    }
+
+    fn database(item: &Entity<ReviewItem>, cx: &mut VisualTestContext) -> ReviewDb {
+        item.read_with(cx, |item, _| item.database.clone())
+    }
+
+    fn stored_draft(path: &str, start_line: u32, anchor_text: &str) -> Draft {
+        Draft {
+            id: None,
+            key: key(),
+            path: path.into(),
+            side: crate::Side::Right,
+            start_line,
+            end_line: start_line,
+            commit: "old".into(),
+            anchor_text: anchor_text.into(),
+            body: format!("about {anchor_text}"),
+            outdated: false,
+            general: false,
+        }
+    }
+
+    #[gpui::test]
+    async fn draft_survives_reload(cx: &mut TestAppContext) {
+        let (item, mut cx) = open_item(
+            cx,
+            login_tree(),
+            vec![modified("src/login.rs", LOGIN_BASE)],
+            login_graph(),
+            true,
+            None,
+        )
+        .await;
+        settle(&mut cx);
+        select_text(&item, "audit(user);", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        let composer = composer(&item, &mut cx);
+        type_text(&composer, "Why audit ", &mut cx);
+        type_text(&composer, "here?", &mut cx);
+        cx.run_until_parked();
+
+        let database = database(&item, &mut cx);
+        let saved = database.drafts(&key()).expect("drafts");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].body, "Why audit here?");
+        assert_eq!(saved[0].path, "src/login.rs");
+        assert_eq!((saved[0].start_line, saved[0].end_line), (3, 3));
+        assert_eq!(saved[0].anchor_text, "    audit(user);");
+        assert_eq!(saved[0].commit, "head");
+
+        let (project, detail, files) = item.read_with(&cx, |item, _| {
+            let files: Vec<LoadedFile> = item
+                .files
+                .iter()
+                .map(|file| LoadedFile {
+                    diff: file.diff.clone(),
+                    contents: file.contents.clone(),
+                })
+                .collect();
+            (item.project.clone(), item.detail.clone(), files)
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(item);
+        cx.run_until_parked();
+
+        let window = cx.add_window(|window, cx| {
+            ReviewItem::new(project, detail, checkout(), files, database, window, cx)
+        });
+        let reopened = window.root(&mut cx).expect("item");
+        cx.run_until_parked();
+        reopened.read_with(&cx, |item, _| {
+            let bodies: Vec<_> = item
+                .drafts()
+                .iter()
+                .map(|draft| draft.body.as_str())
+                .collect();
+            assert_eq!(bodies, vec!["Why audit here?"]);
+            assert_eq!(item.comment_blocks.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn comment_on_unchanged_excerpt_creates_draft(cx: &mut TestAppContext) {
+        let (item, mut cx) = open_item(
+            cx,
+            login_tree(),
+            vec![modified("src/login.rs", LOGIN_BASE)],
+            login_graph(),
+            true,
+            None,
+        )
+        .await;
+        settle(&mut cx);
+        select_text(&item, "user == password", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let draft = item.drafts().last().expect("draft").clone();
+            assert_eq!(draft.path, "src/password.rs");
+            assert_eq!(draft.side, crate::Side::Right);
+            assert_eq!((draft.start_line, draft.end_line), (2, 2));
+            assert_eq!(draft.anchor_text, "    user == password");
+            assert_eq!(draft.commit, "head");
+            assert_eq!(
+                item.draft_note(&draft).as_deref(),
+                Some(
+                    "Unchanged file: GitHub can't take this comment directly, so Photon adds it \
+                     to the review summary under src/password.rs, with a quote."
+                )
+            );
+            assert_eq!(item.comment_blocks.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn comment_on_deleted_row_uses_base_side(cx: &mut TestAppContext) {
+        let (item, mut cx) = open_item(
+            cx,
+            json!({ "src": { "b.rs": B_HEAD } }),
+            vec![modified("src/b.rs", B_BASE)],
+            Graph {
+                functions: vec![function("callee", "src/b.rs", 0, 2)],
+                calls: Vec::new(),
+            },
+            true,
+            None,
+        )
+        .await;
+        settle(&mut cx);
+        select_text(&item, "let a = 1;", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let draft = item.drafts().last().expect("draft");
+            assert_eq!(draft.path, "src/b.rs");
+            assert_eq!(draft.side, crate::Side::Left);
+            assert_eq!((draft.start_line, draft.end_line), (2, 2));
+            assert_eq!(draft.anchor_text, "    let a = 1;");
+            assert_eq!(item.comment_blocks.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn reanchored_draft_saved_with_new_commit(cx: &mut TestAppContext) {
+        let database = test_database(cx);
+        for draft in [
+            stored_draft("src/login.rs", 2, "    verify_password(user, password)"),
+            stored_draft("src/login.rs", 2, "    old_line();"),
+            stored_draft("src/password.rs", 5, "    user == password"),
+        ] {
+            database.save_draft(draft).await.expect("save");
+        }
+        let (item, mut cx, _) = open_item_with(
+            cx,
+            login_tree(),
+            vec![modified("src/login.rs", LOGIN_BASE)],
+            login_graph(),
+            true,
+            None,
+            false,
+            Some(database.clone()),
+        )
+        .await;
+        settle(&mut cx);
+        let summary = |drafts: &[Draft]| {
+            drafts
+                .iter()
+                .map(|draft| {
+                    (
+                        draft.start_line,
+                        draft.end_line,
+                        draft.commit.clone(),
+                        draft.outdated,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (4, 4, "head".to_string(), false),
+            (2, 2, "old".to_string(), true),
+            (2, 2, "head".to_string(), false),
+        ];
+        assert_eq!(summary(&database.drafts(&key()).expect("drafts")), expected);
+        item.read_with(&cx, |item, _| {
+            assert_eq!(summary(item.drafts()), expected);
+            assert_eq!(item.drafts()[1].anchor_text, "    old_line();");
+        });
+
+        // The outdated draft can be placed again on the current selection.
+        select_text(&item, "audit(user);", &mut cx);
+        item.update(&mut cx, |item, cx| item.replace_draft(1, cx));
+        cx.run_until_parked();
+        let replaced = database.drafts(&key()).expect("drafts")[1].clone();
+        assert_eq!((replaced.start_line, replaced.outdated), (3, false));
+        assert_eq!(replaced.anchor_text, "    audit(user);");
+        assert_eq!(replaced.body, "about     old_line();");
+    }
+
+    #[gpui::test]
+    async fn cancel_nonempty_draft_asks_first(cx: &mut TestAppContext) {
+        let (item, mut cx) = open_item(
+            cx,
+            login_tree(),
+            vec![modified("src/login.rs", LOGIN_BASE)],
+            login_graph(),
+            true,
+            None,
+        )
+        .await;
+        settle(&mut cx);
+        let database = database(&item, &mut cx);
+        let local_id = |item: &Entity<ReviewItem>, cx: &mut VisualTestContext| {
+            item.read_with(cx, |item, _| {
+                item.draft_views.last().expect("view").local_id
+            })
+        };
+
+        select_text(&item, "audit(user);", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        let empty = local_id(&item, &mut cx);
+        item.update_in(&mut cx, |item, window, cx| {
+            item.cancel_draft(empty, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        item.read_with(&cx, |item, _| assert!(item.drafts().is_empty()));
+
+        select_text(&item, "audit(user);", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        let typed = local_id(&item, &mut cx);
+        type_text(&composer(&item, &mut cx), "Keep me", &mut cx);
+        cx.run_until_parked();
+        item.update_in(&mut cx, |item, window, cx| {
+            item.cancel_draft(typed, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Keep");
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| assert_eq!(item.drafts().len(), 1));
+        assert_eq!(database.drafts(&key()).expect("drafts").len(), 1);
+
+        item.update_in(&mut cx, |item, window, cx| {
+            item.cancel_draft(typed, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            assert!(item.drafts().is_empty());
+            assert!(item.comment_blocks.is_empty());
+        });
+        assert!(database.drafts(&key()).expect("drafts").is_empty());
     }
 }
