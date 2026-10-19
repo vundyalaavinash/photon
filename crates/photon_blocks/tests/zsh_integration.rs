@@ -411,6 +411,9 @@ fn blocks_get_padding_rows() {
     let (_marks, output, _home) = run_zsh("", "echo hi\nexit\n");
     // A blank row closes the block's output, and the prompt leaves a blank row and a
     // metadata row above the typed command.
-    assert!(output.contains("hi\n\n\x1b]133;D;0\x07"), "{output:?}");
-    assert!(output.contains("\n\n\x1b]133;B\x07"), "{output:?}");
+    assert!(
+        output.contains("hi\n\n\x1b]133;D;0;photon\x07"),
+        "{output:?}"
+    );
+    assert!(output.contains("\n\n\x1b]133;B;photon\x07"), "{output:?}");
 }

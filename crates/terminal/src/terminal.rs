@@ -6699,6 +6699,28 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn marks_from_a_program_inside_a_block_are_ignored(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        // Photon's zsh tags its marks; an agent CLI running in the block prints its own.
+        feed_pty_output(
+            &terminal,
+            b"\x1b]133;A;photon\x07\x1b]133;B;photon\x07devin\r\n\x1b]633;E;devin;photon\x07\x1b]133;C;photon\x07\x1b]133;A\x07> \x1b]133;B\x07ls\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07bye\r\n\x1b]133;D;0;photon\x07\x1b]133;A;photon\x07\x1b]133;B;photon\x07",
+            cx,
+        );
+        terminal.read_with(cx, |terminal, _| {
+            let blocks = terminal.blocks().expect("blocks");
+            assert_eq!(blocks.phase(), &photon_blocks::Phase::Prompt);
+            let commands: Vec<_> = blocks.blocks().map(|block| block.command.clone()).collect();
+            assert_eq!(commands, ["devin"]);
+            let id = blocks.blocks().next().expect("block").id;
+            assert_eq!(
+                terminal.block_text(id, BlockPart::Output).as_deref(),
+                Some("> ls\nout\nbye")
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn input_goes_to_pty_while_command_runs(cx: &mut TestAppContext) {
         let (terminal, cx) = init_block_terminal(cx);
         feed_pty_output(

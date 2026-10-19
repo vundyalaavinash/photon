@@ -16,6 +16,8 @@ use crate::{
 
 const MAX_BLOCKS: usize = 1000;
 const NO_MARKS_TIMEOUT: Duration = Duration::from_secs(2);
+/// The last field of every mark Photon's zsh hooks print (assets/shell_integration/zsh).
+const PHOTON_MARK_TAG: &[u8] = b"photon";
 
 /// Where keyboard input should go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +43,10 @@ pub(crate) struct TerminalBlocks {
     /// Until then zsh may be at a continuation prompt (an unclosed quote), which only the
     /// PTY can answer.
     awaiting_shell: bool,
+    /// Set once Photon's own zsh hooks were heard (their marks end in a `photon` field). From
+    /// then on untagged marks come from a program inside a block (an agent CLI, another
+    /// integration) and are ignored rather than read as the shell misbehaving.
+    tagged_marks: bool,
 }
 
 impl TerminalBlocks {
@@ -51,6 +57,7 @@ impl TerminalBlocks {
             history_clears,
             oldest_line: 0,
             awaiting_shell: false,
+            tagged_marks: false,
         }
     }
 
@@ -90,6 +97,17 @@ impl TerminalBlocks {
         history_clears: u64,
     ) -> Option<Option<BlockEvent>> {
         let absolute_line = self.line_after_clears(absolute_line, history_clears);
+        let is_cwd = params
+            .first()
+            .is_some_and(|first| first.starts_with(b"file://"));
+        let params = match params.split_last() {
+            Some((last, rest)) if !is_cwd && last.as_slice() == PHOTON_MARK_TAG => {
+                self.tagged_marks = true;
+                rest
+            }
+            _ if !is_cwd && self.tagged_marks => return None,
+            _ => params,
+        };
         let mark = parse_shell_mark(params)?;
         if matches!(mark, ShellMark::PromptStart | ShellMark::OutputStart) {
             self.awaiting_shell = false;

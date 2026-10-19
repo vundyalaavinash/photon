@@ -9,9 +9,10 @@ ZDOTDIR=${PHOTON_USER_ZDOTDIR:-$HOME}
 if [[ $PHOTON_COMPLETER == 1 ]]; then
   source $PHOTON_ZDOTDIR/photon-complete.zsh
 elif [[ $PHOTON_BLOCKS == 1 ]]; then
-  # A zsh started by a command (`exec zsh`, a nested `zsh`) ends that command's block.
+  # A zsh started by a command (`exec zsh`, a nested `zsh`) ends that command's block. Every
+  # mark ends in a `photon` field so marks printed by programs inside a block can be told apart.
   if [[ -n $__photon_command_ran ]]; then
-    printf '\e]133;D;0\a'
+    printf '\e]133;D;0;photon\a'
     unset __photon_command_ran
   fi
 
@@ -22,13 +23,13 @@ elif [[ $PHOTON_BLOCKS == 1 ]]; then
 
   __photon_precmd() {
     # The newline leaves a blank row inside the block below its output (Warp's padding).
-    [[ -n $__photon_command_ran ]] && printf '\n\e]133;D;%s\a' "$__photon_status"
+    [[ -n $__photon_command_ran ]] && printf '\n\e]133;D;%s;photon\a' "$__photon_status"
     unset __photon_command_ran
     local url=${PWD//\%/%25}
     printf '\e]7;file://%s%s\a' "$HOST" "${url// /%20}"
-    printf '\e]133;A\a'
+    printf '\e]133;A;photon\a'
     # A blank row and a row for the block's folder/branch/time, then the typed command.
-    PROMPT=$'\n\n%{\e]133;B\a%}'
+    PROMPT=$'\n\n%{\e]133;B;photon\a%}'
     RPROMPT=''
   }
 
@@ -54,8 +55,8 @@ elif [[ $PHOTON_BLOCKS == 1 ]]; then
       export __photon_command_ran
       ZDOTDIR=$PHOTON_ZDOTDIR
     fi
-    printf '\e]633;E;%s%s\a' "$command" "$flag"
-    printf '\e]133;C\a'
+    printf '\e]633;E;%s%s;photon\a' "$command" "$flag"
+    printf '\e]133;C;photon\a'
   }
 
   precmd_functions=(__photon_capture_status ${precmd_functions:#__photon_*} __photon_precmd)
