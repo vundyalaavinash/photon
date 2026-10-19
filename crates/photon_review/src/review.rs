@@ -26,7 +26,7 @@ use project::{
     lsp_store::OpenLspBufferHandle,
     trusted_worktrees::{TrustedWorktrees, TrustedWorktreesEvent},
 };
-use ui::{Checkbox, ToggleState, prelude::*};
+use ui::{Checkbox, ToggleState, Tooltip, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
     AppState, Item, OpenMode, OpenOptions, Toast, ToggleWorktreeSecurity, Workspace,
@@ -59,6 +59,8 @@ actions!(
     ]
 );
 
+const LEFT_COMMENT_NOTE: &str = "Switch to the full diff to comment on removed lines";
+const VIEWED_DISABLED_TOOLTIP: &str = "Switch to the full diff to mark things viewed";
 const HUNK_CONTEXT_LINES: u32 = 3;
 const COMPOSER_MAX_LINES: u32 = 4;
 const TRUST_REASON: &str = "Trust this worktree to find callers";
@@ -190,6 +192,8 @@ pub struct ReviewItem {
     last_review: Option<String>,
     full_files: Option<Vec<LoadedFile>>,
     since_review_note: Option<SharedString>,
+    loading_since_review: bool,
+    _since_review_lsp_handles: Vec<OpenLspBufferHandle>,
     _since_review_task: Task<()>,
     _reanchor_task: Task<()>,
     _lsp_handles: Vec<OpenLspBufferHandle>,
@@ -935,6 +939,8 @@ impl ReviewItem {
             last_review,
             full_files: None,
             since_review_note: None,
+            loading_since_review: false,
+            _since_review_lsp_handles: Vec::new(),
             _since_review_task: Task::ready(()),
             _reanchor_task: Task::ready(()),
             _lsp_handles: lsp_handles,
@@ -968,6 +974,12 @@ impl ReviewItem {
         cx: &mut Context<Self>,
     ) {
         self.since_review_note = None;
+        if self.loading_since_review {
+            self.loading_since_review = false;
+            self._since_review_task = Task::ready(());
+            cx.notify();
+            return;
+        }
         if let Some(full_files) = self.full_files.take() {
             self._since_review_task = Task::ready(());
             self.set_files(full_files, cx);
@@ -984,6 +996,7 @@ impl ReviewItem {
         let key = self.detail.summary.key.clone();
         let url = fetch_url(&repo_id(&self.detail.summary));
         let project = self.project.clone();
+        self.loading_since_review = true;
         self._since_review_task = cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_spawn({
@@ -1018,15 +1031,18 @@ impl ReviewItem {
                 },
                 Err(error) => Err(format!("{error:#}")),
             };
-            this.update(cx, |this, cx| match loaded {
-                Ok(files) => {
-                    let full = std::mem::take(&mut this.files);
-                    this.full_files = Some(full);
-                    this.set_files(files, cx);
-                }
-                Err(message) => {
-                    this.since_review_note = Some(message.into());
-                    cx.notify();
+            this.update(cx, |this, cx| {
+                this.loading_since_review = false;
+                match loaded {
+                    Ok(files) => {
+                        let full = std::mem::take(&mut this.files);
+                        this.full_files = Some(full);
+                        this.set_files(files, cx);
+                    }
+                    Err(message) => {
+                        this.since_review_note = Some(message.into());
+                        cx.notify();
+                    }
                 }
             })
             .log_err();
@@ -1036,7 +1052,12 @@ impl ReviewItem {
 
     fn set_files(&mut self, files: Vec<LoadedFile>, cx: &mut Context<Self>) {
         let (lsp_handles, changed_rows) = index_files(&self.project, &files, cx);
-        self._lsp_handles.extend(lsp_handles);
+        // The full set's handles live in `_lsp_handles`; only the subset's are replaced here.
+        self._since_review_lsp_handles = if self.full_files.is_some() {
+            lsp_handles
+        } else {
+            Vec::new()
+        };
         self.changed_rows = changed_rows;
         self.files = files;
         self.analyses = Vec::new();
@@ -1503,7 +1524,7 @@ impl ReviewItem {
         viewed: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if self.marking_viewed.contains(path) {
+        if self.full_files.is_some() || self.marking_viewed.contains(path) {
             return Task::ready(Ok(()));
         }
         self.set_local_file_viewed(path, viewed);
@@ -1557,6 +1578,9 @@ impl ReviewItem {
 
     /// Steps exist only in Photon, so their viewed state stays local.
     pub fn set_step_viewed(&mut self, step_key: &str, viewed: bool, cx: &mut Context<Self>) {
+        if self.full_files.is_some() {
+            return;
+        }
         if viewed {
             self.viewed_steps.insert(step_key.to_string());
         } else {
@@ -1778,6 +1802,12 @@ impl ReviewItem {
         let Some(lines) = self.selected_lines(cx) else {
             return;
         };
+        // The base text here is the reviewed commit's, so its line numbers are not GitHub's.
+        if self.full_files.is_some() && lines.side == Side::Left {
+            self.since_review_note = Some(LEFT_COMMENT_NOTE.into());
+            cx.notify();
+            return;
+        }
         let draft = Draft {
             id: None,
             key: self.detail.summary.key.clone(),
@@ -2496,11 +2526,18 @@ impl ReviewItem {
             .when(self.changes_since_review_offered(), |header| {
                 let showing = self.showing_changes_since_review();
                 header.child(
-                    Button::new("since-review", "Changes since your review")
-                        .toggle_state(showing)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_changes_since_review(&ToggleChangesSinceReview, window, cx)
-                        })),
+                    Button::new(
+                        "since-review",
+                        if self.loading_since_review {
+                            "Loading changes… (click to cancel)"
+                        } else {
+                            "Changes since your review"
+                        },
+                    )
+                    .toggle_state(showing)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_changes_since_review(&ToggleChangesSinceReview, window, cx)
+                    })),
                 )
             })
             .children(self.since_review_note.clone().map(|note| {
@@ -2591,6 +2628,10 @@ impl ReviewItem {
                         )
                         .label("Step viewed")
                         .label_size(LabelSize::Small)
+                        .disabled(self.full_files.is_some())
+                        .when(self.full_files.is_some(), |checkbox| {
+                            checkbox.tooltip(Tooltip::text(VIEWED_DISABLED_TOOLTIP))
+                        })
                         .on_click(cx.listener(
                             move |this, state: &ToggleState, _, cx| {
                                 this.set_step_viewed(&step_key, *state == ToggleState::Selected, cx)
@@ -2610,7 +2651,12 @@ impl ReviewItem {
                                 )
                                 .label(format!("{path} viewed"))
                                 .label_size(LabelSize::Small)
-                                .disabled(self.marking_viewed.contains(path))
+                                .disabled(
+                                    self.marking_viewed.contains(path) || self.full_files.is_some(),
+                                )
+                                .when(self.full_files.is_some(), |checkbox| {
+                                    checkbox.tooltip(Tooltip::text(VIEWED_DISABLED_TOOLTIP))
+                                })
                                 .on_click(cx.listener(
                                     move |this, state: &ToggleState, _, cx| {
                                         this.set_file_viewed(
@@ -5137,6 +5183,62 @@ fn verify_password(user: &str, password: &str) -> bool {
                 .map(|draft| (draft.body.as_str(), draft.post_state))
                 .collect();
             assert_eq!(left, vec![("", PostState::Unposted)]);
+        });
+    }
+
+    #[gpui::test]
+    async fn since_review_mode_blocks_base_comments_and_viewed(cx: &mut TestAppContext) {
+        let (item, mut cx) = open_item(
+            cx,
+            json!({ "src": { "b.rs": B_HEAD } }),
+            vec![modified("src/b.rs", B_BASE)],
+            Graph {
+                functions: vec![function("callee", "src/b.rs", 0, 2)],
+                calls: Vec::new(),
+            },
+            true,
+            None,
+        )
+        .await;
+        settle(&mut cx);
+        item.update(&mut cx, |item, _| item.full_files = Some(Vec::new()));
+        select_text(&item, "let a = 1;", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        let step = step_keys(&item, &mut cx)[0].clone();
+        item.update(&mut cx, |item, cx| item.set_step_viewed(&step, true, cx));
+        item.read_with(&cx, |item, _| {
+            assert!(item.drafts().is_empty());
+            assert_eq!(item.since_review_note.as_deref(), Some(LEFT_COMMENT_NOTE));
+            assert!(item.viewed_steps.is_empty());
+        });
+        select_text(&item, "let b = 2;", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            assert_eq!(
+                item.drafts().last().map(|draft| draft.side),
+                Some(Side::Right)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn second_click_while_loading_cancels(cx: &mut TestAppContext) {
+        let (item, mut cx) = open_item(
+            cx,
+            login_tree(),
+            vec![login_with_hunk()],
+            login_graph(),
+            true,
+            None,
+        )
+        .await;
+        item.update_in(&mut cx, |item, window, cx| {
+            item.loading_since_review = true;
+            item.toggle_changes_since_review(&ToggleChangesSinceReview, window, cx);
+            assert!(!item.loading_since_review);
+            assert!(!item.showing_changes_since_review());
         });
     }
 

@@ -152,6 +152,46 @@ pub fn author_changed_paths(old: &[FileDiff], new: &[FileDiff]) -> Vec<String> {
     paths
 }
 
+/// Binary and submodule entries have no hunks to compare, so their blobs are compared instead.
+async fn opaque_changed_paths(
+    checkout: &Checkout,
+    old_merge_base: &str,
+    old_head: &str,
+    old: &[FileDiff],
+    new: &[FileDiff],
+) -> Vec<String> {
+    let blob = async |revision: &str, path: &str| {
+        git(
+            &checkout.worktree,
+            &["rev-parse", &format!("{revision}:{path}")],
+        )
+        .await
+        .ok()
+    };
+    let mut changed = Vec::new();
+    for old_file in old {
+        let Some(new_file) = new.iter().find(|file| file.path == old_file.path) else {
+            continue;
+        };
+        let opaque = [old_file, new_file]
+            .iter()
+            .any(|file| file.binary || file.submodule);
+        if !opaque {
+            continue;
+        }
+        let path = &old_file.path;
+        let before = (blob(old_merge_base, path).await, blob(old_head, path).await);
+        let after = (
+            blob(&checkout.merge_base, path).await,
+            blob(&checkout.head_sha, path).await,
+        );
+        if before != after {
+            changed.push(path.clone());
+        }
+    }
+    changed
+}
+
 // ponytail: within a listed file, base changes from the rebase still show. Upgrade to a per-file
 // range-diff if that bites.
 pub async fn since_review_files(
@@ -167,7 +207,12 @@ pub async fn since_review_files(
         } => {
             let old = git_diff(worktree, old_merge_base, old_head).await?;
             let new = git_diff(worktree, &checkout.merge_base, &checkout.head_sha).await?;
-            (old_head, Some(author_changed_paths(&old, &new)))
+            let mut paths = author_changed_paths(&old, &new);
+            paths
+                .extend(opaque_changed_paths(checkout, old_merge_base, old_head, &old, &new).await);
+            paths.sort();
+            paths.dedup();
+            (old_head, Some(paths))
         }
         SinceReviewPlan::Unavailable { message } => bail!("{message}"),
     };
@@ -220,6 +265,9 @@ mod tests {
             let dir = temp.path().canonicalize().expect("canonical").join("repo");
             std::fs::create_dir_all(&dir).expect("dir");
             run(&dir, &["init", "-b", "main"]);
+            for name in ["b", "c"] {
+                std::fs::write(dir.join(format!("{name}.bin")), [0u8, 1, 2]).expect("write");
+            }
             for name in ["x", "y", "z"] {
                 let text: String = (1..=8).map(|n| format!("{name}{n}\n")).collect();
                 std::fs::write(dir.join(format!("{name}.rs")), text).expect("write");
@@ -380,6 +428,50 @@ mod tests {
         assert!(matches!(plan, SinceReviewPlan::Rebased { .. }), "{plan:?}");
         assert_eq!(local.sha("refs/photon/pr/7/reviewed"), reviewed);
         assert!(!local.dir.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[gpui::test]
+    async fn binary_changed_by_the_author_across_a_rebase_is_listed(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let repo = Repo::new();
+        let write =
+            |name: &str, bytes: &[u8]| std::fs::write(repo.dir.join(name), bytes).expect("write");
+        run(&repo.dir, &["checkout", "-b", "pr"]);
+        write("b.bin", &[0, 1, 9]);
+        write("c.bin", &[0, 1, 8]);
+        run(&repo.dir, &["commit", "-am", "binaries"]);
+        let reviewed = repo.sha("HEAD");
+        run(&repo.dir, &["checkout", "main"]);
+        repo.commit("x.rs", "x9", "base moves");
+        run(&repo.dir, &["checkout", "-b", "pr2"]);
+        write("b.bin", &[0, 1, 7]);
+        write("c.bin", &[0, 1, 8]);
+        run(&repo.dir, &["commit", "-am", "binaries again"]);
+        let checkout = repo.checkout("pr2", "main");
+
+        let plan = plan_since_review(&checkout, &key(), &repo.url(), &reviewed).await;
+        let files = since_review_files(&checkout, &plan).await.expect("files");
+        assert_eq!(paths(&files), vec!["b.bin"]);
+    }
+
+    #[gpui::test]
+    async fn refetching_a_different_commit_updates_the_private_ref(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let upstream = Repo::new();
+        run(&upstream.dir, &["checkout", "-b", "one"]);
+        let first = upstream.commit("y.rs", "y9", "first");
+        run(&upstream.dir, &["checkout", "main"]);
+        run(&upstream.dir, &["checkout", "-b", "two"]);
+        let second = upstream.commit("z.rs", "z9", "second");
+        let local = Repo::new();
+        run(&local.dir, &["checkout", "-b", "pr"]);
+        local.commit("x.rs", "x9", "new");
+        let checkout = local.checkout("pr", "main");
+
+        plan_since_review(&checkout, &key(), &upstream.url(), &first).await;
+        assert_eq!(local.sha("refs/photon/pr/7/reviewed"), first);
+        plan_since_review(&checkout, &key(), &upstream.url(), &second).await;
+        assert_eq!(local.sha("refs/photon/pr/7/reviewed"), second);
     }
 
     fn file(path: &str, start: u32, body: &str) -> FileDiff {
