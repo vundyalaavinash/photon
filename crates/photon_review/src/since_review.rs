@@ -242,6 +242,9 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            // Separate repos share their "base" commit only if its timestamp matches too.
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
             .output()
             .expect("git runs");
         assert!(
