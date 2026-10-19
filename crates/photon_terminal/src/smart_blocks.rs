@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use anyhow::{Context as _, Result};
+
 use collections::HashMap;
 use git_ui::{commit_view::CommitView, project_diff::ProjectDiff};
 use gpui::{
@@ -12,7 +14,7 @@ use photon_blocks::{
 };
 use settings::Settings as _;
 use terminal::{Event, Terminal, terminal_settings::TerminalSettings};
-use util::ResultExt as _;
+use util::{ResultExt as _, paths::normalize_lexically};
 use workspace::{Toast, Workspace, notifications::NotificationId};
 
 use crate::chips::run_git;
@@ -33,6 +35,25 @@ struct UrlScan {
     lines: usize,
     /// The next absolute line to read from.
     next_line: Option<i64>,
+}
+
+/// Where a `git status` block's paths are relative to.
+struct StatusPaths {
+    cwd: PathBuf,
+    /// `--porcelain` prints paths from the repository root, other formats from the cwd.
+    from_root: bool,
+}
+
+impl StatusPaths {
+    async fn directory(&self) -> Result<PathBuf> {
+        if self.from_root {
+            Ok(run_git(&self.cwd, &["rev-parse", "--show-toplevel"], false)
+                .await?
+                .into())
+        } else {
+            Ok(self.cwd.clone())
+        }
+    }
 }
 
 /// What a git action did to a `git status` row.
@@ -154,26 +175,48 @@ impl SmartBlocks {
     }
 
     pub fn open_diff(&self, id: BlockId, absolute_line: i64, window: &mut Window, cx: &mut App) {
-        let (Some(cwd), Some(file)) = (self.block_cwd(id, cx), self.status_file(id, absolute_line))
-        else {
+        let (Some(block_paths), Some(file)) = (
+            self.block_paths(id, cx),
+            self.status_file(id, absolute_line),
+        ) else {
             return;
         };
-        let path = cwd.join(&file.path);
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let Some(project_path) = workspace
-            .read(cx)
-            .project()
-            .read(cx)
-            .find_project_path(&path, cx)
-        else {
-            self.show_error(format!("{} is not in this project", path.display()), cx);
-            return;
-        };
-        workspace.update(cx, |workspace, cx| {
-            ProjectDiff::deploy_at_project_path(workspace, project_path, window, cx)
-        });
+        let file = file.path.clone();
+        let workspace = self.workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let result = async {
+                    let path = block_paths.directory().await?.join(&file);
+                    Ok::<_, anyhow::Error>(normalize_lexically(&path).unwrap_or(path))
+                }
+                .await;
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        let project_path = result.and_then(|path| {
+                            workspace
+                                .project()
+                                .read(cx)
+                                .find_project_path(&path, cx)
+                                .with_context(|| {
+                                    format!("{} is not in this project", path.display())
+                                })
+                        });
+                        match project_path {
+                            Ok(project_path) => ProjectDiff::deploy_at_project_path(
+                                workspace,
+                                project_path,
+                                window,
+                                cx,
+                            ),
+                            Err(error) => workspace.show_toast(
+                                Toast::new(NotificationId::unique::<Self>(), error.to_string()),
+                                cx,
+                            ),
+                        }
+                    })
+                    .log_err();
+            })
+            .detach();
     }
 
     /// Opens `hash` in the innermost repository of the project that contains the block's cwd.
@@ -232,6 +275,17 @@ impl SmartBlocks {
         self.terminal.read(cx).blocks()?.block(id)?.cwd.clone()
     }
 
+    fn block_paths(&self, id: BlockId, cx: &App) -> Option<StatusPaths> {
+        let block = self.terminal.read(cx).blocks()?.block(id)?;
+        Some(StatusPaths {
+            cwd: block.cwd.clone()?,
+            from_root: block
+                .command
+                .split_whitespace()
+                .any(|word| word.starts_with("--porcelain")),
+        })
+    }
+
     fn run_git_action<const N: usize>(
         &mut self,
         id: BlockId,
@@ -240,14 +294,17 @@ impl SmartBlocks {
         mark: RowMark,
         cx: &mut Context<Self>,
     ) {
-        let Some(cwd) = self.block_cwd(id, cx) else {
+        let Some(block_paths) = self.block_paths(id, cx) else {
             self.show_error("This block has no working directory".to_string(), cx);
             return;
         };
         let args = args.map(str::to_string);
         cx.spawn(async move |this, cx| {
             let args = args.each_ref().map(String::as_str);
-            let result = run_git(&cwd, &args, true).await;
+            let result = match block_paths.directory().await {
+                Ok(directory) => run_git(&directory, &args, true).await,
+                Err(error) => Err(error),
+            };
             this.update(cx, |this, cx| match result {
                 Ok(_) => {
                     for line in lines {
@@ -809,6 +866,31 @@ mod tests {
         }
 
         #[gpui::test]
+        async fn porcelain_paths_are_staged_from_the_repository_root(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let Some(directory) = repository().await else {
+                return;
+            };
+            let path = directory.path();
+            let subdirectory = path.join("sub");
+            std::fs::create_dir(&subdirectory).expect("mkdir");
+            let (terminal, smart, _workspace, mut cx) = setup_with_workspace(cx).await;
+            let block = status_block(&subdirectory, " M a.txt\r\n")
+                .replace("git status -s", "git status --porcelain");
+            feed(&terminal, &block, &mut cx);
+            let id = block_ids(&terminal, &mut cx)[0];
+            let line = status_files(&smart, id, &mut cx)[0].absolute_line;
+            smart.update(&mut cx, |smart, cx| smart.stage(id, line, cx));
+            wait_until(&mut cx, |cx| {
+                smart.read_with(cx, |smart, _| smart.row_mark(id, line).is_some())
+            });
+            assert_eq!(
+                git_stdout(path, &["diff", "--cached", "--name-only"]).await,
+                "a.txt\n"
+            );
+        }
+
+        #[gpui::test]
         async fn stage_quotes_path(cx: &mut TestAppContext) {
             cx.executor().allow_parking();
             let Some(directory) = repository().await else {
@@ -856,8 +938,6 @@ mod tests {
                 Some("Discard changes to a.txt?".to_string())
             );
             cx.simulate_prompt_answer("Cancel");
-            cx.run_until_parked();
-            std::thread::sleep(std::time::Duration::from_millis(200));
             cx.run_until_parked();
             assert_eq!(
                 std::fs::read_to_string(path.join("a.txt")).expect("read"),

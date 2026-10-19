@@ -51,8 +51,15 @@ pub fn git_info(cwd: &Path, cx: &App) -> Task<Option<GitInfo>> {
 }
 
 async fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    // Failing outside a repository is routine here, so it is not logged.
-    run_git(cwd, args, false).await.ok()
+    match run_git(cwd, args, false).await {
+        Ok(output) => Some(output),
+        // Git failing outside a repository is routine; git missing is not.
+        Err(error) if error.is::<std::io::Error>() => {
+            log::error!("running git: {error:?}");
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// Read-only callers pass `optional_locks: false` so a background `git status` never holds

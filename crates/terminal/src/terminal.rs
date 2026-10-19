@@ -6730,6 +6730,45 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn output_lines_read_tabs_back_as_tabs(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        feed_pty_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07git status\r\n\x1b]633;E;git status\x07\x1b]133;C\x07Changes not staged for commit:\r\n\tmodified:   a.txt\r\nab\tc\t\td\r\n\x1b]133;D;1\x07",
+            cx,
+        );
+        terminal.read_with(cx, |terminal, _| {
+            let block = terminal
+                .blocks()
+                .expect("blocks")
+                .blocks()
+                .next()
+                .expect("block");
+            let lines = terminal
+                .block_output_lines(block.id, 10, 1000)
+                .expect("lines");
+            let texts: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
+            assert_eq!(
+                texts,
+                [
+                    "Changes not staged for commit:",
+                    "\tmodified:   a.txt",
+                    "ab\tc\t\td"
+                ]
+            );
+            let insight = photon_blocks::recognise(&block.command, &lines, block.exit_code);
+            assert!(
+                matches!(
+                    &insight,
+                    Some(photon_blocks::Insight::GitStatus { files })
+                        if files.len() == 1 && files[0].path == "a.txt"
+                ),
+                "{insight:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn output_lines_over_cap_is_none(cx: &mut TestAppContext) {
         let (terminal, cx) = init_block_terminal(cx);
         feed_pty_output(

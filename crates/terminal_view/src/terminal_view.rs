@@ -4882,7 +4882,7 @@ mod tests {
         feed_block_output(
             &terminal,
             format!(
-                "\x1b]133;A\x07\x1b]133;B\x07git status -s\r\n\x1b]633;E;git status -s\x07\x1b]133;C\x07{long_line}\r\n M a.txt\r\nA  b.txt\r\n?? c.txt\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07"
+                "\x1b]133;A\x07\x1b]133;B\x07git status\r\n\x1b]633;E;git status\x07\x1b]133;C\x07{long_line}\r\nChanges to be committed:\r\n\tnew file:   b.txt\r\n\r\nChanges not staged for commit:\r\n\tmodified:   a.txt\r\n\r\nUntracked files:\r\n\tc.txt\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07"
             )
             .as_bytes(),
             &mut cx,
@@ -4915,7 +4915,11 @@ mod tests {
             rows,
             [
                 (
-                    "M a.txt".to_string(),
+                    "new file:   b.txt".to_string(),
+                    RowContent::Buttons(vec![RowButton::Diff])
+                ),
+                (
+                    "modified:   a.txt".to_string(),
                     RowContent::Buttons(vec![
                         RowButton::Stage,
                         RowButton::Diff,
@@ -4923,14 +4927,81 @@ mod tests {
                     ])
                 ),
                 (
-                    "A  b.txt".to_string(),
-                    RowContent::Buttons(vec![RowButton::Diff])
-                ),
-                (
-                    "?? c.txt".to_string(),
+                    "c.txt".to_string(),
                     RowContent::Buttons(vec![RowButton::Stage])
                 ),
             ]
+        );
+    }
+
+    #[gpui::test]
+    async fn diff_button_resolves_parent_paths(cx: &mut TestAppContext) {
+        // The block's OSC 7 cwd makes the input box's branch chip run a real `git`.
+        cx.executor().allow_parking();
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let workspace = terminal_view.read_with(&cx, |view, _| view.workspace.clone());
+        let workspace = workspace.upgrade().expect("workspace");
+        cx.update(|_, cx| {
+            editor::init(cx);
+            git_ui::init(cx);
+        });
+        let fs = workspace
+            .read_with(&cx, |workspace, cx| {
+                workspace.project().read(cx).fs().clone()
+            })
+            .as_fake()
+            .clone();
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({
+                ".git": {},
+                "app": { "a.txt": "one" },
+                "lib": { "b.txt": "two" },
+            }),
+        )
+        .await;
+        workspace
+            .update(&mut cx, |workspace, cx| {
+                workspace.project().update(cx, |project, cx| {
+                    project.find_or_create_worktree("/project/app", true, cx)
+                })
+            })
+            .await
+            .expect("worktree");
+        cx.run_until_parked();
+        feed_block_output(
+            &terminal,
+            b"\x1b]7;file://host/project/lib\x07\x1b]133;A\x07\x1b]133;B\x07git status -s\r\n\x1b]633;E;git status -s\x07\x1b]133;C\x07 M ../app/a.txt\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07",
+            &mut cx,
+        );
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-up");
+        let (_, line, _) = terminal_view
+            .read_with(&cx, |view, cx| view.selected_status_rows(cx))
+            .into_iter()
+            .next()
+            .expect("status row");
+        let (id, smart_blocks) = terminal_view.read_with(&cx, |view, _| {
+            (
+                view.selected_block().expect("selected"),
+                view.smart_blocks.as_ref().expect("smart blocks").0.clone(),
+            )
+        });
+        smart_blocks.update_in(&mut cx, |smart_blocks, window, cx| {
+            smart_blocks.open_diff(id, line, window, cx)
+        });
+        cx.run_until_parked();
+        let opened = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<git_ui::project_diff::ProjectDiff>())
+                .is_some()
+        });
+        assert!(
+            opened,
+            "`../app/a.txt` from /project/lib opens the diff of the `app` worktree's a.txt"
         );
     }
 

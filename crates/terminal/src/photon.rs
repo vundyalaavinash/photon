@@ -383,6 +383,8 @@ struct OutputRead {
     max_bytes: usize,
 }
 
+const TAB_WIDTH: usize = 8;
+
 fn read_output_lines(
     term: &AlacrittyTerm,
     read: &OutputRead,
@@ -426,11 +428,22 @@ fn read_output_lines(
     let mut line = first;
     while line <= last {
         let row = &grid[line];
-        let text: String = (0..grid.columns())
-            .map(|column| &row[alacritty_terminal::index::Column(column)])
-            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-            .map(|cell| cell.c)
-            .collect();
+        let mut text = String::new();
+        let mut in_tab = false;
+        for column in 0..grid.columns() {
+            let cell = &row[alacritty_terminal::index::Column(column)];
+            // A TAB leaves a '\t' cell followed by blank cells up to the next tab stop; read it
+            // back as the single '\t' the program printed, as alacritty's own copy does.
+            // ponytail: assumes the default 8-column tab stops; alacritty keeps custom stops
+            // private.
+            if in_tab && column % TAB_WIDTH != 0 && cell.c == ' ' {
+                continue;
+            }
+            in_tab = cell.c == '\t';
+            if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                text.push(cell.c);
+            }
+        }
         let wraps = row[last_column].flags.contains(Flags::WRAPLINE);
         match lines.last_mut().filter(|_| continuing) {
             Some(open) => open.text.push_str(&text),
