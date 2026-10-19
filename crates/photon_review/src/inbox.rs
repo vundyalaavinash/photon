@@ -24,6 +24,7 @@ use crate::{
     Tracked, auth_status_request,
     checkout::{ensure_safe_segment, force_remove_worktree, review_root, worktree_path},
     cleanup_checkout, gh_runner, inbox_request, open_review, parse_auth_status, parse_inbox,
+    run_locally,
 };
 
 actions!(
@@ -164,9 +165,6 @@ fn badge_color(badge: &str) -> Color {
         Color::Muted
     }
 }
-
-// Task 13 replaces this with `crate::run_locally::run_locally`.
-fn run_locally(_summary: &PrSummary, _window: &mut Window, _cx: &mut App) {}
 
 pub struct InboxPanel {
     workspace: WeakEntity<Workspace>,
@@ -459,6 +457,7 @@ impl InboxPanel {
         let primary_summary = summary.clone();
         let workspace = self.workspace.clone();
         let local_summary = summary.clone();
+        let local_workspace = workspace.clone();
         v_flex()
             .id(SharedString::from(id.clone()))
             .gap_1()
@@ -488,7 +487,14 @@ impl InboxPanel {
                     .child(
                         Button::new(SharedString::from(format!("{id}-run")), "Run locally")
                             .style(ButtonStyle::Subtle)
-                            .on_click(move |_, window, cx| run_locally(&local_summary, window, cx)),
+                            .on_click(move |_, window, cx| {
+                                local_workspace
+                                    .update(cx, |workspace, cx| {
+                                        run_locally(local_summary.clone(), workspace, window, cx)
+                                            .detach_and_log_err(cx)
+                                    })
+                                    .log_err();
+                            }),
                     )
                     .child(
                         Button::new(

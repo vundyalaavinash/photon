@@ -359,11 +359,11 @@ pub(crate) async fn git_raw(dir: &Path, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, reason = "synchronous fixture setup")]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::Command;
 
-    fn run(dir: &Path, args: &[&str]) -> String {
+    pub(crate) fn run(dir: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -383,18 +383,18 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         _temp: tempfile::TempDir,
-        upstream: PathBuf,
-        seed: PathBuf,
-        user: PathBuf,
-        root: PathBuf,
-        main_sha: String,
-        pr_sha: String,
+        pub(crate) upstream: PathBuf,
+        pub(crate) seed: PathBuf,
+        pub(crate) user: PathBuf,
+        pub(crate) root: PathBuf,
+        pub(crate) main_sha: String,
+        pub(crate) pr_sha: String,
     }
 
     impl Fixture {
-        fn new() -> Option<Self> {
+        pub(crate) fn new() -> Option<Self> {
             if Command::new("git").arg("--version").output().is_err() {
                 return None;
             }
@@ -439,11 +439,11 @@ mod tests {
             })
         }
 
-        fn url(&self) -> String {
+        pub(crate) fn url(&self) -> String {
             format!("file://{}", self.upstream.display())
         }
 
-        fn key(&self) -> PrKey {
+        pub(crate) fn key(&self) -> PrKey {
             PrKey {
                 host: "github.com".into(),
                 owner: "acme".into(),
@@ -452,7 +452,7 @@ mod tests {
             }
         }
 
-        fn user_state(&self) -> Vec<String> {
+        pub(crate) fn user_state(&self) -> Vec<String> {
             let refs = run(&self.user, &["for-each-ref"])
                 .lines()
                 .filter(|line| !line.contains("refs/photon/"))

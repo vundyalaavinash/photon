@@ -8,6 +8,7 @@ mod github;
 mod inbox;
 mod review;
 mod review_map;
+mod run_locally;
 mod since_review;
 mod store;
 
@@ -21,6 +22,7 @@ pub use github::*;
 pub use inbox::*;
 pub use review::*;
 pub use review_map::*;
+pub use run_locally::*;
 pub use since_review::*;
 pub use store::*;
 

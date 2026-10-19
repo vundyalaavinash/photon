@@ -4326,6 +4326,21 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn prefill_block_input_sets_text_without_running(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        take_pty_writes(&terminal, &mut cx);
+        terminal_view.update_in(&mut cx, |view, window, cx| {
+            view.prefill_block_input("cargo test", window, cx)
+        });
+        assert_eq!(input_text(&terminal_view, &mut cx), "cargo test");
+        let writes = take_pty_writes(&terminal, &mut cx).concat();
+        assert!(
+            !String::from_utf8_lossy(&writes).contains("cargo test"),
+            "{writes:?}"
+        );
+    }
+
+    #[gpui::test]
     async fn ctrl_c_clears_input(cx: &mut TestAppContext) {
         let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
         take_pty_writes(&terminal, &mut cx);

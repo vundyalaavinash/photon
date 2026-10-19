@@ -393,7 +393,7 @@ async fn place_review(
     Ok(())
 }
 
-fn repo_id(summary: &PrSummary) -> RepoId {
+pub(crate) fn repo_id(summary: &PrSummary) -> RepoId {
     RepoId {
         host: summary.key.host.to_lowercase(),
         owner: summary.key.owner.to_lowercase(),

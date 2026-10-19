@@ -1724,6 +1724,8 @@
   //
   // Default: false
   "disable_ai": false,
+  // photon: command pre-filled (not run) in the terminal that "Run locally" opens for a PR.
+  "pr_review": { "test_command": null },
   // Automatically update Zed. This setting may be ignored on Linux if
   // installed through a package manager.
   "auto_update": false, // photon: update by pulling and rebuilding

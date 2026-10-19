@@ -85,12 +85,26 @@ pub struct ProjectSettingsContent {
     ///
     /// Default: false
     pub disable_ai: Option<SaturatingBool>,
+
+    /// Settings for reviewing GitHub pull requests.
+    pub pr_review: Option<PrReviewSettingsContent>, // photon: PR review settings
+}
+
+// photon: settings for the PR review workflow
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct PrReviewSettingsContent {
+    /// Command pre-filled (never run) in the terminal that "Run locally" opens for a pull request.
+    ///
+    /// Default: null
+    pub test_command: Option<String>,
 }
 
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
         terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        pr_review, // photon: PR review settings
     },
     defaults: { lsp, dap, context_servers },
 });

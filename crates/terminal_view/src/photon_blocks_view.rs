@@ -526,6 +526,16 @@ impl TerminalView {
 }
 
 impl TerminalView {
+    /// Puts `text` in the block input without running it. A terminal without one (blocks off,
+    /// or not zsh) is left alone.
+    pub fn prefill_block_input(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.block_input.clone() else {
+            log::info!("not pre-filling the terminal: it has no block input");
+            return;
+        };
+        input.update(cx, |input, cx| input.set_text(text, window, cx));
+    }
+
     pub(crate) fn new_block_input(
         terminal: &Entity<Terminal>,
         workspace: gpui::WeakEntity<workspace::Workspace>,
