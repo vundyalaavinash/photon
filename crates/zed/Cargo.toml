@@ -175,6 +175,7 @@ outline_panel.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
 photon_brand.workspace = true
+photon_review.workspace = true # photon: PR review
 photon_terminal.workspace = true # photon: block terminal input and history
 picker.workspace = true
 profiling.workspace = true

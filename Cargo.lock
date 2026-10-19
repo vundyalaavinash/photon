@@ -13471,6 +13471,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "photon_review"
+version = "0.1.0"
+dependencies = [
+ "futures 0.3.34",
+ "gpui",
+ "parking_lot",
+ "serde_json",
+ "tempfile",
+ "util",
+]
+
+[[package]]
 name = "photon_terminal"
 version = "0.1.0"
 dependencies = [
@@ -22686,6 +22698,7 @@ dependencies = [
  "parking_lot",
  "paths",
  "photon_brand",
+ "photon_review",
  "photon_terminal",
  "picker",
  "pkg-config",

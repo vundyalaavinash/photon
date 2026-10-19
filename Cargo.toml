@@ -164,6 +164,7 @@ members = [
     "crates/paths",
     "crates/photon_blocks",
     "crates/photon_brand",
+    "crates/photon_review", # photon: PR review
     "crates/photon_terminal",
     "crates/picker",
     "crates/picker_preview",
@@ -443,6 +444,7 @@ paths = { path = "crates/paths" }
 perf = { path = "tooling/perf", default-features = false }
 photon_blocks = { path = "crates/photon_blocks" }
 photon_brand = { path = "crates/photon_brand" }
+photon_review = { path = "crates/photon_review" } # photon: PR review
 photon_terminal = { path = "crates/photon_terminal" }
 picker = { path = "crates/picker" }
 picker_preview = { path = "crates/picker_preview" }
