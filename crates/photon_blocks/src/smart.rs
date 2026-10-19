@@ -83,13 +83,27 @@ pub enum Insight {
 pub const MAX_INSIGHT_LINES: usize = 20_000;
 pub const MAX_INSIGHT_BYTES: usize = 5 * 1024 * 1024;
 
-pub fn recognise(_command: &str, lines: &[OutputLine], _exit_code: Option<i32>) -> Option<Insight> {
+pub fn recognise(command: &str, lines: &[OutputLine], _exit_code: Option<i32>) -> Option<Insight> {
     if lines.len() > MAX_INSIGHT_LINES
         || lines.iter().map(|line| line.text.len()).sum::<usize>() > MAX_INSIGHT_BYTES
     {
         return None;
     }
-    recognise_tests(lines).map(Insight::Tests)
+    if let Some(run) = recognise_tests(lines) {
+        return Some(Insight::Tests(run));
+    }
+    let mut words = command.split_whitespace();
+    let git_subcommand = (words.next() == Some("git"))
+        .then(|| words.next())
+        .flatten();
+    recognise_build(lines)
+        .or_else(|| match git_subcommand {
+            Some("status") => recognise_git_status(lines),
+            Some("log") => recognise_git_log(lines),
+            _ => None,
+        })
+        .or_else(|| recognise_json(lines))
+        .or_else(|| recognise_table(lines))
 }
 
 // Nextest echoes each failing test's own `test result:` line, so it must be tried before Cargo.
@@ -551,6 +565,286 @@ pub fn compare_runs(previous: &TestRun, current: &TestRun) -> RunDelta {
     }
 }
 
+static RUSTC_ERROR: LazyLock<Regex> = LazyLock::new(|| regex(r"^error(?:\[[A-Za-z0-9]+\])?:"));
+static RUSTC_BOUNDARY: LazyLock<Regex> = LazyLock::new(|| regex(r"^(?:error|warning)"));
+static RUSTC_ARROW: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"^[ \t]*--> (.+?):([0-9]+):([0-9]+)$"));
+static TSC_ERROR: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"^(.+?)\(([0-9]+),([0-9]+)\): error TS"));
+static GCC_ERROR: LazyLock<Regex> = LazyLock::new(|| regex(r"^(.+?):([0-9]+):([0-9]+): error:"));
+static STATUS_SECTION: LazyLock<Regex> = LazyLock::new(|| regex(r"^[A-Z][^\t]*:$"));
+static STATUS_LONG_ENTRY: LazyLock<Regex> = LazyLock::new(|| regex(r"^\t([a-z][a-z ]*):[ ]+(.+)$"));
+static STATUS_SHORT_ENTRY: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"^([ MTADRCU?!])([ MTADRCU?!]) (.+)$"));
+static LOG_HASH: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"^(?:commit )?([0-9a-f]{7,40})(?:[ \t]|$)"));
+static LOCAL_URL: LazyLock<Regex> = LazyLock::new(|| {
+    regex(r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\])(:[0-9]+)?(/[^ \t]*)?")
+});
+static ERROR_LINE: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"(?i-u)\b(error|failed|exception|panic(ked)?)\b"));
+static NO_ERROR_LINE: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"(?i-u)\b(0|no) (errors?|failures?)\b"));
+
+fn recognise_build(lines: &[OutputLine]) -> Option<Insight> {
+    let mut errors = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let found = if RUSTC_ERROR.is_match(&line.text) {
+            lines[index + 1..]
+                .iter()
+                .take_while(|next| !RUSTC_BOUNDARY.is_match(&next.text))
+                .find_map(|next| RUSTC_ARROW.captures(&next.text))
+        } else {
+            TSC_ERROR
+                .captures(&line.text)
+                .or_else(|| GCC_ERROR.captures(&line.text))
+        };
+        if let Some(error) = found.and_then(|c| location(&c[1], &c[2], Some(&c[3]))) {
+            errors.push(error);
+        }
+    }
+    (!errors.is_empty()).then_some(Insight::Build { errors })
+}
+
+// Git quotes paths with special characters as C strings with octal escapes for non-ASCII bytes.
+fn unquote_git_path(path: &str) -> String {
+    let Some(inner) = path
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return path.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        index += 1;
+        if byte != b'\\' {
+            decoded.push(byte);
+            continue;
+        }
+        let Some(&escaped) = bytes.get(index) else {
+            decoded.push(byte);
+            break;
+        };
+        index += 1;
+        match escaped {
+            b'0'..=b'7' => {
+                let mut value = u32::from(escaped - b'0');
+                for _ in 0..2 {
+                    match bytes.get(index) {
+                        Some(&digit @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(digit - b'0');
+                            index += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                decoded.push(value as u8);
+            }
+            b'n' => decoded.push(b'\n'),
+            b't' => decoded.push(b'\t'),
+            other => decoded.push(other),
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn status_path(text: &str, renamed: bool) -> String {
+    let target = match text.split_once(" -> ") {
+        Some((_, new)) if renamed => new,
+        _ => text,
+    };
+    unquote_git_path(target.trim())
+}
+
+fn recognise_git_status(lines: &[OutputLine]) -> Option<Insight> {
+    let mut files = Vec::new();
+    let mut section = None;
+    for line in lines {
+        let text = line.text.as_str();
+        if STATUS_SECTION.is_match(text) {
+            section = match text {
+                "Changes to be committed:" => Some(FileState::Staged),
+                "Changes not staged for commit:" | "Unmerged paths:" => Some(FileState::Unstaged),
+                "Untracked files:" => Some(FileState::Untracked),
+                _ => None,
+            };
+            continue;
+        }
+        let Some(state) = section else { continue };
+        let entry = if state == FileState::Untracked {
+            text.strip_prefix('\t').map(|path| (path, false))
+        } else {
+            STATUS_LONG_ENTRY.captures(text).map(|captures| {
+                let renamed = matches!(&captures[1], "renamed" | "copied");
+                (captures.get(2).map_or("", |path| path.as_str()), renamed)
+            })
+        };
+        if let Some((path, renamed)) = entry {
+            files.push(StatusFile {
+                absolute_line: line.absolute_line,
+                path: status_path(path, renamed),
+                state,
+            });
+        }
+    }
+    if files.is_empty() {
+        for line in lines {
+            let Some(captures) = STATUS_SHORT_ENTRY.captures(&line.text) else {
+                continue;
+            };
+            let (index, worktree) = (&captures[1], &captures[2]);
+            let renamed = index == "R" || index == "C" || worktree == "R" || worktree == "C";
+            let path = status_path(&captures[3], renamed);
+            let mut states = Vec::new();
+            if index == "?" && worktree == "?" {
+                states.push(FileState::Untracked);
+            } else if index != "!" {
+                if index != " " {
+                    states.push(FileState::Staged);
+                }
+                if worktree != " " {
+                    states.push(FileState::Unstaged);
+                }
+            }
+            files.extend(states.into_iter().map(|state| StatusFile {
+                absolute_line: line.absolute_line,
+                path: path.clone(),
+                state,
+            }));
+        }
+    }
+    (!files.is_empty()).then_some(Insight::GitStatus { files })
+}
+
+fn recognise_git_log(lines: &[OutputLine]) -> Option<Insight> {
+    let commits: Vec<CommitHash> = lines
+        .iter()
+        .filter_map(|line| {
+            let hash = LOG_HASH.captures(&line.text)?.get(1)?;
+            Some(CommitHash {
+                absolute_line: line.absolute_line,
+                columns: hash.start()..hash.end(),
+                hash: hash.as_str().to_string(),
+            })
+        })
+        .collect();
+    (!commits.is_empty()).then_some(Insight::GitLog { commits })
+}
+
+fn recognise_json(lines: &[OutputLine]) -> Option<Insight> {
+    let text = lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = text.trim();
+    (trimmed.starts_with(['{', '[']) && serde_json::from_str::<serde_json::Value>(trimmed).is_ok())
+        .then_some(Insight::Json)
+}
+
+fn recognise_table(lines: &[OutputLine]) -> Option<Insight> {
+    let rows: Vec<Vec<char>> = lines
+        .iter()
+        .map(|line| line.text.trim_end().chars().collect())
+        .collect();
+    let first = rows.iter().position(|row| !row.is_empty())?;
+    let last = rows.iter().rposition(|row| !row.is_empty())?;
+    let rows = &rows[first..=last];
+    if rows.len() < 3 {
+        return None;
+    }
+    let header = &rows[0];
+    let is_space_at = |row: &Vec<char>, index: usize| row.get(index).is_none_or(|c| *c == ' ');
+    let mut starts = vec![0];
+    starts.extend((1..header.len().saturating_sub(1)).filter_map(|index| {
+        let boundary = is_space_at(header, index)
+            && header.get(index + 1).is_some_and(|c| *c != ' ')
+            && rows.iter().all(|row| is_space_at(row, index));
+        boundary.then_some(index + 1)
+    }));
+    if starts.len() < 2 {
+        return None;
+    }
+    let cells = |row: &Vec<char>| -> Vec<String> {
+        starts
+            .iter()
+            .enumerate()
+            .map(|(column, &start)| {
+                let end = starts.get(column + 1).map_or(row.len(), |next| next - 1);
+                row.get(start..end.max(start).min(row.len()))
+                    .map(|cell| cell.iter().collect::<String>().trim().to_string())
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    let headers = cells(header);
+    if headers
+        .iter()
+        .any(|cell| cell.is_empty() || cell.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let rows: Vec<Vec<String>> = rows[1..]
+        .iter()
+        .map(cells)
+        .filter(|row| row.iter().any(|cell| !cell.is_empty()))
+        .collect();
+    // Prose lines can share a space column by chance; real table rows rarely leave most cells empty.
+    if rows
+        .iter()
+        .any(|row| row.iter().filter(|cell| !cell.is_empty()).count() * 2 < row.len())
+    {
+        return None;
+    }
+    Some(Insight::Table(Table { headers, rows }))
+}
+
+pub fn find_local_url(line: &str) -> Option<String> {
+    let captures = LOCAL_URL.captures(line)?;
+    let matched = captures.get(0)?;
+    let host = captures.get(1)?;
+    if matches!(host.as_str(), "0.0.0.0" | "[::]") {
+        let text = matched.as_str();
+        let offset = host.start() - matched.start();
+        return Some(format!(
+            "{}localhost{}",
+            &text[..offset],
+            &text[offset + host.len()..]
+        ));
+    }
+    Some(matched.as_str().to_string())
+}
+
+pub fn url_label(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+pub fn is_error_line(line: &str) -> bool {
+    ERROR_LINE.is_match(line) && !NO_ERROR_LINE.is_match(line)
+}
+
+pub fn table_to_csv(table: &Table) -> String {
+    let mut csv = String::new();
+    for row in std::iter::once(&table.headers).chain(&table.rows) {
+        let record: Vec<String> = row
+            .iter()
+            .map(|cell| {
+                if cell.contains([',', '"', '\n', '\r']) {
+                    format!("\"{}\"", cell.replace('"', "\"\""))
+                } else {
+                    cell.clone()
+                }
+            })
+            .collect();
+        csv.push_str(&record.join(","));
+        csv.push('\n');
+    }
+    csv
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +1187,286 @@ mod tests {
         );
         assert_eq!(rerun_failed_command("npm test # x", &jest), None);
         assert_eq!(rerun_failed_command("npm test \\x", &jest), None);
+    }
+
+    fn insight(command: &str, text: &str) -> Option<Insight> {
+        recognise(command, &fixture(text), Some(0))
+    }
+
+    fn build_errors(text: &str) -> Vec<(String, u32, Option<u32>)> {
+        match insight("cargo build", text) {
+            Some(Insight::Build { errors }) => errors
+                .into_iter()
+                .map(|error| (error.path.display().to_string(), error.line, error.column))
+                .collect(),
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    fn status_rows(command: &str, text: &str) -> Vec<(i64, String, FileState)> {
+        match insight(command, text) {
+            Some(Insight::GitStatus { files }) => files
+                .into_iter()
+                .map(|file| (file.absolute_line, file.path, file.state))
+                .collect(),
+            other => panic!("expected GitStatus, got {other:?}"),
+        }
+    }
+
+    fn table_of(command: &str, text: &str) -> Table {
+        match insight(command, text) {
+            Some(Insight::Table(table)) => table,
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rustc_errors_located() {
+        let text = include_str!("../test_fixtures/smart/rustc_errors.txt");
+        assert_eq!(
+            build_errors(text),
+            vec![
+                ("src/main.rs".to_string(), 4, Some(13)),
+                ("src/lib.rs".to_string(), 12, Some(5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn tsc_and_gcc_errors_located() {
+        let text = "src/app.ts(10,5): error TS2322: Type 'string' is not assignable.\nmain.c:7:3: error: expected ';'\nmain.c:8:1: warning: unused\n";
+        assert_eq!(
+            build_errors(text),
+            vec![
+                ("src/app.ts".to_string(), 10, Some(5)),
+                ("main.c".to_string(), 7, Some(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn successful_build_has_no_insight() {
+        let text = "   Compiling demo v0.1.0\nwarning: unused variable\n --> src/main.rs:1:1\n    Finished dev profile\n";
+        assert_eq!(insight("cargo build", text), None);
+    }
+
+    #[test]
+    fn git_status_long_format() {
+        let rows = status_rows(
+            "git status",
+            include_str!("../test_fixtures/smart/git_status_long.txt"),
+        );
+        let expected = [
+            (3, "a.txt", FileState::Staged),
+            (4, "d.txt", FileState::Staged),
+            (9, "b.txt", FileState::Unstaged),
+            (13, "a b.txt", FileState::Untracked),
+            (14, "new.txt", FileState::Untracked),
+            (15, "é.txt", FileState::Untracked),
+        ];
+        assert_eq!(
+            rows,
+            expected
+                .into_iter()
+                .map(|(line, path, state)| (line, path.to_string(), state))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn git_status_short_format() {
+        let rows = status_rows(
+            "git status -sb",
+            include_str!("../test_fixtures/smart/git_status_short.txt"),
+        );
+        let states: Vec<_> = rows.iter().map(|row| (row.1.as_str(), row.2)).collect();
+        assert_eq!(
+            states,
+            vec![
+                ("a.txt", FileState::Staged),
+                ("b.txt", FileState::Unstaged),
+                ("d.txt", FileState::Staged),
+                ("a b.txt", FileState::Untracked),
+                ("new.txt", FileState::Untracked),
+                ("é.txt", FileState::Untracked),
+            ]
+        );
+        assert_eq!(rows[0].0, 1);
+    }
+
+    #[test]
+    fn git_status_short_format_can_list_a_file_twice() {
+        let rows = status_rows("git status -s", "MM both.rs\n");
+        assert_eq!(
+            rows,
+            vec![
+                (0, "both.rs".to_string(), FileState::Staged),
+                (0, "both.rs".to_string(), FileState::Unstaged),
+            ]
+        );
+    }
+
+    #[test]
+    fn git_status_paths_with_spaces_and_renames() {
+        let rows = status_rows(
+            "git status --short",
+            "?? \"a b.txt\"\nR  old.txt -> new.txt\nRM \"x y\" -> \"p q\"\n?? \"\\303\\251.txt\"\n",
+        );
+        let paths: Vec<_> = rows.iter().map(|row| row.1.as_str()).collect();
+        assert_eq!(paths, vec!["a b.txt", "new.txt", "p q", "p q", "é.txt"]);
+    }
+
+    #[test]
+    fn git_status_needs_the_git_status_command() {
+        assert_eq!(insight("echo", "?? new.txt\n"), None);
+    }
+
+    #[test]
+    fn git_log_hashes_with_columns() {
+        let hashes = |command: &str, text: &str| match insight(command, text) {
+            Some(Insight::GitLog { commits }) => commits
+                .into_iter()
+                .map(|commit| (commit.absolute_line, commit.columns, commit.hash))
+                .collect::<Vec<_>>(),
+            other => panic!("expected GitLog, got {other:?}"),
+        };
+        assert_eq!(
+            hashes(
+                "git log",
+                include_str!("../test_fixtures/smart/git_log_default.txt")
+            ),
+            vec![
+                (
+                    0,
+                    7..47,
+                    "3c170bdd4d90abd616df40a0a0fa99fef681a312".to_string()
+                ),
+                (
+                    6,
+                    7..47,
+                    "f05df5ee50a7f6137bdcf656b547dfd65d0a5c5c".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            hashes(
+                "git log --oneline",
+                include_str!("../test_fixtures/smart/git_log_oneline.txt")
+            ),
+            vec![
+                (0, 0..7, "3c170bd".to_string()),
+                (1, 0..7, "f05df5e".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn json_detected() {
+        assert_eq!(
+            insight("curl x", "{\n  \"a\": [1, 2],\n  \"b\": null\n}\n"),
+            Some(Insight::Json)
+        );
+        assert_eq!(insight("cat x", "[1, 2, 3]"), Some(Insight::Json));
+    }
+
+    #[test]
+    fn json_near_misses() {
+        for text in ["{not json", "[1,2", "ok {\n}"] {
+            assert_eq!(insight("cat x", text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn kubectl_docker_ps_tables() {
+        let pods = table_of(
+            "kubectl get pods",
+            include_str!("../test_fixtures/smart/kubectl_pods.txt"),
+        );
+        assert_eq!(pods.headers, ["NAME", "READY", "STATUS", "RESTARTS", "AGE"]);
+        assert_eq!(
+            pods.rows[1],
+            [
+                "worker-5c6d7f8b9-xyz12",
+                "0/1",
+                "CrashLoopBackOff",
+                "12",
+                "2h"
+            ]
+        );
+
+        let containers = table_of(
+            "docker ps",
+            include_str!("../test_fixtures/smart/docker_ps.txt"),
+        );
+        assert_eq!(containers.headers[0], "CONTAINER ID");
+        assert_eq!(containers.headers.len(), 7);
+        assert_eq!(containers.rows[0][5], "0.0.0.0:5432->5432/tcp");
+        assert_eq!(containers.rows[1][6], "cache");
+
+        let processes = table_of("ps aux", include_str!("../test_fixtures/smart/ps_aux.txt"));
+        assert_eq!(
+            processes.headers.last().map(String::as_str),
+            Some("COMMAND")
+        );
+        assert_eq!(
+            processes.rows[1].last().map(String::as_str),
+            Some("/bin/zsh -c echo hello world")
+        );
+    }
+
+    #[test]
+    fn prose_is_not_a_table() {
+        let text = "The quick brown fox jumps over the lazy dog and keeps running far away.\nA second sentence follows here, which is of a quite different length.\nAnd then a short third one.\n";
+        assert_eq!(insight("cat notes", text), None);
+    }
+
+    #[test]
+    fn two_line_output_is_not_a_table() {
+        assert_eq!(insight("ls", "NAME   AGE\nweb    3d\n"), None);
+    }
+
+    #[test]
+    fn local_urls() {
+        assert_eq!(
+            find_local_url("  ➜  Local:   http://localhost:5173/"),
+            Some("http://localhost:5173/".to_string())
+        );
+        assert_eq!(
+            find_local_url("listening on http://0.0.0.0:3000"),
+            Some("http://localhost:3000".to_string())
+        );
+        assert_eq!(
+            find_local_url("at http://[::]:8080/app"),
+            Some("http://localhost:8080/app".to_string())
+        );
+        assert_eq!(
+            find_local_url("http://127.0.0.1:9000/x"),
+            Some("http://127.0.0.1:9000/x".to_string())
+        );
+        assert_eq!(find_local_url("https://example.com"), None);
+        assert_eq!(url_label("http://localhost:5173/"), "localhost:5173");
+        assert_eq!(url_label("http://localhost:3000/a/b"), "localhost:3000");
+    }
+
+    #[test]
+    fn error_lines() {
+        assert!(is_error_line("error: x"));
+        assert!(is_error_line("thread 'main' panicked at src/lib.rs"));
+        assert!(is_error_line("Test FAILED"));
+        assert!(!is_error_line("0 errors"));
+        assert!(!is_error_line("Compiled with no errors"));
+        assert!(!is_error_line("all good"));
+    }
+
+    #[test]
+    fn csv_quoting() {
+        let table = Table {
+            headers: vec!["a".to_string(), "b,c".to_string()],
+            rows: vec![vec!["say \"hi\"".to_string(), "line1\nline2".to_string()]],
+        };
+        assert_eq!(
+            table_to_csv(&table),
+            "a,\"b,c\"\n\"say \"\"hi\"\"\",\"line1\nline2\"\n"
+        );
     }
 }

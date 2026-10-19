@@ -1,0 +1,16 @@
+# hand-written
+error[E0425]: cannot find value `x` in this scope
+ --> src/main.rs:4:13
+  |
+4 |     let y = x;
+  |             ^ not found
+
+warning: unused variable: `z`
+ --> src/main.rs:9:9
+  |
+
+error[E0308]: mismatched types
+  --> src/lib.rs:12:5
+   |
+
+error: could not compile `demo` (bin "demo") due to 2 previous errors; 1 warning emitted

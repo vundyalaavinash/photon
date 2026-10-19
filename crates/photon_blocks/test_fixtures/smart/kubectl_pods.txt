@@ -1,0 +1,4 @@
+# hand-written
+NAME                     READY   STATUS             RESTARTS   AGE
+web-7d9f8b6c5-abcde      1/1     Running            0          3d
+worker-5c6d7f8b9-xyz12   0/1     CrashLoopBackOff   12         2h

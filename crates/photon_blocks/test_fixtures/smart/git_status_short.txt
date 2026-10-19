@@ -1,0 +1,7 @@
+## master
+M  a.txt
+ M b.txt
+R  c.txt -> d.txt
+?? "a b.txt"
+?? new.txt
+?? "\303\251.txt"
