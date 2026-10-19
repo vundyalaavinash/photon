@@ -1,0 +1,6 @@
+--- FAIL: TestBad (0.00s)
+    --- FAIL: TestBad/sub (0.00s)
+        a_test.go:5: boom
+FAIL
+FAIL	demo	0.507s
+FAIL

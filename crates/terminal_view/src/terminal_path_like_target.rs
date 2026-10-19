@@ -1,7 +1,7 @@
 use super::{HoverTarget, HoveredWord, TerminalView};
 use anyhow::Result;
 use editor::items::open_resolved_target;
-use gpui::{Context, EntityId, Focusable as _, Task, TaskExt, WeakEntity, Window};
+use gpui::{Context, Entity, EntityId, Focusable as _, Task, TaskExt, WeakEntity, Window};
 use std::path::PathBuf;
 use terminal::PathLikeTarget;
 use workspace::path_link::PathMatching;
@@ -11,7 +11,7 @@ use workspace::path_link::resolve_open_target;
 use workspace::path_link::{
     BackgroundPathChecks, OpenTargetFoundBy, resolve_open_target_with_fs_checks,
 };
-use workspace::{Workspace, path_link::OpenTarget};
+use workspace::{Pane, Workspace, path_link::OpenTarget};
 
 pub(super) fn hover_path_like_target(
     workspace: &WeakEntity<Workspace>,
@@ -118,6 +118,42 @@ fn possibly_open_target(
     if terminal_view.hover.is_none() {
         return Task::ready(Ok(None));
     }
+    open_target_beside_terminal(
+        workspace,
+        path_like_target,
+        window,
+        cx,
+        #[cfg(test)]
+        background_path_checks,
+    )
+}
+
+// photon: also opens smart-block error locations, which are not hovered first.
+pub(super) fn open_location_beside_terminal(
+    workspace: &WeakEntity<Workspace>,
+    path_like_target: &PathLikeTarget,
+    window: &mut Window,
+    cx: &mut Context<TerminalView>,
+) {
+    open_target_beside_terminal(
+        workspace,
+        path_like_target,
+        window,
+        cx,
+        #[cfg(test)]
+        BackgroundPathChecks::ProjectPathResolution,
+    )
+    .detach_and_log_err(cx)
+}
+
+// photon: split out of `possibly_open_target` so hovered paths and error locations share it.
+fn open_target_beside_terminal(
+    workspace: &WeakEntity<Workspace>,
+    path_like_target: &PathLikeTarget,
+    window: &mut Window,
+    cx: &mut Context<TerminalView>,
+    #[cfg(test)] background_path_checks: BackgroundPathChecks,
+) -> Task<Result<Option<OpenTarget>>> {
     let workspace = workspace.clone();
     let path_like_target = path_like_target.clone();
     cx.spawn_in(window, async move |terminal_view, cx| {
@@ -154,7 +190,7 @@ fn possibly_open_target(
         if open_target.is_file() {
             let terminal_id = terminal_view.entity_id();
             workspace.update_in(cx, |workspace, window, cx| {
-                focus_pane_beside_center_terminal(workspace, terminal_id, window, cx)
+                focus_pane_beside_center_terminal(workspace, terminal_id, window, cx);
             })?;
         }
         let opened = open_resolved_target(&workspace, &open_target, cx).await?;
@@ -163,20 +199,20 @@ fn possibly_open_target(
 }
 
 /// Does nothing for the dock terminal, which already opens files in the center.
-fn focus_pane_beside_center_terminal(
+// photon: also used to open block output as JSON or a table.
+pub(super) fn focus_pane_beside_center_terminal(
     workspace: &mut Workspace,
     terminal_id: EntityId,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) {
-    let Some(terminal_pane) = workspace.pane_for_item_id(terminal_id) else {
-        return;
-    };
+) -> Option<Entity<Pane>> {
+    let terminal_pane = workspace.pane_for_item_id(terminal_id)?;
     if !workspace.panes().contains(&terminal_pane) {
-        return;
+        return None;
     }
     let target_pane = workspace.adjacent_pane_of(&terminal_pane, window, cx);
     window.focus(&target_pane.focus_handle(cx), cx);
+    Some(target_pane)
 }
 
 #[cfg(test)]

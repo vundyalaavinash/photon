@@ -51,6 +51,7 @@ zed_actions.workspace = true
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }
+git_ui = { workspace = true, features = ["test-support"] } # photon: assert git log cmd-click opens a CommitView
 gpui = { workspace = true, features = ["test-support"] }
 photon_terminal = { workspace = true, features = ["test-support"] } # photon: inject a fake completion helper
 pretty_assertions.workspace = true

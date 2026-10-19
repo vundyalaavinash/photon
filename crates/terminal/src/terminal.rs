@@ -1849,6 +1849,8 @@ impl Terminal {
                 resize(term, new_bounds);
                 if let (Some(blocks), Some(distances)) = (&mut self.blocks, block_distances) {
                     blocks.restore_from_cursor(term, &distances);
+                    // photon: smart blocks read again the blocks whose lines moved.
+                    cx.emit(Event::BlocksChanged(None));
                 }
                 if columns_changed {
                     self.reset_cwd_history();
@@ -6696,6 +6698,103 @@ mod tests {
             });
             assert_eq!(outputs(cx), expected, "at {columns} columns");
         }
+    }
+
+    #[gpui::test]
+    async fn output_lines_join_wrapped_rows(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(20.),
+                px(10.),
+                bounds(point(px(0.), px(0.)), size(px(30.), px(20. * 30.))),
+            ));
+            terminal.sync(window, cx);
+        });
+        feed_pty_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07cmd\r\n\x1b]633;E;cmd\x07\x1b]133;C\x07abcdefgh\r\nxy\r\n\r\n\x1b]133;D;0\x07",
+            cx,
+        );
+        terminal.read_with(cx, |terminal, _| {
+            let id = terminal
+                .blocks()
+                .expect("blocks")
+                .blocks()
+                .next()
+                .expect("block")
+                .id;
+            let lines = terminal.block_output_lines(id, 10, 1000).expect("lines");
+            let texts: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
+            assert_eq!(texts, ["abcdefgh", "xy"]);
+            assert_eq!(lines[1].absolute_line, lines[0].absolute_line + 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn output_lines_read_tabs_back_as_tabs(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        feed_pty_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07git status\r\n\x1b]633;E;git status\x07\x1b]133;C\x07Changes not staged for commit:\r\n\tmodified:   a.txt\r\nab\tc\t\td\r\n\x1b]133;D;1\x07",
+            cx,
+        );
+        terminal.read_with(cx, |terminal, _| {
+            let block = terminal
+                .blocks()
+                .expect("blocks")
+                .blocks()
+                .next()
+                .expect("block");
+            let lines = terminal
+                .block_output_lines(block.id, 10, 1000)
+                .expect("lines");
+            let texts: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
+            assert_eq!(
+                texts,
+                [
+                    "Changes not staged for commit:",
+                    "\tmodified:   a.txt",
+                    "ab\tc\t\td"
+                ]
+            );
+            let insight = photon_blocks::recognise(&block.command, &lines, block.exit_code);
+            assert!(
+                matches!(
+                    &insight,
+                    Some(photon_blocks::Insight::GitStatus { files })
+                        if files.len() == 1 && files[0].path == "a.txt"
+                ),
+                "{insight:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn output_lines_over_cap_is_none(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        feed_pty_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07cmd\r\n\x1b]633;E;cmd\x07\x1b]133;C\x07one\r\ntwo\r\nthree\r\n\x1b]133;D;0\x07",
+            cx,
+        );
+        terminal.read_with(cx, |terminal, _| {
+            let id = terminal
+                .blocks()
+                .expect("blocks")
+                .blocks()
+                .next()
+                .expect("block")
+                .id;
+            assert_eq!(
+                terminal
+                    .block_output_lines(id, 3, 1000)
+                    .map(|lines| lines.len()),
+                Some(3)
+            );
+            assert!(terminal.block_output_lines(id, 2, 1000).is_none());
+            assert!(terminal.block_output_lines(id, 10, 10).is_none());
+        });
     }
 
     #[gpui::test]

@@ -1,18 +1,23 @@
-use std::{ops::Range, time::Duration};
+use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla, KeyDownEvent,
     Pixels, Point, SharedString, Stateful, Task, TextRun, TextStyle, Window, actions, fill, point,
     px, rgb, rgba, size,
 };
-use photon_blocks::{Block, BlockId, BlockList, Phase, VisibleBlock, visible_blocks};
-use photon_terminal::BlockInput;
+use photon_blocks::{
+    Block, BlockId, BlockList, Phase, VisibleBlock, format_duration, visible_blocks,
+};
+use photon_terminal::{BlockInput, SmartBlocks};
 use terminal::{BlockPart, InputTarget, Modes, Terminal, TerminalBounds};
 use ui::{ContextMenu, prelude::*};
 use util::{ResultExt as _, paths::PathExt as _};
 use workspace::searchable::SearchEvent;
 
-use crate::{TerminalMode, TerminalView};
+use crate::{
+    TerminalMode, TerminalView,
+    photon_smart_blocks_view::{block_summary, block_toolbar, delta_text},
+};
 
 actions!(
     photon_terminal,
@@ -40,17 +45,8 @@ const FAILED_EDGE: u32 = 0xFF8272;
 const SEPARATOR: u32 = 0x1a1a1a;
 const METADATA: u32 = 0x8E8E8E;
 const EDGE_WIDTH: Pixels = px(3.);
-
-pub fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds >= 3600 {
-        format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
-    } else if seconds >= 60 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{:.1}s", duration.as_secs_f64())
-    }
-}
+const CHIP_BACKGROUND_OPACITY: f32 = 0.15;
+const CHIP_CORNER_RADIUS: Pixels = px(3.);
 
 /// Full-screen apps and terminals that fell back look exactly like classic terminals.
 pub(crate) fn active_blocks(terminal: &Terminal) -> Option<&BlockList> {
@@ -89,14 +85,18 @@ pub(crate) struct BlockChrome {
     hidden_rows: Range<i32>,
     starts_on_screen: bool,
     edge: Option<Hsla>,
-    selected: bool,
+    pub(crate) selected: bool,
     command: SharedString,
     metadata: SharedString,
+    /// What a smart block turned out to be, painted after the metadata (Photon's prompt) or
+    /// after the command.
+    pub(crate) summary: Option<(SharedString, Hsla)>,
 }
 
 pub(crate) fn layout_block_chrome(
     terminal: &Terminal,
     selected: Option<BlockId>,
+    smart_blocks: Option<&SmartBlocks>,
     screen_rows: usize,
 ) -> Vec<BlockChrome> {
     let Some(blocks) = active_blocks(terminal) else {
@@ -104,6 +104,7 @@ pub(crate) fn layout_block_chrome(
     };
     let screen_rows = i32::try_from(screen_rows).unwrap_or(i32::MAX);
     let top_absolute_line = terminal.top_absolute_line();
+    let at_prompt = terminal.input_target() == InputTarget::BlockInput;
     visible_blocks(blocks, top_absolute_line, screen_rows)
         .iter()
         .filter_map(|visible| {
@@ -133,6 +134,13 @@ pub(crate) fn layout_block_chrome(
             } else {
                 None
             };
+            // The selected block's toolbar takes the metadata's place on the header row.
+            let toolbar_covers_metadata = is_selected
+                && metadata_row.is_none()
+                && smart_blocks.is_some_and(|smart| {
+                    !block_toolbar(block, smart, at_prompt).is_empty()
+                        || smart.delta(block.id).and_then(delta_text).is_some()
+                });
             let metadata = [
                 block
                     .cwd
@@ -147,6 +155,11 @@ pub(crate) fn layout_block_chrome(
             .flatten()
             .collect::<Vec<_>>()
             .join("  ");
+            let metadata = if toolbar_covers_metadata {
+                String::new()
+            } else {
+                metadata
+            };
             Some(BlockChrome {
                 hidden_rows: (header_row + 1).max(0)..output_row.min(rows.end),
                 rows,
@@ -157,6 +170,7 @@ pub(crate) fn layout_block_chrome(
                 selected: is_selected,
                 command: block.command.clone().into(),
                 metadata: metadata.into(),
+                summary: smart_blocks.and_then(|smart| block_summary(block, smart)),
             })
         })
         .collect()
@@ -242,6 +256,7 @@ pub(crate) fn paint_block_chrome(
                 cx,
             )
             .log_err();
+        let mut metadata_end = None;
         if !block.metadata.is_empty() {
             let metadata = window.text_system().shape_line(
                 block.metadata.clone(),
@@ -271,8 +286,69 @@ pub(crate) fn paint_block_chrome(
                     cx,
                 )
                 .log_err();
+            metadata_end = Some(metadata_origin.x + metadata.width);
+        }
+        if let Some((summary, color)) = &block.summary {
+            let gap = dimensions.cell_width() * 2.;
+            // The chip follows the text on its row; on the header row the right side belongs
+            // to the metadata or the selected block's toolbar.
+            let chip_origin = match block.metadata_row {
+                Some(row) => point(
+                    metadata_end.map_or(origin.x, |end| end + gap),
+                    origin.y + line_height * row as f32,
+                ),
+                None => point(origin.x + command.width + gap, header_y),
+            };
+            paint_summary_chip(
+                summary,
+                *color,
+                chip_origin,
+                dimensions,
+                text_style,
+                font_size,
+                window,
+                cx,
+            );
         }
     }
+}
+
+fn paint_summary_chip(
+    summary: &SharedString,
+    color: Hsla,
+    origin: Point<Pixels>,
+    dimensions: &TerminalBounds,
+    text_style: &TextStyle,
+    font_size: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let line_height = dimensions.line_height();
+    let text = window.text_system().shape_line(
+        summary.clone(),
+        font_size,
+        &[TextRun {
+            len: summary.len(),
+            font: text_style.font(),
+            color,
+            ..Default::default()
+        }],
+        None,
+    );
+    let padding = dimensions.cell_width() / 2.;
+    let inset = line_height * 0.1;
+    window.paint_quad(
+        fill(
+            Bounds::new(
+                point(origin.x - padding, origin.y + inset),
+                size(text.width + padding * 2., line_height - inset * 2.),
+            ),
+            color.opacity(CHIP_BACKGROUND_OPACITY),
+        )
+        .corner_radii(CHIP_CORNER_RADIUS),
+    );
+    text.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx)
+        .log_err();
 }
 
 pub(crate) fn register_block_actions(
@@ -293,11 +369,13 @@ pub(crate) fn register_block_actions(
         )
         .on_action(cx.listener(TerminalView::rerun_block))
         .on_action(cx.listener(TerminalView::clear_block_selection))
+        .map(|element| crate::photon_smart_blocks_view::register_smart_block_actions(element, cx))
 }
 
 /// The selected block's actions in the terminal's right-click menu.
-pub(crate) fn block_menu_items(menu: ContextMenu) -> ContextMenu {
+pub(crate) fn block_menu_items(menu: ContextMenu, test_delta: Option<String>) -> ContextMenu {
     menu.separator()
+        .when_some(test_delta, |menu, delta| menu.label(delta))
         .action("Copy Command", Box::new(CopyBlockCommand))
         .action("Copy Output", Box::new(CopyBlockOutput))
         .action("Copy Command and Output", Box::new(CopyBlock))
@@ -457,6 +535,29 @@ impl TerminalView {
         terminal.read(cx).blocks()?;
         let terminal = terminal.clone();
         Some(cx.new(|cx| BlockInput::new(terminal, workspace, window, cx)))
+    }
+
+    pub(crate) fn new_smart_blocks(
+        terminal: &Entity<Terminal>,
+        workspace: gpui::WeakEntity<workspace::Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<photon_terminal::SmartBlocks>, gpui::Subscription)> {
+        terminal.read(cx).blocks()?;
+        let terminal = terminal.clone();
+        let smart_blocks =
+            cx.new(|cx| photon_terminal::SmartBlocks::new(terminal, workspace, window, cx));
+        let subscription = cx.subscribe_in(
+            &smart_blocks,
+            window,
+            |this, _, event: &photon_terminal::SmartBlocksEvent, window, cx| match event {
+                photon_terminal::SmartBlocksEvent::Changed => cx.notify(),
+                photon_terminal::SmartBlocksEvent::FocusBlock(id) => {
+                    this.focus_block(*id, window, cx)
+                }
+            },
+        );
+        Some((smart_blocks, subscription))
     }
 
     /// The input's slot below the grid, kept while blocks are drawn so the grid size does

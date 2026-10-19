@@ -149,6 +149,11 @@ impl TableView {
         }
     }
 
+    // photon: lets tests of the terminal's "Open as table" count the rows it loaded.
+    pub fn data_row_count(&self) -> usize {
+        self.engine.contents.rows.len()
+    }
+
     /// Replace the data shown by the grid. Recomputes filter menus and column widths, kicks off the
     /// display-to-data recomputation, and clears the loading state.
     pub fn set_contents(&mut self, contents: TableLikeContent, cx: &mut Context<Self>) {

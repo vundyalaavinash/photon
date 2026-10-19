@@ -1,0 +1,24 @@
+# hand-written
+ FAIL  src/sum.test.js
+  sum
+    ✓ adds numbers (2 ms)
+    ✕ subtracts numbers (3 ms)
+
+  ● sum › subtracts numbers
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 2
+
+      at Object.<anonymous> (src/sum.test.js:9:21)
+
+  ● sum › handles zero
+
+    expect(received).toBe(expected) // Object.is equality
+
+Test Suites: 1 failed, 1 total
+Tests:       2 failed, 5 passed, 7 total
+Snapshots:   0 total
+Time:        0.8 s
+Ran all test suites.

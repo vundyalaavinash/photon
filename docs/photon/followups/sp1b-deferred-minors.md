@@ -1,0 +1,51 @@
+# SP1b deferred minors
+
+Found by per-task and final reviews and not fixed before merge (graded Minor). Source: the SP1b SDD ledger.
+
+- Task 1: minor (deferred): regex() helper panics on invalid constant pattern (smart.rs:192)
+- Task 1: minor (deferred): go/vitest failure parsing breaks on paths with spaces ([^ \t])
+- Task 1: minor (deferred): pytest class/parametrized failures get no location; FAILED nodeids with spaces truncated; pytest -q (no ===== line) not recognised
+- Task 1: minor (deferred): push_unique collapses same test name failing in two crates while failed count sums both
+- Task 1: minor (deferred): test gaps — byte limit, pytest passed-only, multi-package go
+- Task 2: minor (deferred): has_sequence accepts `cargo test` anywhere (e.g. `echo cargo test`); low risk, replays user's own command
+- Task 2: minor (deferred): nextest guard starts_with("-E") also refuses unrelated -E… flags (harmless refusal)
+- Task 3: minor (deferred): build lookahead uses lines[index+1..] slice (safe) instead of iter().skip
+- Task 3: minor (deferred): short-format git status fallback runs on any git status output with no long-format rows
+- Task 3: minor (deferred): table "half cells filled" guard (not in brief) rejects sparse real tables
+- Task 3: minor (deferred): \a \b \f \v decode arms untested (only \r tested)
+- Task 4: minor (deferred): cell text drops zero-width/combining chars (photon.rs block_output_lines)
+- Task 4: minor (deferred): line cap checked before trailing blank lines are popped (exact-cap off-by-one)
+- Task 4: minor (deferred): back-to-back runs of same command miss the delta while the previous run is still recognising
+- Task 4: minor (deferred): second clear while running (output_line already Some(0)) leaves URL scan next_line unclamped
+- Task 4: minor (deferred): URL scan stuck if one completed logical line exceeds 5 MB
+- Task 5: minor (deferred): smart_block_overlay re-runs layout_block_chrome + rerun_failed_command on every render (streaming output with a selected block)
+- Task 5: minor (deferred): block_summary format! per visible smart block per frame (cache chip on insight store)
+- Task 5: minor (deferred): overlay ignores scroll_top; anchored() may flip/extend past the grid on narrow terminals
+- Task 5: minor (deferred): chip can run under the right-aligned toolbar with long metadata/command (no clipping)
+- Task 5: minor (deferred): no test that smart_blocks off hides chip+overlay (Task 10 owns it); drag test asserts only non-empty selection
+- Task 5: minor (deferred): redundant running && local_url check in toolbar_buttons
+- Task 6: minor (deferred): relative path resolution against block.cwd untested (relies on resolve_open_target working_directory)
+- Task 6: minor (deferred): next_error test asserts cursor index only; stale "read in later tasks" allow(dead_code) comment on smart_blocks field
+- Task 7: minor (deferred): run_git has extra optional_locks param vs brief signature (justified: add/restore write the index)
+- Task 7: minor (deferred): OpenInGitPanel ignores smart_blocks setting; ToggleFocus moves focus away when the panel is focused
+- Task 7: minor (deferred): occluding row wraps the staged/discarded mark label (drag can't start there)
+- Task 7: minor (deferred): hash cmd-click counts cells as chars (wide chars before a hash shift the match)
+- Task 7: minor (deferred): tab read-back assumes 8-column tab stops (alacritty keeps custom stops private)
+- Task 7: minor (deferred): --porcelain detected by whitespace words only (quoted/aliased invocations miss it)
+- Task 8: minor (deferred): notification tests sleep 1.1 s real time (block duration uses Instant::now in the terminal crate)
+- Task 8: minor (deferred): no direct test that OpenBlockUrl calls cx.open_url; TDD RED evidence thin
+- Task 8: minor (deferred): no test calls the notification response handler with smart_blocks off; error-title cap untested; router pruning untested
+- Task 8: minor (deferred): error-scan backlog over 2,000 lines drains only on further Wakeups (a quiet server's later error in the same burst is missed)
+- Task 9: minor (deferred): open_block_as_json errors reach the log only (missing JSON language opens plain text silently); pane captured before await may be closed
+- Task 9: minor (deferred): multi-line JSON passed through untrimmed; table tab title is the full command
+- Task 9: minor (deferred): test gaps — dock-terminal fallback, handler no-op for other insights, unparsable single-line JSON
+- Task 10: minor (deferred): _smart_blocks variable names in perf tests; per-command test repeats the heavy test's runs; 1 ms per-command bound is loose (measured 5-12 µs)
+- Task 10: minor (deferred): ERROR_SCAN_TAIL_LINES inserted between ERROR_NOTIFICATION_INTERVAL and its doc comment; stale "came before the server was up" wording; unreachable urls check; long doc line in photon.rs
+- Task 10: minor (deferred): forget_removed_blocks early exit can leave a removed clear-block's scan entries until the oldest id passes it (not displayed)
+- Task 10: minor (deferred): perf margin thin in debug (+7–9% vs 10%)
+- Final: minor (deferred): background read holds the term lock for the whole copy (one-frame hitch after huge outputs)
+- Final: minor (deferred): Open as JSON leaves a modified untitled buffer (save prompt on close)
+- Final: minor (deferred): ~550 lines of SP1b tests live in upstream terminal_view.rs mod tests
+- Final: minor (deferred): perf ratio tests run in debug on shared CI runners (thin margin; may flake)
+- Final: minor (deferred): F8 propagate() paths untested independently of the keymap context
+- Final: minor (deferred): width change on the alternate screen leaves insights hidden until the next BlocksChanged

@@ -1,0 +1,13 @@
+# hand-written
+ ❯ src/sum.test.ts (3 tests | 1 failed) 4ms
+   × sum > subtracts numbers
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/sum.test.ts > sum > subtracts numbers
+AssertionError: expected 2 to be 1 // Object.is equality
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 2 passed (3)
+   Start at  10:00:00
+   Duration  1.2s

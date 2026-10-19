@@ -2298,6 +2298,10 @@
     "bell": "off",
     // photon: show commands as blocks in zsh terminals. Applies to newly opened terminals only.
     "blocks": true,
+    // photon: recognise test runs, git, servers, JSON and tables in command blocks.
+    "smart_blocks": true,
+    // photon: notify when a command that ran at least this long finishes while Photon is in the background; 0 turns it off.
+    "notify_after_seconds": 10,
   },
   "code_actions_on_format": {},
   // Settings related to running tasks.

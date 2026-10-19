@@ -963,6 +963,16 @@ impl TerminalElement {
 
                 let view = terminal_view.read(cx);
                 let scroll_top = view.scroll_top;
+                // photon: cmd-click on a `git log` hash opens the commit instead of a hyperlink.
+                if e.modifiers.secondary() {
+                    let mut position = e.position;
+                    position.y += scroll_top.max(Pixels::ZERO);
+                    if terminal_view
+                        .update(cx, |view, cx| view.open_commit_at(position, window, cx))
+                    {
+                        return;
+                    }
+                }
                 terminal.update(cx, |terminal, cx| {
                     let mut adjusted_event = e.clone();
                     if scroll_top > Pixels::ZERO {
@@ -1598,9 +1608,11 @@ impl Element for TerminalElement {
                 };
 
                 // photon: command block chrome.
+                let terminal_view = self.terminal_view.read(cx);
                 let block_chrome = crate::photon_blocks_view::layout_block_chrome(
                     self.terminal.read(cx),
-                    self.terminal_view.read(cx).selected_block(),
+                    terminal_view.selected_block(),
+                    terminal_view.enabled_smart_blocks(cx),
                     dimensions.num_lines(),
                 );
 

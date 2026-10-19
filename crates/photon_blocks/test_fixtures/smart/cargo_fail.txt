@@ -1,0 +1,33 @@
+   Compiling demo v0.1.0 (/work/demo)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
+     Running unittests src/lib.rs (target/debug/deps/demo-01aee8672a305f11)
+
+running 4 tests
+test ok_one ... ok
+test ok_two ... ok
+test bad_one ... FAILED
+test bad_two ... FAILED
+
+failures:
+
+---- bad_one stdout ----
+
+thread 'bad_one' (6536921) panicked at src/lib.rs:3:23:
+assertion `left == right` failed
+  left: 1
+ right: 2
+
+---- bad_two stdout ----
+
+thread 'bad_two' (6536922) panicked at src/lib.rs:4:46:
+empty
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    bad_one
+    bad_two
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

@@ -1,0 +1,3 @@
+# hand-written
+ok  	example.com/demo/api	0.412s
+ok  	example.com/demo/store	(cached)

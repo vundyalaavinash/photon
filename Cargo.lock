@@ -13457,6 +13457,8 @@ dependencies = [
  "anyhow",
  "log",
  "percent-encoding",
+ "regex",
+ "serde_json",
  "tempfile",
 ]
 
@@ -13473,8 +13475,10 @@ name = "photon_terminal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "collections",
  "db",
  "editor",
+ "git_ui",
  "gpui",
  "language",
  "libc",
@@ -13485,6 +13489,7 @@ dependencies = [
  "project",
  "settings",
  "smol",
+ "tabular_data_preview",
  "tempfile",
  "terminal",
  "theme",
@@ -18188,6 +18193,7 @@ dependencies = [
  "dirs",
  "editor",
  "futures 0.3.34",
+ "git_ui",
  "gpui",
  "itertools 0.14.0",
  "language",

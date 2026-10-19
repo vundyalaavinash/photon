@@ -1,0 +1,4 @@
+# hand-written
+USER          PID  %CPU  %MEM        VSZ     RSS TT  STAT  STARTED      TIME COMMAND
+user        72266   1.9   1.4  436125168  463712 ??  R     11:39PM   2:23.12 /usr/libexec/mediaanalysisd --flag value
+user         7613   0.0   0.0  435308464    3200 ??  Ss    8:36PM    0:00.02 /bin/zsh -c echo hello world
