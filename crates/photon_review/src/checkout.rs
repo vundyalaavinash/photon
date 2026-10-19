@@ -168,7 +168,7 @@ pub(crate) fn ensure_safe_segment(label: &str, segment: &str) -> Result<()> {
     Ok(())
 }
 
-async fn safe_git(dir: &Path, args: &[&str]) -> Result<String> {
+pub(crate) async fn safe_git(dir: &Path, args: &[&str]) -> Result<String> {
     let arguments: Vec<&str> = SAFE_GIT_CONFIG.iter().chain(args).copied().collect();
     git(dir, &arguments).await
 }

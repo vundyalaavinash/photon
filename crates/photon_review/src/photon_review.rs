@@ -8,6 +8,7 @@ mod github;
 mod inbox;
 mod review;
 mod review_map;
+mod since_review;
 mod store;
 
 pub use anchoring::*;
@@ -20,6 +21,7 @@ pub use github::*;
 pub use inbox::*;
 pub use review::*;
 pub use review_map::*;
+pub use since_review::*;
 pub use store::*;
 
 use gpui::App;

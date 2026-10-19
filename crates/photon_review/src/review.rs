@@ -37,13 +37,14 @@ use crate::{
     CallerMark, ChangedFunction, Checkout, ChecksState, ContextCache, ContextError, ContextExcerpt,
     Draft, FileAnalysis, FileDiff, FileKind, FileStatus, FunctionContext, GhError, GhRunner,
     LoadedFile, MapFile, MapFunction, PostState, PrDetail, PrKey, PrSummary, Reanchor, RepoId,
-    ReviewDb, ReviewEvent, ReviewThread, Side, Step, Tracked, analyse_loaded_file,
-    auth_status_request, base_text, build_loaded_file, build_review_map, call_edges,
-    caller_touched, candidate_repos, classify_caller, classify_path, commentable_lines,
-    context::buffer_path, context_excerpts, deleted_lines, detail_request, fetch_url, find_clone,
-    functions, gh_runner, git_diff, is_sendable, landing_note, parse_auth_status, parse_detail,
-    parse_mutation, parse_reply, place, prepare_checkout, reanchor, reply_request, resolve_request,
-    review_request, review_root, viewed_request,
+    ReviewDb, ReviewEvent, ReviewThread, Side, SinceReviewPlan, Step, ToggleChangesSinceReview,
+    Tracked, analyse_loaded_file, auth_status_request, base_text, build_loaded_file,
+    build_review_map, call_edges, caller_touched, candidate_repos, classify_caller, classify_path,
+    commentable_lines, context::buffer_path, context_excerpts, deleted_lines, detail_request,
+    fetch_url, find_clone, functions, gh_runner, git_diff, is_sendable, landing_note,
+    parse_auth_status, parse_detail, parse_mutation, parse_reply, place, plan_since_review,
+    prepare_checkout, reanchor, reply_request, resolve_request, review_request, review_root,
+    since_review_files, viewed_request,
 };
 
 actions!(
@@ -186,6 +187,10 @@ pub struct ReviewItem {
     submit_note: Option<SharedString>,
     resolving: HashSet<String>,
     marking_viewed: HashSet<String>,
+    last_review: Option<String>,
+    full_files: Option<Vec<LoadedFile>>,
+    since_review_note: Option<SharedString>,
+    _since_review_task: Task<()>,
     _reanchor_task: Task<()>,
     _lsp_handles: Vec<OpenLspBufferHandle>,
     _subscriptions: Vec<Subscription>,
@@ -794,6 +799,30 @@ async fn drain_sync(
     }
 }
 
+/// Call hierarchy needs every head buffer open in its language server.
+fn index_files(
+    project: &Entity<Project>,
+    files: &[LoadedFile],
+    cx: &mut App,
+) -> (Vec<OpenLspBufferHandle>, HashMap<String, Vec<Range<u32>>>) {
+    let mut lsp_handles = Vec::new();
+    let mut changed_rows = HashMap::new();
+    for file in files {
+        let Some((buffer, diff)) = &file.contents else {
+            continue;
+        };
+        if buffer.read(cx).file().is_some() {
+            lsp_handles.push(project.update(cx, |project, cx| {
+                project.register_buffer_with_language_servers(buffer, cx)
+            }));
+        }
+        let rows =
+            functions::changed_rows(&diff.read(cx).snapshot(cx), &buffer.read(cx).snapshot());
+        changed_rows.insert(file.diff.path.clone(), rows);
+    }
+    (lsp_handles, changed_rows)
+}
+
 impl ReviewItem {
     pub fn new(
         project: Entity<Project>,
@@ -813,22 +842,7 @@ impl ReviewItem {
         let editor = cx.new(|cx| {
             Editor::for_multibuffer(multibuffer.clone(), Some(project.clone()), window, cx)
         });
-        // Call hierarchy needs every head buffer open in its language server.
-        let mut lsp_handles = Vec::new();
-        let mut changed_rows = HashMap::new();
-        for file in &files {
-            let Some((buffer, diff)) = &file.contents else {
-                continue;
-            };
-            if buffer.read(cx).file().is_some() {
-                lsp_handles.push(project.update(cx, |project, cx| {
-                    project.register_buffer_with_language_servers(buffer, cx)
-                }));
-            }
-            let rows =
-                functions::changed_rows(&diff.read(cx).snapshot(cx), &buffer.read(cx).snapshot());
-            changed_rows.insert(file.diff.path.clone(), rows);
-        }
+        let (lsp_handles, changed_rows) = index_files(&project, &files, cx);
         let mut subscriptions = vec![cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| {
             if matches!(event, EditorEvent::SelectionsChanged { .. }) {
                 this.update_impact(cx);
@@ -876,6 +890,10 @@ impl ReviewItem {
             .viewed_steps(&detail.summary.key)
             .log_err()
             .unwrap_or_default();
+        let last_review = database
+            .last_review(&detail.summary.key)
+            .log_err()
+            .flatten();
         let mut this = Self {
             project,
             detail,
@@ -914,6 +932,10 @@ impl ReviewItem {
             submit_note: None,
             resolving: HashSet::new(),
             marking_viewed: HashSet::new(),
+            last_review,
+            full_files: None,
+            since_review_note: None,
+            _since_review_task: Task::ready(()),
             _reanchor_task: Task::ready(()),
             _lsp_handles: lsp_handles,
             _subscriptions: subscriptions,
@@ -927,6 +949,104 @@ impl ReviewItem {
         this._context_task = this.load_context(cx);
         this._reanchor_task = this.reanchor_drafts(cx);
         this
+    }
+
+    pub fn changes_since_review_offered(&self) -> bool {
+        self.last_review
+            .as_ref()
+            .is_some_and(|reviewed| *reviewed != self.checkout.head_sha)
+    }
+
+    pub fn showing_changes_since_review(&self) -> bool {
+        self.full_files.is_some()
+    }
+
+    pub fn toggle_changes_since_review(
+        &mut self,
+        _: &ToggleChangesSinceReview,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.since_review_note = None;
+        if let Some(full_files) = self.full_files.take() {
+            self._since_review_task = Task::ready(());
+            self.set_files(full_files, cx);
+            return;
+        }
+        let Some(reviewed) = self
+            .last_review
+            .clone()
+            .filter(|_| self.changes_since_review_offered())
+        else {
+            return;
+        };
+        let checkout = self.checkout.clone();
+        let key = self.detail.summary.key.clone();
+        let url = fetch_url(&repo_id(&self.detail.summary));
+        let project = self.project.clone();
+        self._since_review_task = cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_spawn({
+                    let checkout = checkout.clone();
+                    async move {
+                        let plan = plan_since_review(&checkout, &key, &url, &reviewed).await;
+                        let files = match &plan {
+                            SinceReviewPlan::Unavailable { .. } => Vec::new(),
+                            _ => since_review_files(&checkout, &plan).await?,
+                        };
+                        anyhow::Ok((plan, files))
+                    }
+                })
+                .await;
+            let loaded = match outcome {
+                Ok((plan, files)) => match plan.message() {
+                    Some(message) => Err(message.to_string()),
+                    None => {
+                        let loads = cx.update(|cx| {
+                            files
+                                .into_iter()
+                                .map(|(diff, base)| {
+                                    let abs_path = checkout.worktree.join(&diff.path);
+                                    build_loaded_file(&project, abs_path, base, diff, cx)
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        try_join_all(loads)
+                            .await
+                            .map_err(|error| format!("{error:#}"))
+                    }
+                },
+                Err(error) => Err(format!("{error:#}")),
+            };
+            this.update(cx, |this, cx| match loaded {
+                Ok(files) => {
+                    let full = std::mem::take(&mut this.files);
+                    this.full_files = Some(full);
+                    this.set_files(files, cx);
+                }
+                Err(message) => {
+                    this.since_review_note = Some(message.into());
+                    cx.notify();
+                }
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
+    fn set_files(&mut self, files: Vec<LoadedFile>, cx: &mut Context<Self>) {
+        let (lsp_handles, changed_rows) = index_files(&self.project, &files, cx);
+        self._lsp_handles.extend(lsp_handles);
+        self.changed_rows = changed_rows;
+        self.files = files;
+        self.analyses = Vec::new();
+        self.functions = Vec::new();
+        self.contexts = Vec::new();
+        self.steps = Vec::new();
+        self.selected = 0;
+        self.expanded_context.clear();
+        self.rebuild_map(&[], cx);
+        self._context_task = self.load_context(cx);
     }
 
     pub fn drafts(&self) -> &[Draft] {
@@ -2373,6 +2493,21 @@ impl ReviewItem {
                 .size(LabelSize::Small)
                 .color(Color::Muted),
             )
+            .when(self.changes_since_review_offered(), |header| {
+                let showing = self.showing_changes_since_review();
+                header.child(
+                    Button::new("since-review", "Changes since your review")
+                        .toggle_state(showing)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_changes_since_review(&ToggleChangesSinceReview, window, cx)
+                        })),
+                )
+            })
+            .children(self.since_review_note.clone().map(|note| {
+                Label::new(note)
+                    .size(LabelSize::Small)
+                    .color(Color::Warning)
+            }))
             .child(
                 div().ml_auto().child(
                     Label::new(self.progress_text())
@@ -2793,6 +2928,7 @@ impl Render for ReviewItem {
                 this.select_step(this.selected.saturating_sub(1), window, cx)
             }))
             .on_action(cx.listener(Self::add_comment))
+            .on_action(cx.listener(Self::toggle_changes_since_review))
             .child(self.render_header(cx))
             .child(
                 h_flex()
@@ -5002,5 +5138,44 @@ fn verify_password(user: &str, password: &str) -> bool {
                 .collect();
             assert_eq!(left, vec![("", PostState::Unposted)]);
         });
+    }
+
+    #[gpui::test]
+    async fn changes_since_review_toggle_offered_only_when_pushed(cx: &mut TestAppContext) {
+        for (last_review, offered) in [(None, false), (Some("head"), false), (Some("older"), true)]
+        {
+            let database = test_database(cx);
+            database
+                .track(Tracked {
+                    key: key(),
+                    node_id: "PR_482".into(),
+                    repo_dir: PathBuf::from(path!("/repo")),
+                    worktree: PathBuf::from(path!("/repo")),
+                })
+                .await
+                .expect("track");
+            if let Some(commit) = last_review {
+                database
+                    .set_last_review(key(), commit.into())
+                    .await
+                    .expect("set last review");
+            }
+            let (item, cx, _) = open_item_with(
+                cx,
+                login_tree(),
+                vec![login_with_hunk()],
+                login_graph(),
+                true,
+                None,
+                false,
+                Some(database),
+            )
+            .await;
+            assert_eq!(
+                item.read_with(&cx, |item, _| item.changes_since_review_offered()),
+                offered,
+                "{last_review:?}"
+            );
+        }
     }
 }
