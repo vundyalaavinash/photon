@@ -1,0 +1,46 @@
+# photon: builds Photon.app for a photon-v* tag and publishes it as a GitHub release.
+name: Photon Release
+
+on:
+  push:
+    tags: ["photon-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing photon-v* tag to (re)build"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
+      - name: Install build prerequisites
+        run: |
+          brew install cmake
+          xcodebuild -downloadComponent MetalToolchain || true
+      - name: Build the stable app
+        run: |
+          echo stable > crates/zed/RELEASE_CHANNEL
+          script/bundle-mac aarch64-apple-darwin
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dmg="target/aarch64-apple-darwin/release/Photon-aarch64.dmg"
+          notes="docs/photon/releases/${TAG}.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$dmg" --clobber
+          else
+            gh release create "$TAG" "$dmg" --title "Photon ${TAG#photon-v}" --notes-file "$notes"
+          fi
