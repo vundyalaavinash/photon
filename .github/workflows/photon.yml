@@ -47,7 +47,7 @@ jobs:
           -p tabular_data_preview
           -E 'package(photon_brand) | package(paths) | package(release_channel) | package(cli)
           | package(settings) | package(settings_content) | package(ui) | package(theme_settings) | package(zed_credentials_provider)
-          | package(photon_blocks) | package(photon_terminal) | package(terminal) | package(terminal_view)
+          | package(photon_blocks) | package(photon_terminal) | package(photon_review) | package(terminal) | package(terminal_view)
           | package(tabular_data_preview)
           | test(photon) | test(new_window)
           | test(agent_registry) | test(default_agent_is_claude)'
