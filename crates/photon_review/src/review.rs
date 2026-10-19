@@ -40,8 +40,8 @@ use crate::{
     ReviewThread, Side, Step, Tracked, analyse_loaded_file, auth_status_request, base_text,
     build_loaded_file, build_review_map, call_edges, caller_touched, candidate_repos,
     classify_caller, classify_path, commentable_lines, context::buffer_path, context_excerpts,
-    detail_request, fetch_url, find_clone, functions, gh_runner, git_diff, landing_note,
-    parse_auth_status, parse_detail, place, prepare_checkout, reanchor, review_root,
+    deleted_lines, detail_request, fetch_url, find_clone, functions, gh_runner, git_diff,
+    landing_note, parse_auth_status, parse_detail, place, prepare_checkout, reanchor, review_root,
 };
 
 actions!(
@@ -83,11 +83,16 @@ struct UnchangedContext;
 /// one, so the newest text always lands last without a timer.
 #[derive(Default)]
 struct DraftSync {
-    pending: Option<Draft>,
+    pending: Option<PendingWrite>,
     id: Option<i64>,
     in_flight: bool,
-    deleted: bool,
     error: Option<SharedString>,
+}
+
+/// An empty body is never stored, so emptying a draft removes its row until text comes back.
+enum PendingWrite {
+    Save(Draft),
+    DeleteRow,
 }
 
 enum SyncJob {
@@ -97,14 +102,17 @@ enum SyncJob {
 
 impl DraftSync {
     fn next_job(&mut self) -> Option<SyncJob> {
-        if let Some(mut draft) = self.pending.take() {
-            draft.id = self.id;
-            return Some(SyncJob::Save(draft));
-        }
-        if self.deleted
-            && let Some(id) = self.id.take()
-        {
-            return Some(SyncJob::Delete(id));
+        match self.pending.take() {
+            Some(PendingWrite::Save(mut draft)) => {
+                draft.id = self.id;
+                return Some(SyncJob::Save(draft));
+            }
+            Some(PendingWrite::DeleteRow) => {
+                if let Some(id) = self.id.take() {
+                    return Some(SyncJob::Delete(id));
+                }
+            }
+            None => {}
         }
         self.in_flight = false;
         None
@@ -503,6 +511,9 @@ fn draft_renderer(
         let error = sync.lock().error.clone();
         let add_item = item.clone();
         let cancel_item = item.clone();
+        let retry_item = item.clone();
+        let edit_item = item.clone();
+        let delete_item = item.clone();
         comment_card(("photon-review-draft", local_id).into(), block)
             .child(
                 h_flex()
@@ -523,9 +534,22 @@ fn draft_renderer(
                     .map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
             )
             .children(error.map(|error| {
-                Label::new(error)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Error)
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Label::new(error)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error),
+                    )
+                    .child(
+                        Button::new("retry", "Retry")
+                            .label_size(LabelSize::XSmall)
+                            .on_click(move |_, _, cx| {
+                                retry_item
+                                    .update(cx, |item, cx| item.queue_save(local_id, cx))
+                                    .log_err();
+                            }),
+                    )
             }))
             .when(composer.is_some(), |this| {
                 this.child(
@@ -543,6 +567,24 @@ fn draft_renderer(
                         .child(
                             Button::new("cancel", "Cancel").on_click(move |_, window, cx| {
                                 cancel_item
+                                    .update(cx, |item, cx| item.cancel_draft(local_id, window, cx))
+                                    .log_err();
+                            }),
+                        ),
+                )
+            })
+            .when(composer.is_none(), |this| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(Button::new("edit", "Edit").on_click(move |_, window, cx| {
+                            edit_item
+                                .update(cx, |item, cx| item.edit_draft(local_id, window, cx))
+                                .log_err();
+                        }))
+                        .child(
+                            Button::new("delete", "Delete").on_click(move |_, window, cx| {
+                                delete_item
                                     .update(cx, |item, cx| item.cancel_draft(local_id, window, cx))
                                     .log_err();
                             }),
@@ -692,7 +734,7 @@ impl ReviewItem {
             _context_task: Task::ready(()),
         };
         for draft in stored_drafts {
-            this.push_draft(draft, None, cx);
+            this.push_draft(draft);
         }
         this.rebuild_map(&[], cx);
         this._context_task = this.load_context(cx);
@@ -714,26 +756,9 @@ impl ReviewItem {
         landing_note(&place(draft, &self.commentable))
     }
 
-    fn push_draft(
-        &mut self,
-        draft: Draft,
-        composer: Option<Entity<Editor>>,
-        cx: &mut Context<Self>,
-    ) -> usize {
+    fn push_draft(&mut self, draft: Draft) -> usize {
         let local_id = self.next_draft_id;
         self.next_draft_id += 1;
-        let subscription = composer.as_ref().map(|composer| {
-            cx.subscribe(composer, move |this, editor, event: &EditorEvent, cx| {
-                if !matches!(event, EditorEvent::BufferEdited) {
-                    return;
-                }
-                let body = editor.read(cx).text(cx);
-                if let Some(index) = this.draft_index(local_id) {
-                    this.drafts[index].body = body;
-                    this.queue_save(local_id, cx);
-                }
-            })
-        });
         let sync = Arc::new(Mutex::new(DraftSync {
             id: draft.id,
             ..DraftSync::default()
@@ -741,19 +766,62 @@ impl ReviewItem {
         self.drafts.push(draft);
         self.draft_views.push(DraftView {
             local_id,
-            composer,
+            composer: None,
             sync,
-            _composer_subscription: subscription,
+            _composer_subscription: None,
         });
         local_id
+    }
+
+    /// Shows the draft as an editable composer holding its current body.
+    fn open_composer(&mut self, local_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.draft_index(local_id) else {
+            return;
+        };
+        if self.draft_views[index].composer.is_some() {
+            return;
+        }
+        let body = self.drafts[index].body.clone();
+        let composer = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, COMPOSER_MAX_LINES as usize, window, cx);
+            editor.set_placeholder_text("Leave a comment", window, cx);
+            editor.set_text(body, window, cx);
+            editor
+        });
+        let subscription = cx.subscribe(&composer, move |this, editor, event: &EditorEvent, cx| {
+            if !matches!(event, EditorEvent::BufferEdited) {
+                return;
+            }
+            let body = editor.read(cx).text(cx);
+            if let Some(index) = this.draft_index(local_id) {
+                this.drafts[index].body = body;
+                this.queue_save(local_id, cx);
+            }
+        });
+        let view = &mut self.draft_views[index];
+        view.composer = Some(composer.clone());
+        view._composer_subscription = Some(subscription);
+        self.show_comments(cx);
+        window.focus(&composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    pub fn edit_draft(&mut self, local_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_composer(local_id, window, cx);
     }
 
     fn queue_save(&mut self, local_id: usize, cx: &mut Context<Self>) {
         let Some(index) = self.draft_index(local_id) else {
             return;
         };
+        let draft = &self.drafts[index];
+        let write = if draft.body.trim().is_empty() {
+            PendingWrite::DeleteRow
+        } else {
+            PendingWrite::Save(draft.clone())
+        };
         let sync = self.draft_views[index].sync.clone();
-        sync.lock().pending = Some(self.drafts[index].clone());
+        sync.lock().pending = Some(write);
         self.start_sync(local_id, sync, cx);
     }
 
@@ -768,9 +836,25 @@ impl ReviewItem {
                 let job = sync.lock().next_job();
                 match job {
                     None => return,
-                    Some(SyncJob::Delete(id)) => {
-                        database.delete_draft(id).await.log_err();
-                    }
+                    Some(SyncJob::Delete(id)) => match database.delete_draft(id).await {
+                        Ok(()) => {
+                            this.update(cx, |this, _| {
+                                if let Some(index) = this.draft_index(local_id) {
+                                    this.drafts[index].id = None;
+                                }
+                            })
+                            .ok();
+                        }
+                        Err(error) => {
+                            log::error!("deleting a review draft failed: {error:#}");
+                            let mut state = sync.lock();
+                            if state.id.is_none() {
+                                state.id = Some(id);
+                            }
+                            state.error =
+                                Some(format!("Couldn't save this draft: {error:#}").into());
+                        }
+                    },
                     Some(SyncJob::Save(draft)) => {
                         let result = database.save_draft(draft).await;
                         let saved_id = {
@@ -812,11 +896,7 @@ impl ReviewItem {
         };
         self.drafts.remove(index);
         let view = self.draft_views.remove(index);
-        {
-            let mut state = view.sync.lock();
-            state.pending = None;
-            state.deleted = true;
-        }
+        view.sync.lock().pending = Some(PendingWrite::DeleteRow);
         self.start_sync(local_id, view.sync, cx);
         self.show_comments(cx);
         cx.notify();
@@ -853,6 +933,8 @@ impl ReviewItem {
         if self.drafts[index].body.trim().is_empty() {
             return;
         }
+        // Saving again here retries a write that failed while typing.
+        self.queue_save(local_id, cx);
         let view = &mut self.draft_views[index];
         view.composer = None;
         view._composer_subscription = None;
@@ -929,15 +1011,8 @@ impl ReviewItem {
             outdated: false,
             general: false,
         };
-        let composer = cx.new(|cx| {
-            let mut editor = Editor::auto_height(1, COMPOSER_MAX_LINES as usize, window, cx);
-            editor.set_placeholder_text("Leave a comment", window, cx);
-            editor
-        });
-        self.push_draft(draft, Some(composer.clone()), cx);
-        self.show_comments(cx);
-        window.focus(&composer.focus_handle(cx), cx);
-        cx.notify();
+        let local_id = self.push_draft(draft);
+        self.open_composer(local_id, window, cx);
     }
 
     /// Moves a draft to the current selection, which also makes an outdated draft current again.
@@ -980,28 +1055,41 @@ impl ReviewItem {
             }
             let file = self.files.iter().find(|file| file.diff.path == draft.path);
             let contents = file.and_then(|file| file.contents.as_ref());
-            let text: Task<Option<String>> = match (draft.side, contents) {
-                (Side::Left, contents) => {
-                    Task::ready(contents.and_then(|(_, diff)| diff.read(cx).base_text_string(cx)))
-                }
-                (Side::Right, Some((buffer, _))) => Task::ready(Some(buffer.read(cx).text())),
-                (Side::Right, None) if file.is_some() => Task::ready(None),
+            // `Ok(None)` means the file is gone; an error leaves the draft for the next open.
+            let text: Task<Result<Option<String>>> = match (draft.side, contents) {
+                (Side::Left, contents) => Task::ready(Ok(
+                    contents.and_then(|(_, diff)| diff.read(cx).base_text_string(cx))
+                )),
+                (Side::Right, Some((buffer, _))) => Task::ready(Ok(Some(buffer.read(cx).text()))),
+                (Side::Right, None) if file.is_some() => Task::ready(Ok(None)),
                 (Side::Right, None) => {
                     let path = self.checkout.worktree.join(&draft.path);
                     let fs = fs.clone();
-                    cx.background_spawn(async move { fs.load(&path).await.ok() })
+                    cx.background_spawn(async move {
+                        match fs.metadata(&path).await? {
+                            None => Ok(None),
+                            Some(_) => fs.load(&path).await.map(Some),
+                        }
+                    })
                 }
             };
             jobs.push((
                 view.local_id,
+                draft.path.clone(),
                 draft.anchor_text.clone(),
                 draft.start_line,
                 text,
             ));
         }
         cx.spawn(async move |this, cx| {
-            for (local_id, anchor_text, start_line, text) in jobs {
-                let text = text.await;
+            for (local_id, path, anchor_text, start_line, text) in jobs {
+                let text = match text.await {
+                    Ok(text) => text,
+                    Err(error) => {
+                        log::warn!("can't read {path} to re-anchor a review draft: {error:#}");
+                        continue;
+                    }
+                };
                 let result = reanchor(&anchor_text, start_line, text.as_deref());
                 this.update(cx, |this, cx| this.apply_reanchor(local_id, result, cx))
                     .log_err();
@@ -1012,6 +1100,17 @@ impl ReviewItem {
     fn apply_reanchor(&mut self, local_id: usize, result: Reanchor, cx: &mut Context<Self>) {
         let Some(index) = self.draft_index(local_id) else {
             return;
+        };
+        let result = match result {
+            Reanchor::Placed {
+                start_line,
+                end_line,
+            } if self.drafts[index].side == Side::Left
+                && !self.on_deleted_rows(&self.drafts[index].path, start_line, end_line) =>
+            {
+                Reanchor::Outdated
+            }
+            result => result,
         };
         let draft = &mut self.drafts[index];
         match result {
@@ -1028,6 +1127,17 @@ impl ReviewItem {
         self.queue_save(local_id, cx);
         self.show_comments(cx);
         cx.notify();
+    }
+
+    fn on_deleted_rows(&self, path: &str, start_line: u32, end_line: u32) -> bool {
+        self.files
+            .iter()
+            .find(|file| file.diff.path == path)
+            .is_some_and(|file| {
+                deleted_lines(&file.diff)
+                    .iter()
+                    .any(|rows| rows.contains(&start_line) && rows.contains(&end_line))
+            })
     }
 
     /// The multibuffer position at the end of a 1-based line, when that line is shown.
@@ -1089,7 +1199,7 @@ impl ReviewItem {
             let body_rows = draft.body.lines().count().max(1) as u32;
             let height = match view.composer {
                 Some(_) => COMPOSER_MAX_LINES + 4,
-                None => 2 + body_rows,
+                None => 3 + body_rows,
             } + if note.is_some() { 2 } else { 0 };
             blocks.push(BlockProperties {
                 placement: BlockPlacement::Below(anchor),
@@ -2007,6 +2117,7 @@ mod tests {
         path: &'static str,
         base: Option<&'static str>,
         status: FileStatus,
+        hunks: Vec<crate::Hunk>,
     }
 
     fn function(name: &'static str, path: &'static str, start: u32, end: u32) -> GraphFunction {
@@ -2031,6 +2142,7 @@ mod tests {
             path,
             base: Some(base),
             status: FileStatus::Modified,
+            hunks: Vec::new(),
         }
     }
 
@@ -2236,7 +2348,7 @@ mod tests {
                 status: file.status,
                 binary: false,
                 submodule: false,
-                hunks: Vec::new(),
+                hunks: file.hunks,
             };
             let task = cx.update(|cx| {
                 build_loaded_file(
@@ -3176,5 +3288,225 @@ fn verify_password(user: &str, password: &str) -> bool {
             assert!(item.comment_blocks.is_empty());
         });
         assert!(database.drafts(&key()).expect("drafts").is_empty());
+    }
+
+    async fn open_with_drafts(
+        cx: &mut TestAppContext,
+        drafts: Vec<Draft>,
+    ) -> (Entity<ReviewItem>, VisualTestContext, ReviewDb) {
+        let database = test_database(cx);
+        for draft in drafts {
+            database.save_draft(draft).await.expect("save");
+        }
+        let (item, mut cx, _) = open_item_with(
+            cx,
+            login_tree(),
+            vec![modified("src/login.rs", LOGIN_BASE)],
+            login_graph(),
+            true,
+            None,
+            false,
+            Some(database.clone()),
+        )
+        .await;
+        settle(&mut cx);
+        (item, cx, database)
+    }
+
+    fn current_draft(path: &str, start_line: u32, anchor_text: &str) -> Draft {
+        Draft {
+            commit: "head".into(),
+            ..stored_draft(path, start_line, anchor_text)
+        }
+    }
+
+    fn bodies(database: &ReviewDb) -> Vec<String> {
+        database
+            .drafts(&key())
+            .expect("drafts")
+            .into_iter()
+            .map(|draft| draft.body)
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn edit_after_reload(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(
+            cx,
+            vec![current_draft("src/login.rs", 3, "    audit(user);")],
+        )
+        .await;
+        item.update_in(&mut cx, |item, window, cx| item.edit_draft(0, window, cx));
+        cx.run_until_parked();
+        let composer = composer(&item, &mut cx);
+        assert_eq!(
+            composer.read_with(&cx, |editor, cx| editor.text(cx)),
+            "about     audit(user);"
+        );
+        type_text(&composer, " Really?", &mut cx);
+        cx.run_until_parked();
+        assert_eq!(bodies(&database), vec!["about     audit(user); Really?"]);
+        item.update(&mut cx, |item, cx| item.collapse_draft(0, cx));
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            assert!(item.draft_views[0].composer.is_none());
+            assert_eq!(item.drafts()[0].body, "about     audit(user); Really?");
+        });
+    }
+
+    #[gpui::test]
+    async fn delete_after_reload(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(
+            cx,
+            vec![current_draft("src/login.rs", 3, "    audit(user);")],
+        )
+        .await;
+        item.update_in(&mut cx, |item, window, cx| item.cancel_draft(0, window, cx));
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            assert!(item.drafts().is_empty());
+            assert!(item.comment_blocks.is_empty());
+        });
+        assert!(bodies(&database).is_empty());
+    }
+
+    #[gpui::test]
+    async fn empty_body_leaves_no_row(cx: &mut TestAppContext) {
+        let (item, mut cx) = open_item(
+            cx,
+            login_tree(),
+            vec![modified("src/login.rs", LOGIN_BASE)],
+            login_graph(),
+            true,
+            None,
+        )
+        .await;
+        settle(&mut cx);
+        let database = database(&item, &mut cx);
+        select_text(&item, "audit(user);", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        let composer = composer(&item, &mut cx);
+        type_text(&composer, "x", &mut cx);
+        cx.run_until_parked();
+        assert_eq!(bodies(&database), vec!["x"]);
+
+        composer.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("  ", window, cx)
+        });
+        cx.run_until_parked();
+        assert!(bodies(&database).is_empty());
+        item.read_with(&cx, |item, _| assert_eq!(item.drafts().len(), 1));
+
+        type_text(&composer, "y", &mut cx);
+        cx.run_until_parked();
+        assert_eq!(bodies(&database), vec!["  y"]);
+    }
+
+    #[gpui::test]
+    async fn failed_save_is_retried_when_added(cx: &mut TestAppContext) {
+        let (item, mut cx) = open_item(
+            cx,
+            login_tree(),
+            vec![modified("src/login.rs", LOGIN_BASE)],
+            login_graph(),
+            true,
+            None,
+        )
+        .await;
+        settle(&mut cx);
+        let database = database(&item, &mut cx);
+        select_text(&item, "audit(user);", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        crate::store::FAILING_SAVES.store(1, Ordering::SeqCst);
+        type_text(&composer(&item, &mut cx), "Keep me", &mut cx);
+        cx.run_until_parked();
+        assert!(bodies(&database).is_empty());
+        item.read_with(&cx, |item, _| {
+            assert!(item.draft_views[0].sync.lock().error.is_some())
+        });
+
+        item.update(&mut cx, |item, cx| item.collapse_draft(0, cx));
+        cx.run_until_parked();
+        assert_eq!(bodies(&database), vec!["Keep me"]);
+        item.read_with(&cx, |item, _| {
+            assert!(item.draft_views[0].composer.is_none());
+            assert!(item.draft_views[0].sync.lock().error.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn left_draft_reanchored_outside_diff_is_outdated(cx: &mut TestAppContext) {
+        let database = test_database(cx);
+        let left = |start_line, anchor_text: &str| Draft {
+            side: crate::Side::Left,
+            ..stored_draft("src/b.rs", start_line, anchor_text)
+        };
+        for draft in [left(5, "    let a = 1;"), left(1, "fn callee() {")] {
+            database.save_draft(draft).await.expect("save");
+        }
+        let (_item, mut cx, _) = open_item_with(
+            cx,
+            json!({ "src": { "b.rs": B_HEAD } }),
+            vec![PrFile {
+                hunks: vec![crate::Hunk {
+                    old_start: 1,
+                    old_len: 3,
+                    new_start: 1,
+                    new_len: 3,
+                    body: " fn callee() {\n-    let a = 1;\n+    let b = 2;\n }\n".into(),
+                }],
+                ..modified("src/b.rs", B_BASE)
+            }],
+            Graph {
+                functions: vec![function("callee", "src/b.rs", 0, 2)],
+                calls: Vec::new(),
+            },
+            true,
+            None,
+            false,
+            Some(database.clone()),
+        )
+        .await;
+        settle(&mut cx);
+        let drafts: Vec<_> = database
+            .drafts(&key())
+            .expect("drafts")
+            .into_iter()
+            .map(|draft| (draft.start_line, draft.commit, draft.outdated))
+            .collect();
+        assert_eq!(
+            drafts,
+            vec![(2, "head".to_string(), false), (1, "old".to_string(), true)]
+        );
+    }
+
+    #[gpui::test]
+    async fn unreadable_file_leaves_draft_untouched(cx: &mut TestAppContext) {
+        let (_item, _cx, database) = open_with_drafts(
+            cx,
+            vec![
+                stored_draft("src", 1, "fn a() {}"),
+                stored_draft("src/gone.rs", 1, "fn a() {}"),
+            ],
+        )
+        .await;
+        let drafts: Vec<_> = database
+            .drafts(&key())
+            .expect("drafts")
+            .into_iter()
+            .map(|draft| (draft.path, draft.commit, draft.outdated))
+            .collect();
+        assert_eq!(
+            drafts,
+            vec![
+                ("src".to_string(), "old".to_string(), false),
+                ("src/gone.rs".to_string(), "old".to_string(), true),
+            ]
+        );
     }
 }

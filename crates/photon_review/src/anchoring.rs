@@ -13,9 +13,12 @@ pub fn reanchor(anchor_text: &str, original_start: u32, new_text: Option<&str>) 
     let Some(new_text) = new_text else {
         return Reanchor::Outdated;
     };
-    let anchor: Vec<&str> = anchor_text.lines().map(str::trim_end).collect();
-    let lines: Vec<&str> = new_text.lines().map(str::trim_end).collect();
-    if anchor.is_empty() || anchor.len() > lines.len() {
+    // `split` keeps blank lines that `lines` would drop; a file's final newline ends its last
+    // line rather than starting another one.
+    let new_text = new_text.strip_suffix('\n').unwrap_or(new_text);
+    let anchor: Vec<&str> = anchor_text.split('\n').map(str::trim_end).collect();
+    let lines: Vec<&str> = new_text.split('\n').map(str::trim_end).collect();
+    if anchor.len() > lines.len() {
         return Reanchor::Outdated;
     }
     let length = anchor.len() as u32;
@@ -54,7 +57,7 @@ pub fn place(draft: &Draft, commentable: &HashMap<String, Vec<RangeInclusive<u32
         .get(&draft.path)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    if draft.general || draft.outdated || ranges.is_empty() {
+    if draft.general || draft.outdated {
         return Placement::ReviewBody { path };
     }
     let line = |side| Placement::Line {
@@ -63,9 +66,13 @@ pub fn place(draft: &Draft, commentable: &HashMap<String, Vec<RangeInclusive<u32
         start_line: (draft.start_line != draft.end_line).then_some(draft.start_line),
         line: draft.end_line,
     };
-    // Left rows are deleted base rows, which only exist inside the diff.
+    // Left rows are deleted base rows, which only exist inside the diff, even when the whole
+    // file is deleted and has no commentable head lines.
     if draft.side == Side::Left {
         return line(Side::Left);
+    }
+    if ranges.is_empty() {
+        return Placement::ReviewBody { path };
     }
     if ranges
         .iter()
@@ -290,6 +297,29 @@ mod tests {
     }
 
     #[test]
+    fn reanchor_single_blank_line_unmoved() {
+        assert_eq!(
+            reanchor("", 3, Some("a\nb\n\nc\n")),
+            Reanchor::Placed {
+                start_line: 3,
+                end_line: 3
+            }
+        );
+        assert_eq!(reanchor("", 2, Some("a\nb\n")), Reanchor::Outdated);
+    }
+
+    #[test]
+    fn reanchor_range_ending_in_blank_line_keeps_length() {
+        assert_eq!(
+            reanchor("fn a() {\n", 2, Some("x\nfn a() {\n  \r\ny\n")),
+            Reanchor::Placed {
+                start_line: 2,
+                end_line: 3
+            }
+        );
+    }
+
+    #[test]
     fn reanchor_deleted_file_is_outdated() {
         assert_eq!(reanchor(ANCHOR, 3, None), Reanchor::Outdated);
     }
@@ -340,6 +370,20 @@ mod tests {
                 path: "src/a.rs".into(),
                 side: Side::Left,
                 start_line: Some(3),
+                line: 4
+            }
+        );
+    }
+
+    #[test]
+    fn place_left_draft_on_deleted_file() {
+        let ranges = commentable("src/gone.rs", Vec::new());
+        assert_eq!(
+            place(&draft("src/gone.rs", Side::Left, 4, 4), &ranges),
+            Placement::Line {
+                path: "src/gone.rs".into(),
+                side: Side::Left,
+                start_line: None,
                 line: 4
             }
         );

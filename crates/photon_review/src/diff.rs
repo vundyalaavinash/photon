@@ -256,6 +256,34 @@ pub fn commentable_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
         .collect()
 }
 
+/// Base lines (1-based) that the diff removes, which are the only lines a `Side::Left` comment
+/// can sit on.
+pub fn deleted_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
+    if file.submodule {
+        return Vec::new();
+    }
+    let mut ranges: Vec<RangeInclusive<u32>> = Vec::new();
+    for hunk in &file.hunks {
+        let mut old_line = hunk.old_start;
+        for line in hunk.body.lines() {
+            match line.as_bytes().first() {
+                Some(b'-') => {
+                    match ranges.last_mut() {
+                        Some(last) if *last.end() + 1 == old_line => {
+                            *last = *last.start()..=old_line;
+                        }
+                        _ => ranges.push(old_line..=old_line),
+                    }
+                    old_line += 1;
+                }
+                Some(b' ') => old_line += 1,
+                _ => {}
+            }
+        }
+    }
+    ranges
+}
+
 /// `None` for added, binary and submodule entries, which have no text base to show.
 pub async fn base_text(worktree: &Path, commit: &str, file: &FileDiff) -> Result<Option<String>> {
     if file.binary || file.submodule {
@@ -523,6 +551,30 @@ rename to new name.rs
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn deleted_lines_follow_minus_rows() {
+        let mut diff = file("a.rs", FileStatus::Modified, false);
+        diff.hunks = vec![
+            Hunk {
+                old_start: 3,
+                old_len: 5,
+                new_start: 3,
+                new_len: 3,
+                body: " a\n-b\n-c\n+C\n d\n-e\n f\n\\ No newline at end of file\n".into(),
+            },
+            Hunk {
+                old_start: 20,
+                old_len: 1,
+                new_start: 18,
+                new_len: 0,
+                body: "-z\n".into(),
+            },
+        ];
+        assert_eq!(deleted_lines(&diff), vec![4..=5, 7..=7, 20..=20]);
+        diff.submodule = true;
+        assert!(deleted_lines(&diff).is_empty());
     }
 
     #[test]

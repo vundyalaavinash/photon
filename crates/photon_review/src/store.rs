@@ -76,6 +76,11 @@ pub struct Draft {
     pub general: bool,
 }
 
+/// Saves that fail before reaching the database, for testing the retry path.
+#[cfg(test)]
+pub(crate) static FAILING_SAVES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 type DraftRow = (
     (i64, String, String, i64, i64),
     (String, String, String, bool, bool),
@@ -207,6 +212,17 @@ impl ReviewDb {
 
     /// Inserts a draft without an id, otherwise updates the row with its id. Returns the id.
     pub async fn save_draft(&self, draft: Draft) -> Result<i64> {
+        #[cfg(test)]
+        if FAILING_SAVES
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |count| count.checked_sub(1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("injected save failure");
+        }
         let number = i64::try_from(draft.key.number)?;
         let side = match draft.side {
             Side::Left => "LEFT",
