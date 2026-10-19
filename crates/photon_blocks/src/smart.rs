@@ -485,9 +485,11 @@ pub fn rerun_failed_command(command: &str, run: &TestRun) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("|");
             let filter = format!("-t {}", shell_quote(&pattern));
-            if matches!(tokens.first(), Some(&("npm" | "pnpm" | "yarn" | "bun"))) {
+            if tokens.first() == Some(&"npm") {
                 let dashes = if separator.is_some() { "" } else { "-- " };
                 Some(format!("{command} {dashes}{filter}"))
+            } else if matches!(tokens.first(), Some(&("pnpm" | "yarn" | "bun"))) {
+                Some(format!("{command} {filter}"))
             } else if tokens
                 .iter()
                 .any(|token| *token == "jest" || *token == "vitest")
@@ -513,6 +515,9 @@ pub fn rerun_failed_command(command: &str, run: &TestRun) -> Option<String> {
                 .map(|name| regex::escape(name))
                 .collect::<Vec<_>>()
                 .join("|");
+            if tokens.iter().any(|token| token.starts_with("-run")) {
+                return None;
+            }
             let mut parts: Vec<String> = vec!["go test".into()];
             parts.extend(
                 known_flags(tokens.get(2..).unwrap_or_default(), GO_FLAGS)?
@@ -763,7 +768,7 @@ mod tests {
         let run = self::run(TestTool::Jest, &["sum > a.b", "x › y"]);
         assert_eq!(
             rerun_failed_command("pnpm vitest run", &run).as_deref(),
-            Some("pnpm vitest run -- -t 'sum a\\.b|x y'")
+            Some("pnpm vitest run -t 'sum a\\.b|x y'")
         );
         assert_eq!(rerun_failed_command("make check", &run), None);
     }
@@ -846,6 +851,8 @@ mod tests {
         go.packages = vec!["p".to_string()];
         assert_eq!(rerun_failed_command("go test -count 1 ./...", &go), None);
         assert_eq!(rerun_failed_command("go test ./... -args -x", &go), None);
+        assert_eq!(rerun_failed_command("go test -run=X ./...", &go), None);
+        assert_eq!(rerun_failed_command("go test -run X ./...", &go), None);
         assert_eq!(
             rerun_failed_command("go test -count=1 -v ./...", &go).as_deref(),
             Some("go test -count=1 -v -run '^(TestA)$' 'p'")
@@ -870,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn rerun_package_manager_commands_always_use_dashes() {
+    fn rerun_package_manager_dashes_only_for_npm() {
         let jest = run(TestTool::Jest, &["a › b"]);
         assert_eq!(
             rerun_failed_command("npm run jest", &jest).as_deref(),
@@ -878,7 +885,7 @@ mod tests {
         );
         assert_eq!(
             rerun_failed_command("yarn jest", &jest).as_deref(),
-            Some("yarn jest -- -t 'a b'")
+            Some("yarn jest -t 'a b'")
         );
         assert_eq!(
             rerun_failed_command("npm test -- --watch", &jest).as_deref(),
