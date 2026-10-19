@@ -19,10 +19,7 @@
       "nodes": [
        {
         "commit": {
-         "oid": "a1",
-         "statusCheckRollup": {
-          "state": "SUCCESS"
-         }
+         "oid": "a1"
         }
        }
       ]
@@ -42,6 +39,17 @@
      },
      "reviews": {
       "nodes": []
+     },
+     "lastCommit": {
+      "nodes": [
+       {
+        "commit": {
+         "statusCheckRollup": {
+          "state": "SUCCESS"
+         }
+        }
+       }
+      ]
      }
     },
     {
@@ -61,16 +69,12 @@
       "nodes": [
        {
         "commit": {
-         "oid": "b1",
-         "statusCheckRollup": null
+         "oid": "b1"
         }
        },
        {
         "commit": {
-         "oid": "b2",
-         "statusCheckRollup": {
-          "state": "PENDING"
-         }
+         "oid": "b2"
         }
        }
       ]
@@ -87,6 +91,17 @@
        {
         "commit": {
          "oid": "b2"
+        }
+       }
+      ]
+     },
+     "lastCommit": {
+      "nodes": [
+       {
+        "commit": {
+         "statusCheckRollup": {
+          "state": "PENDING"
+         }
         }
        }
       ]
@@ -109,34 +124,27 @@
       "nodes": [
        {
         "commit": {
-         "oid": "c1",
-         "statusCheckRollup": null
+         "oid": "c1"
         }
        },
        {
         "commit": {
-         "oid": "c2",
-         "statusCheckRollup": null
+         "oid": "c2"
         }
        },
        {
         "commit": {
-         "oid": "c3",
-         "statusCheckRollup": null
+         "oid": "c3"
         }
        },
        {
         "commit": {
-         "oid": "c4",
-         "statusCheckRollup": null
+         "oid": "c4"
         }
        },
        {
         "commit": {
-         "oid": "c5",
-         "statusCheckRollup": {
-          "state": "FAILURE"
-         }
+         "oid": "c5"
         }
        }
       ]
@@ -159,6 +167,17 @@
         }
        }
       ]
+     },
+     "lastCommit": {
+      "nodes": [
+       {
+        "commit": {
+         "statusCheckRollup": {
+          "state": "FAILURE"
+         }
+        }
+       }
+      ]
      }
     },
     {
@@ -178,8 +197,7 @@
       "nodes": [
        {
         "commit": {
-         "oid": "d9",
-         "statusCheckRollup": null
+         "oid": "d9"
         }
        }
       ]
@@ -196,6 +214,15 @@
        {
         "commit": {
          "oid": "d1"
+        }
+       }
+      ]
+     },
+     "lastCommit": {
+      "nodes": [
+       {
+        "commit": {
+         "statusCheckRollup": null
         }
        }
       ]
@@ -222,10 +249,7 @@
       "nodes": [
        {
         "commit": {
-         "oid": "e1",
-         "statusCheckRollup": {
-          "state": "SUCCESS"
-         }
+         "oid": "e1"
         }
        }
       ]
@@ -239,6 +263,17 @@
      },
      "reviews": {
       "nodes": []
+     },
+     "lastCommit": {
+      "nodes": [
+       {
+        "commit": {
+         "statusCheckRollup": {
+          "state": "SUCCESS"
+         }
+        }
+       }
+      ]
      }
     }
    ]
@@ -262,16 +297,12 @@
       "nodes": [
        {
         "commit": {
-         "oid": "b1",
-         "statusCheckRollup": null
+         "oid": "b1"
         }
        },
        {
         "commit": {
-         "oid": "b2",
-         "statusCheckRollup": {
-          "state": "PENDING"
-         }
+         "oid": "b2"
         }
        }
       ]
@@ -288,6 +319,17 @@
        {
         "commit": {
          "oid": "b2"
+        }
+       }
+      ]
+     },
+     "lastCommit": {
+      "nodes": [
+       {
+        "commit": {
+         "statusCheckRollup": {
+          "state": "PENDING"
+         }
         }
        }
       ]
@@ -310,10 +352,7 @@
       "nodes": [
        {
         "commit": {
-         "oid": "f1",
-         "statusCheckRollup": {
-          "state": "SUCCESS"
-         }
+         "oid": "f1"
         }
        }
       ]
@@ -327,6 +366,17 @@
      },
      "reviews": {
       "nodes": []
+     },
+     "lastCommit": {
+      "nodes": [
+       {
+        "commit": {
+         "statusCheckRollup": {
+          "state": "SUCCESS"
+         }
+        }
+       }
+      ]
      }
     }
    ]

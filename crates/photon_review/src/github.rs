@@ -197,6 +197,8 @@ struct RawPullRequest {
     base_ref_name: String,
     repository: RawRepository,
     commits: Nodes<RawCommitNode>,
+    #[serde(rename = "lastCommit")]
+    last_commit: Nodes<RawLastCommit>,
     review_threads: Nodes<RawThread>,
     reviews: Nodes<RawReview>,
     #[serde(default)]
@@ -224,6 +226,17 @@ struct RawCommitNode {
 #[serde(rename_all = "camelCase")]
 struct RawCommit {
     oid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLastCommit {
+    commit: RawLastCommitRollup,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLastCommitRollup {
     status_check_rollup: Option<RawRollup>,
 }
 
@@ -261,7 +274,7 @@ struct RawThread {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawComment {
-    database_id: u64,
+    database_id: Option<u64>,
     author: Option<RawLogin>,
     body: String,
     created_at: String,
@@ -305,9 +318,13 @@ fn summarize(host: &str, key: Option<&PrKey>, raw: &RawPullRequest) -> Result<Pr
         .flatten()
         .map(|node| &node.commit)
         .collect();
-    let checks = match commits
-        .last()
-        .and_then(|commit| commit.status_check_rollup.as_ref())
+    let checks = match raw
+        .last_commit
+        .nodes
+        .iter()
+        .flatten()
+        .next_back()
+        .and_then(|node| node.commit.status_check_rollup.as_ref())
         .map(|rollup| rollup.state.as_str())
     {
         Some("SUCCESS") => ChecksState::Passing,
@@ -335,10 +352,7 @@ fn summarize(host: &str, key: Option<&PrKey>, raw: &RawPullRequest) -> Result<Pr
         key,
         node_id: raw.id.clone(),
         title: raw.title.clone(),
-        author: raw
-            .author
-            .as_ref()
-            .map_or_else(|| GHOST_LOGIN.to_string(), |author| author.login.clone()),
+        author: author_login(raw.author.as_ref()),
         url: raw.url.clone(),
         head_sha: raw.head_ref_oid.clone(),
         base_ref: raw.base_ref_name.clone(),
@@ -357,8 +371,10 @@ fn summarize(host: &str, key: Option<&PrKey>, raw: &RawPullRequest) -> Result<Pr
 
 const PR_SUMMARY_FIELDS: &str = "id number title url author { login } headRefOid baseRefName \
     repository { nameWithOwner } \
-    commits(last: 100) { nodes { commit { oid statusCheckRollup { state } } } } \
-    reviews(last: 1, author: $login) { nodes { commit { oid } } }";
+    commits(last: 100) { nodes { commit { oid } } } \
+    lastCommit: commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } \
+    reviews(last: 1, author: $login, states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) \
+    { nodes { commit { oid } } }";
 
 pub fn inbox_request(host: &str, login: &str, tracked_node_ids: &[String]) -> GhRequest {
     let search = |alias: &str, qualifier: &str| {
@@ -511,11 +527,13 @@ pub fn parse_detail(key: &PrKey, json: &str) -> Result<PrDetail> {
                         .nodes
                         .into_iter()
                         .flatten()
-                        .map(|comment| ThreadComment {
-                            database_id: comment.database_id,
-                            author: author_login(comment.author.as_ref()),
-                            body: comment.body,
-                            created_at: comment.created_at,
+                        .filter_map(|comment| {
+                            Some(ThreadComment {
+                                database_id: comment.database_id?,
+                                author: author_login(comment.author.as_ref()),
+                                body: comment.body,
+                                created_at: comment.created_at,
+                            })
                         })
                         .collect()
                 })
@@ -670,6 +688,7 @@ mod tests {
         assert_eq!((thread.line, thread.start_line), (Some(42), Some(40)));
         assert_eq!(thread.side, Side::Right);
         assert!(!thread.is_resolved && !thread.is_outdated);
+        // The fixture's third comment has a null databaseId and is skipped.
         assert_eq!(thread.comments.len(), 2);
         assert_eq!(thread.comments[0].database_id, 1001);
         assert_eq!(thread.comments[0].author, "bob");
@@ -713,6 +732,8 @@ mod tests {
             serde_json::json!({"login": "alice", "tracked": ["PR_x"]})
         );
         let query = body["query"].as_str().expect("query");
+        assert!(query.contains("states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]"));
+        assert!(query.contains("lastCommit: commits(last: 1)"));
         for search in ["review-requested:@me", "author:@me", "mentions:@me"] {
             assert!(
                 query.contains(&format!("is:pr is:open archived:false {search}")),

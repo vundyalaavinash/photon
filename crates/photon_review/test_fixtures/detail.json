@@ -18,16 +18,12 @@
      "nodes": [
       {
        "commit": {
-        "oid": "a1",
-        "statusCheckRollup": null
+        "oid": "a1"
        }
       },
       {
        "commit": {
-        "oid": "a2",
-        "statusCheckRollup": {
-         "state": "SUCCESS"
-        }
+        "oid": "a2"
        }
       }
      ]
@@ -57,6 +53,14 @@
           "author": null,
           "body": "Network flakes.",
           "createdAt": "2026-10-01T11:00:00Z"
+         },
+         {
+          "databaseId": null,
+          "author": {
+           "login": "bob"
+          },
+          "body": "orphan",
+          "createdAt": "2026-10-01T12:00:00Z"
          }
         ]
        }
@@ -96,6 +100,17 @@
       {
        "path": "src/retry.rs",
        "viewerViewedState": "UNVIEWED"
+      }
+     ]
+    },
+    "lastCommit": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "state": "SUCCESS"
+        }
+       }
       }
      ]
     }
