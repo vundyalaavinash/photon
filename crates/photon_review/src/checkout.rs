@@ -191,6 +191,26 @@ pub async fn prepare_checkout(
     clone: Option<PathBuf>,
     root: &Path,
 ) -> Result<Checkout> {
+    finish_checkout(fetch_checkout(key, base_ref, fetch_url, clone, root).await?).await
+}
+
+/// The pull request's refs, fetched into `refs/photon/pr/<N>/*` without touching the worktree.
+#[derive(Clone, Debug)]
+pub struct FetchedCheckout {
+    pub repo_dir: PathBuf,
+    pub worktree: PathBuf,
+    pub head_sha: String,
+    pub merge_base: String,
+    worktree_exists: bool,
+}
+
+pub async fn fetch_checkout(
+    key: &PrKey,
+    base_ref: &str,
+    fetch_url: &str,
+    clone: Option<PathBuf>,
+    root: &Path,
+) -> Result<FetchedCheckout> {
     ensure_safe_segment("host", &key.host)?;
     ensure_safe_segment("owner", &key.owner)?;
     ensure_safe_segment("repo", &key.repo)?;
@@ -272,7 +292,24 @@ pub async fn prepare_checkout(
 
     let head_sha = safe_git(&repo_dir, &["rev-parse", &head_ref]).await?;
     let merge_base = safe_git(&repo_dir, &["merge-base", &head_ref, &base_private_ref]).await?;
+    Ok(FetchedCheckout {
+        repo_dir,
+        worktree,
+        head_sha,
+        merge_base,
+        worktree_exists,
+    })
+}
 
+/// Moves Photon's worktree to the fetched head, creating it if needed.
+pub async fn finish_checkout(fetched: FetchedCheckout) -> Result<Checkout> {
+    let FetchedCheckout {
+        repo_dir,
+        worktree,
+        head_sha,
+        merge_base,
+        worktree_exists,
+    } = fetched;
     let previous_head = if worktree_exists {
         safe_git(&worktree, &["rev-parse", "HEAD"]).await.log_err()
     } else {
@@ -705,6 +742,51 @@ pub(crate) mod tests {
         .await
         .expect("third");
         assert!(!third.head_changed);
+    }
+
+    #[gpui::test]
+    async fn fetch_step_leaves_the_worktree_head_alone(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let first = prepare_checkout(
+            &fixture.key(),
+            "main",
+            &fixture.url(),
+            Some(fixture.user.clone()),
+            &fixture.root,
+        )
+        .await
+        .expect("first");
+        run(&fixture.seed, &["checkout", "pr"]);
+        std::fs::write(fixture.seed.join("a.txt"), "one\ntwo\nthree\n").expect("write");
+        run(&fixture.seed, &["commit", "-am", "more"]);
+        let newer = run(&fixture.seed, &["rev-parse", "HEAD"]);
+        run(
+            &fixture.seed,
+            &["push", fixture.upstream.to_str().expect("utf8"), "pr"],
+        );
+        run(
+            &fixture.upstream,
+            &["update-ref", "refs/pull/7/head", &newer],
+        );
+
+        let fetched = fetch_checkout(
+            &fixture.key(),
+            "main",
+            &fixture.url(),
+            Some(fixture.user.clone()),
+            &fixture.root,
+        )
+        .await
+        .expect("fetched");
+        assert_eq!(fetched.head_sha, newer);
+        assert_eq!(run(&first.worktree, &["rev-parse", "HEAD"]), first.head_sha);
+
+        let checkout = finish_checkout(fetched).await.expect("checkout");
+        assert!(checkout.head_changed);
+        assert_eq!(run(&checkout.worktree, &["rev-parse", "HEAD"]), newer);
     }
 
     #[gpui::test]

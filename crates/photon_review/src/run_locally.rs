@@ -14,8 +14,9 @@ use workspace::{
 };
 
 use crate::{
-    Checkout, PrSummary, ReviewDb, Tracked, candidate_repos, fetch_url, find_clone,
-    forget_stale_trust, git, prepare_checkout, repo_id, review_root, worktree_path,
+    Checkout, FetchedCheckout, PrKey, PrSummary, ReviewDb, Tracked, candidate_repos,
+    fetch_checkout, fetch_url, find_clone, finish_checkout, forget_stale_trust, git, repo_id,
+    review_root, worktree_path,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, RegisterSetting)]
@@ -69,6 +70,7 @@ pub fn run_locally(
 
 /// The part of running locally that touches git: the same checkout `open_review` makes, reusing
 /// the worktree when it exists.
+#[cfg(test)]
 pub(crate) async fn prepare_local_checkout(
     summary: &PrSummary,
     fetch_url: String,
@@ -76,9 +78,26 @@ pub(crate) async fn prepare_local_checkout(
     candidates: Vec<PathBuf>,
     database: ReviewDb,
 ) -> Result<Checkout> {
+    let fetched = fetch_local_checkout(summary, fetch_url, root, candidates).await?;
+    finish_local_checkout(summary, fetched, database).await
+}
+
+pub(crate) async fn fetch_local_checkout(
+    summary: &PrSummary,
+    fetch_url: String,
+    root: PathBuf,
+    candidates: Vec<PathBuf>,
+) -> Result<FetchedCheckout> {
     let clone = find_clone(candidates, &repo_id(summary)).await;
-    let checkout =
-        prepare_checkout(&summary.key, &summary.base_ref, &fetch_url, clone, &root).await?;
+    fetch_checkout(&summary.key, &summary.base_ref, &fetch_url, clone, &root).await
+}
+
+pub(crate) async fn finish_local_checkout(
+    summary: &PrSummary,
+    fetched: FetchedCheckout,
+    database: ReviewDb,
+) -> Result<Checkout> {
+    let checkout = finish_checkout(fetched).await?;
     database
         .track(Tracked {
             key: summary.key.clone(),
@@ -102,15 +121,16 @@ pub(crate) fn must_refuse_checkout(
 
 struct NewCommitsToast;
 
-/// Run before any `prepare_checkout` for the pull request. Returns true, having activated the
-/// window and told the user, when a window shows the PR's worktree and the checkout would move
-/// its head.
+/// Run between `fetch_checkout` and `finish_checkout`, with the fetched head: the inbox's head
+/// may be stale. Returns true, having activated the window and told the user, when a window
+/// shows the PR's worktree and the checkout would move its head.
 pub(crate) async fn refuse_head_change_under_open_window(
-    summary: &PrSummary,
+    key: &PrKey,
+    fetched_head: &str,
     app_state: &AppState,
     cx: &mut AsyncWindowContext,
 ) -> Result<bool> {
-    let worktree = worktree_path(&review_root(), &summary.key);
+    let worktree = worktree_path(&review_root(), key);
     let open = cx.update(|_, cx| find_workspace_with_worktree(app_state, &worktree, cx))?;
     let Some((window, workspace)) = open else {
         return Ok(false);
@@ -118,12 +138,12 @@ pub(crate) async fn refuse_head_change_under_open_window(
     let worktree_head = cx
         .background_spawn(async move { git(&worktree, &["rev-parse", "HEAD"]).await.log_err() })
         .await;
-    if !must_refuse_checkout(true, worktree_head.as_deref(), &summary.head_sha) {
+    if !must_refuse_checkout(true, worktree_head.as_deref(), fetched_head) {
         return Ok(false);
     }
     let message = format!(
         "Close the window for PR #{} to load its new commits",
-        summary.key.number
+        key.number
     );
     window.update(cx, |_, window, cx| {
         window.activate_window();
@@ -200,15 +220,20 @@ async fn open_terminal(
     candidates: Task<Vec<PathBuf>>,
     cx: &mut AsyncWindowContext,
 ) -> Result<()> {
-    if refuse_head_change_under_open_window(&summary, &app_state, cx).await? {
-        return Ok(());
-    }
     let candidates = candidates.await;
     let url = fetch_url(&repo_id(&summary));
-    let checkout = cx
-        .background_spawn(async move {
-            prepare_local_checkout(&summary, url, review_root(), candidates, database).await
+    let fetched = cx
+        .background_spawn({
+            let summary = summary.clone();
+            async move { fetch_local_checkout(&summary, url, review_root(), candidates).await }
         })
+        .await?;
+    if refuse_head_change_under_open_window(&summary.key, &fetched.head_sha, &app_state, cx).await?
+    {
+        return Ok(());
+    }
+    let checkout = cx
+        .background_spawn(async move { finish_local_checkout(&summary, fetched, database).await })
         .await?;
     let worktree = checkout.worktree.clone();
     cx.update(|_, cx| forget_stale_trust(&checkout, cx))?;
@@ -301,6 +326,21 @@ mod tests {
         assert!(!must_refuse_checkout(true, Some("new"), "new"));
         assert!(!must_refuse_checkout(false, Some("old"), "new"));
         assert!(!must_refuse_checkout(false, None, "new"));
+    }
+
+    #[test]
+    fn stale_summary_head_is_caught_by_the_fetched_head() {
+        let (summary_head, worktree_head, fetched_head) = ("old", "old", "new");
+        assert!(!must_refuse_checkout(
+            true,
+            Some(worktree_head),
+            summary_head
+        ));
+        assert!(must_refuse_checkout(
+            true,
+            Some(worktree_head),
+            fetched_head
+        ));
     }
 
     #[gpui::test]

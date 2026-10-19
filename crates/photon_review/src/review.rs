@@ -36,17 +36,17 @@ use workspace::{
 
 use crate::{
     CallerMark, ChangedFunction, Checkout, ChecksState, ContextCache, ContextError, ContextExcerpt,
-    Draft, FileAnalysis, FileDiff, FileKind, FileStatus, FunctionContext, GhError, GhRunner,
-    LoadedFile, MapFile, MapFunction, PostState, PrDetail, PrKey, PrSummary, Reanchor, RepoId,
-    ReviewDb, ReviewEvent, ReviewThread, SUMMARY_SLOT, Side, SinceReviewPlan, Step,
+    Draft, FetchedCheckout, FileAnalysis, FileDiff, FileKind, FileStatus, FunctionContext, GhError,
+    GhRunner, LoadedFile, MapFile, MapFunction, PostState, PrDetail, PrKey, PrSummary, Reanchor,
+    RepoId, ReviewDb, ReviewEvent, ReviewThread, SUMMARY_SLOT, Side, SinceReviewPlan, Step,
     ToggleChangesSinceReview, Tracked, analyse_loaded_file, auth_status_request, base_text,
     build_loaded_file, build_review_map, call_edges, caller_touched, candidate_repos,
     classify_caller, classify_path, commentable_lines, context::buffer_path, context_excerpts,
-    deleted_lines, detail_request, fetch_url, find_clone, functions, gh_runner, git_diff,
-    is_sendable, landing_note, parse_auth_status, parse_detail, parse_mutation, parse_reply, place,
-    plan_since_review, prepare_checkout, reanchor, refuse_head_change_under_open_window,
-    reply_request, reply_slot, resolve_request, review_request, review_root, since_review_files,
-    viewed_request,
+    deleted_lines, detail_request, fetch_checkout, fetch_url, find_clone, finish_checkout,
+    functions, gh_runner, git_diff, is_sendable, landing_note, parse_auth_status, parse_detail,
+    parse_mutation, parse_reply, place, plan_since_review, reanchor,
+    refuse_head_change_under_open_window, reply_request, reply_slot, resolve_request,
+    review_request, review_root, since_review_files, viewed_request,
 };
 
 actions!(
@@ -403,18 +403,24 @@ async fn open_in_new_window(
         })?;
         return Ok(());
     }
-    if refuse_head_change_under_open_window(&summary, &app_state, cx).await? {
-        return Ok(());
-    }
 
     let candidates = candidates.await;
     let url = fetch_url(&repo_id(&summary));
+    let (login, fetched) = cx
+        .background_spawn({
+            let summary = summary.clone();
+            let runner = runner.clone();
+            async move { fetch_review(&summary, url, review_root(), candidates, runner).await }
+        })
+        .await?;
+    if refuse_head_change_under_open_window(&summary.key, &fetched.head_sha, &app_state, cx).await?
+    {
+        return Ok(());
+    }
     let prepared = cx
         .background_spawn({
             let database = database.clone();
-            async move {
-                prepare_review(&summary, url, review_root(), candidates, runner, database).await
-            }
+            async move { finish_review(&summary, login, fetched, runner, database).await }
         })
         .await?;
     cx.update(|_, cx| forget_stale_trust(&prepared.checkout, cx))?;
@@ -508,6 +514,7 @@ pub(crate) fn repo_id(summary: &PrSummary) -> RepoId {
 
 /// Everything `open_review` does before it opens a window: the login check, the checkout, the
 /// detail and the diff. The user's clone only gains Photon's refs and worktree entry (see `prepare_checkout`).
+#[cfg(test)]
 pub(crate) async fn prepare_review(
     summary: &PrSummary,
     fetch_url: String,
@@ -516,6 +523,19 @@ pub(crate) async fn prepare_review(
     runner: Arc<dyn GhRunner>,
     database: ReviewDb,
 ) -> Result<PreparedReview> {
+    let (login, fetched) =
+        fetch_review(summary, fetch_url, root, candidates, runner.clone()).await?;
+    finish_review(summary, login, fetched, runner, database).await
+}
+
+/// The login check and the fetch: everything before the worktree moves. Returns the login.
+pub(crate) async fn fetch_review(
+    summary: &PrSummary,
+    fetch_url: String,
+    root: PathBuf,
+    candidates: Vec<PathBuf>,
+    runner: Arc<dyn GhRunner>,
+) -> Result<(String, FetchedCheckout)> {
     let key = &summary.key;
     let hosts = parse_auth_status(&runner.run(auth_status_request()).await?)?;
     let login = hosts
@@ -527,7 +547,19 @@ pub(crate) async fn prepare_review(
         })?;
 
     let clone = find_clone(candidates, &repo_id(summary)).await;
-    let checkout = prepare_checkout(key, &summary.base_ref, &fetch_url, clone, &root).await?;
+    let fetched = fetch_checkout(key, &summary.base_ref, &fetch_url, clone, &root).await?;
+    Ok((login, fetched))
+}
+
+pub(crate) async fn finish_review(
+    summary: &PrSummary,
+    login: String,
+    fetched: FetchedCheckout,
+    runner: Arc<dyn GhRunner>,
+    database: ReviewDb,
+) -> Result<PreparedReview> {
+    let key = &summary.key;
+    let checkout = finish_checkout(fetched).await?;
     database
         .track(Tracked {
             key: key.clone(),
