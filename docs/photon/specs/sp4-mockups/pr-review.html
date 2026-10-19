@@ -1,0 +1,200 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Photon PR review mockups</title>
+<style>
+  :root { --bg:#050505; --panel:#0c0d0f; --line:#1c1e22; --text:#d8d9e0; --dim:#6b6f78; --meta:#8E8E8E; --accent:#19AAD8; --red:#FF8272; --green:#B4FA72; --add:#0f2a17; --del:#2e1414; --addt:#9ff0b0; --delt:#ffb3a8; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#1a1a1a; color:var(--text); font-family:-apple-system,system-ui,sans-serif; }
+  h1 { font-size:20px; padding:22px 28px 4px; margin:0; color:#fff; }
+  p.lede { padding:0 28px 8px; margin:0; color:#aaa; font-size:14px; }
+  section { padding:18px 28px 30px; }
+  section > h2 { font-size:16px; margin:0 0 4px; color:#fff; }
+  section > p { margin:0 0 12px; color:#aaa; font-size:13px; max-width:980px; }
+  .app { background:var(--bg); border:1px solid #2a2a2a; border-radius:10px; overflow:hidden; font-size:12.5px; }
+  .titlebar { height:30px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; padding:0 12px; color:var(--meta); font-size:12px; }
+  .titlebar b { color:#fff; font-weight:600; }
+  .pill { border:1px solid #333; border-radius:10px; padding:1px 8px; font-size:11px; color:#ccc; }
+  .pill.ok { color:var(--green); border-color:#2d4a1f; } .pill.bad { color:var(--red); border-color:#4a2420; } .pill.acc { color:var(--accent); border-color:#164a5c; }
+  .cols { display:grid; }
+  .side { background:var(--panel); border-right:1px solid var(--line); padding:10px 0; }
+  .side h3 { font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--meta); margin:6px 14px 8px; font-weight:600; }
+  .step { padding:6px 14px; display:flex; gap:8px; align-items:flex-start; cursor:default; }
+  .step.sel { background:#10232b; box-shadow: inset 2px 0 var(--accent); }
+  .num { color:var(--meta); width:16px; flex:none; }
+  .step .t { color:#fff; } .step .s { color:var(--meta); font-size:11.5px; }
+  .fn { padding:3px 14px 3px 38px; font-family:Hack,Menlo,monospace; font-size:11.5px; }
+  .fn.changed { color:var(--accent); } .fn.unchanged { color:var(--dim); }
+  .dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; }
+  .main { padding:0; overflow:hidden; }
+  .code { font-family:Hack,Menlo,monospace; font-size:12px; line-height:1.55; }
+  .file { border-bottom:1px solid var(--line); }
+  .filehead { display:flex; gap:10px; align-items:center; padding:7px 12px; background:#0a0b0d; border-bottom:1px solid var(--line); color:var(--meta); font-size:12px; }
+  .filehead b { color:#fff; font-weight:500; font-family:Hack,Menlo,monospace; }
+  .ln { display:grid; grid-template-columns:44px 1fr; }
+  .ln .no { color:#444; text-align:right; padding-right:10px; user-select:none; }
+  .ln.add { background:var(--add); } .ln.add .c { color:var(--addt); }
+  .ln.del { background:var(--del); } .ln.del .c { color:var(--delt); }
+  .ln.ctx .c { color:#9aa0a8; }
+  .c { white-space:pre; padding-right:12px; }
+  .kw { color:#c792ea; } .fnn { color:#82aaff; } .str { color:#c3e88d; } .ty { color:#ffcb6b; }
+  .unchanged-block { border-left:2px dashed #2b3a42; margin:0; background:#07090b; }
+  .unchanged-label { color:var(--dim); font-size:11px; padding:6px 12px; font-family:-apple-system,system-ui,sans-serif; display:flex; gap:8px; align-items:center; }
+  .unchanged-label .why { color:var(--accent); }
+  .thread { margin:6px 12px 10px 56px; border:1px solid #2a2d33; border-radius:8px; background:#0e1013; font-family:-apple-system,system-ui,sans-serif; }
+  .thread .h { padding:7px 10px; border-bottom:1px solid #22252a; color:var(--meta); font-size:11.5px; display:flex; gap:8px; }
+  .thread .h b { color:#fff; }
+  .thread .b { padding:8px 10px; font-size:12.5px; color:#d8d9e0; }
+  .thread .f { padding:6px 10px 8px; display:flex; gap:6px; }
+  .btn { border:1px solid #333; border-radius:5px; padding:2px 9px; font-size:11.5px; color:#ddd; background:#141619; }
+  .btn.pri { border-color:#19AAD8; color:#19AAD8; }
+  .note { color:var(--meta); font-size:11px; padding:0 10px 8px; }
+  .right { background:var(--panel); border-left:1px solid var(--line); padding:10px 12px; }
+  .right h3 { font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--meta); margin:6px 0 8px; font-weight:600; }
+  .caller { font-family:Hack,Menlo,monospace; font-size:11.5px; padding:5px 8px; border-radius:5px; margin-bottom:4px; display:flex; justify-content:space-between; gap:8px; }
+  .caller.ok { background:#0d1a10; color:#9fd9a8; } .caller.bad { background:#2a1210; color:var(--red); } .caller.indiff { background:#0f1b22; color:var(--accent); }
+  .legend { color:var(--meta); font-size:11px; margin-top:8px; line-height:1.6; }
+  /* graph */
+  .graph { position:relative; height:420px; background:var(--bg); }
+  .node { position:absolute; border:1px solid #2a2d33; border-radius:7px; padding:7px 10px; font-family:Hack,Menlo,monospace; font-size:11.5px; background:#0e1013; color:#9aa0a8; }
+  .node.ch { border-color:var(--accent); color:#fff; box-shadow:0 0 0 1px #19AAD833, 0 0 14px #19AAD822; }
+  .node.bad { border-color:var(--red); color:#fff; }
+  .node small { display:block; color:var(--meta); font-family:-apple-system,system-ui,sans-serif; font-size:10.5px; margin-top:2px; }
+  svg.edges { position:absolute; inset:0; }
+  /* inbox */
+  .pr { display:grid; grid-template-columns: 1fr auto; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line); }
+  .pr .t { color:#fff; font-size:13px; } .pr .m { color:var(--meta); font-size:11.5px; margin-top:3px; }
+  .bar { height:5px; background:#1d2025; border-radius:3px; overflow:hidden; width:140px; margin-top:6px; } .bar i { display:block; height:100%; background:var(--accent); }
+  /* docs */
+  .doc { font-family:-apple-system,system-ui,sans-serif; padding:16px 20px; line-height:1.55; color:#d8d9e0; font-size:13.5px; }
+  .doc h4 { margin:0 0 8px; color:#fff; font-size:15px; }
+  .ins { background:#0f2a17; color:#b7f5c4; border-radius:3px; padding:0 2px; }
+  .delw { background:#2e1414; color:#ffb3a8; text-decoration:line-through; border-radius:3px; padding:0 2px; }
+  .hl { background:#19AAD833; border-bottom:2px solid var(--accent); }
+</style>
+</head>
+<body>
+<h1>Photon PR review: mockups</h1>
+<p class="lede">The example PR is a fake one ("Add rate limiting to the login endpoint"). Everything is drawn in Photon Black. React to anything: layout, what's shown, what's missing.</p>
+
+<!-- 1. Review workspace -->
+<section>
+  <h2>1. The review workspace: the diff plus the code it touches, in one place</h2>
+  <p>Left: the <b>review map</b> walks the change in logical order. Middle: each step shows the changed code, then the <b>unchanged code it calls or is called by</b> (dashed edge, dimmed), all in one scroll. Comments go anywhere, even on unchanged lines. Right: the <b>impact</b> of the selected change.</p>
+  <div class="app">
+    <div class="titlebar"><b>#482 Add rate limiting to the login endpoint</b><span class="pill acc">alice → main</span><span class="pill ok">checks passing</span><span class="pill">12 files · +214 −38</span><span style="margin-left:auto">2 of 5 steps viewed</span></div>
+    <div class="cols" style="grid-template-columns:250px 1fr 260px; min-height:560px">
+      <div class="side">
+        <h3>Review map</h3>
+        <div class="step"><span class="num">1</span><div><div class="t">✓ New limiter type</div><div class="s">rate_limit.ts · new file</div></div></div>
+        <div class="step sel"><span class="num">2</span><div><div class="t">Login calls the limiter</div><div class="s">auth/login.ts · changed</div></div></div>
+        <div class="fn changed"><span class="dot" style="background:#19AAD8"></span>handleLogin()</div>
+        <div class="fn unchanged"><span class="dot" style="background:#444"></span>verifyPassword()</div>
+        <div class="fn unchanged"><span class="dot" style="background:#444"></span>audit.record()</div>
+        <div class="step"><span class="num">3</span><div><div class="t">Config: limits per route</div><div class="s">config/limits.ts · changed</div></div></div>
+        <div class="step"><span class="num">4</span><div><div class="t">Error response 429</div><div class="s">http/errors.ts · changed</div></div></div>
+        <div class="step"><span class="num">5</span><div><div class="t">Tests</div><div class="s">3 test files</div></div></div>
+        <h3 style="margin-top:16px">Legend</h3>
+        <div class="fn changed" style="padding-left:14px"><span class="dot" style="background:#19AAD8"></span>changed in this PR</div>
+        <div class="fn unchanged" style="padding-left:14px"><span class="dot" style="background:#444"></span>unchanged, pulled in by the call graph</div>
+      </div>
+      <div class="main code">
+        <div class="file">
+          <div class="filehead"><b>auth/login.ts</b><span>handleLogin()</span><span class="pill">changed</span><span style="margin-left:auto">☐ viewed</span></div>
+          <div class="ln ctx"><span class="no">40</span><span class="c"><span class="kw">export async function</span> <span class="fnn">handleLogin</span>(req: <span class="ty">Request</span>) {</span></div>
+          <div class="ln ctx"><span class="no">41</span><span class="c">  <span class="kw">const</span> { user, password } = <span class="kw">await</span> req.json();</span></div>
+          <div class="ln add"><span class="no">42</span><span class="c">  <span class="kw">if</span> (!limiter.<span class="fnn">allow</span>(req.ip)) <span class="kw">return</span> <span class="fnn">tooManyRequests</span>();</span></div>
+          <div class="ln del"><span class="no">43</span><span class="c">  <span class="kw">const</span> ok = <span class="fnn">verifyPassword</span>(user, password);</span></div>
+          <div class="ln add"><span class="no">43</span><span class="c">  <span class="kw">const</span> ok = <span class="kw">await</span> <span class="fnn">verifyPassword</span>(user, password);</span></div>
+          <div class="ln ctx"><span class="no">44</span><span class="c">  audit.<span class="fnn">record</span>(user, ok);</span></div>
+          <div class="thread"><div class="h"><b>you</b> · on line 42 · draft</div><div class="b">Should the limit key be the IP <i>and</i> the username? Behind a shared NAT this locks out a whole office.</div><div class="f"><span class="btn pri">Add to review</span><span class="btn">Cancel</span></div></div>
+        </div>
+        <div class="unchanged-block">
+          <div class="unchanged-label"><span>⤷ unchanged</span><b style="color:#aaa;font-family:Hack,Menlo,monospace">auth/password.ts · verifyPassword()</b><span class="why">called on line 43 (now awaited)</span></div>
+          <div class="ln ctx"><span class="no">12</span><span class="c"><span class="kw">export function</span> <span class="fnn">verifyPassword</span>(user: <span class="ty">string</span>, pw: <span class="ty">string</span>): <span class="ty">boolean</span> {</span></div>
+          <div class="ln ctx"><span class="no">13</span><span class="c">  <span class="kw">return</span> <span class="fnn">timingSafeEqual</span>(<span class="fnn">hash</span>(pw), store.<span class="fnn">get</span>(user));</span></div>
+          <div class="ln ctx"><span class="no">14</span><span class="c">}</span></div>
+          <div class="thread"><div class="h"><b>you</b> · on unchanged line 12 · draft</div><div class="b">This is still synchronous and returns <code>boolean</code>, so the new <code>await</code> on line 43 does nothing. Was it meant to become async?</div><div class="note">Unchanged code: GitHub can't take this comment directly, so Photon posts it on line 43 and quotes these lines.</div><div class="f"><span class="btn pri">Add to review</span><span class="btn">Cancel</span></div></div>
+        </div>
+        <div class="unchanged-block">
+          <div class="unchanged-label"><span>⤷ unchanged</span><b style="color:#aaa;font-family:Hack,Menlo,monospace">audit/log.ts · record()</b><span class="why">called on line 44</span><span style="margin-left:auto;color:#555">collapsed · 9 lines</span></div>
+        </div>
+      </div>
+      <div class="right">
+        <h3>Impact of handleLogin()</h3>
+        <div class="caller indiff">routes/auth.ts:18 <span>in this PR</span></div>
+        <div class="caller ok">sso/callback.ts:77 <span>unchanged ✓</span></div>
+        <div class="caller bad" style="background:#2a2210;color:#f0c060">mobile/legacy.ts:203 <span>check</span></div>
+        <div class="legend">Every caller in the repo, not just the diff. <span style="color:#FF8272">Red</span>: the signature changed and this caller wasn't updated. <span style="color:#f0c060">Amber</span>: the body changed and this caller wasn't touched, so check it.</div>
+        <h3 style="margin-top:18px">Your review</h3>
+        <div class="legend">2 draft comments · 2 of 5 steps viewed</div>
+        <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap"><span class="btn">Comment</span><span class="btn pri">Approve</span><span class="btn">Request changes</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 2. Call graph -->
+<section>
+  <h2>2. Call graph of the change: also works for reading any code, outside PRs</h2>
+  <p>Changed functions glow, unchanged ones are grey, and red marks a caller the PR missed. Click a node to jump to it in the workspace above. Outside reviews, the same view starts from any function you choose ("who calls this, what does it call").</p>
+  <div class="app">
+    <div class="titlebar"><b>Call graph</b><span class="pill">from: the change in #482</span><span class="pill">depth 2</span><span style="margin-left:auto">⤓ export as Mermaid · open in Excalidraw</span></div>
+    <div class="graph">
+      <svg class="edges" viewBox="0 0 1200 420" preserveAspectRatio="none">
+        <g stroke="#3a3f47" stroke-width="1.5" fill="none">
+          <path d="M210 70 C 330 70, 330 190, 450 190"/>
+          <path d="M210 210 C 330 210, 330 200, 450 200"/>
+          <path d="M210 350 C 330 350, 330 210, 450 210" stroke="#FF8272"/>
+          <path d="M640 195 C 720 195, 720 90, 800 90"/>
+          <path d="M640 200 C 720 200, 720 200, 800 200"/>
+          <path d="M640 205 C 720 205, 720 310, 800 310"/>
+          <path d="M990 90 C 1040 90, 1040 60, 1080 60"/>
+        </g>
+      </svg>
+      <div class="node" style="left:40px;top:50px">routes/auth.ts<small>POST /login · in this PR</small></div>
+      <div class="node" style="left:40px;top:190px">sso/callback.ts<small>unchanged caller</small></div>
+      <div class="node bad" style="left:40px;top:330px">mobile/legacy.ts<small>caller not updated</small></div>
+      <div class="node ch" style="left:450px;top:178px">handleLogin()<small>changed · +2 −1</small></div>
+      <div class="node ch" style="left:800px;top:70px">limiter.allow()<small>new in this PR</small></div>
+      <div class="node" style="left:800px;top:180px">verifyPassword()<small>unchanged · now awaited</small></div>
+      <div class="node" style="left:800px;top:290px">audit.record()<small>unchanged</small></div>
+      <div class="node ch" style="left:1080px;top:40px">config.limits<small>changed</small></div>
+    </div>
+  </div>
+</section>
+
+<!-- 3. Inbox + progress -->
+<section>
+  <h2>3. PR inbox and review progress</h2>
+  <p>Your PRs on github.com and GitHub Enterprise in one list. Each shows what's new since your last review, so a re-review starts where you left off. "Run locally" checks the PR out into a separate worktree and runs its tests in a terminal block, without touching your branch.</p>
+  <div class="app">
+    <div class="titlebar"><b>Pull requests</b><span class="pill acc">Review requested · 3</span><span class="pill">Yours · 2</span><span class="pill">github.com + ghe.corp</span></div>
+    <div class="pr"><div><div class="t">#482 Add rate limiting to the login endpoint</div><div class="m">alice · <span style="color:#19AAD8">3 new commits since your review</span> · 2 unresolved threads</div><div class="bar"><i style="width:40%"></i></div></div><div style="display:flex;gap:6px;align-items:start"><span class="btn">Run locally</span><span class="btn pri">Continue review</span></div></div>
+    <div class="pr"><div><div class="t">#479 Migrate sessions table to UUID keys</div><div class="m">bob · ghe.corp/payments · <span style="color:#FF8272">checks failing</span></div><div class="bar"><i style="width:0%"></i></div></div><div style="display:flex;gap:6px;align-items:start"><span class="btn">Run locally</span><span class="btn pri">Start review</span></div></div>
+    <div class="pr"><div><div class="t">#77 Spec: offline sync design</div><div class="m">carol · docs/specs/offline-sync.md · document review</div><div class="bar"><i style="width:75%"></i></div></div><div style="display:flex;gap:6px;align-items:start"><span class="btn pri">Continue review</span></div></div>
+  </div>
+</section>
+
+<!-- 4. Document review -->
+<section>
+  <h2>4. Document review: specs and Markdown, the same flow</h2>
+  <p>Changed docs show rendered, with additions and deletions inline. Select any text to comment, the same as in code.</p>
+  <div class="app">
+    <div class="titlebar"><b>docs/specs/offline-sync.md</b><span class="pill">rendered · changes inline</span><span style="margin-left:auto">source view ⇄</span></div>
+    <div class="cols" style="grid-template-columns:1fr 300px">
+      <div class="doc">
+        <h4>Conflict resolution</h4>
+        When two devices edit the same record offline, the <span class="delw">newest write wins</span> <span class="ins">server keeps both versions and asks the user to pick</span>. Edits to <span class="hl">different fields of one record merge automatically</span>.
+        <br><br>
+        Sync runs every <span class="delw">30</span> <span class="ins">60</span> seconds while the app is open.
+      </div>
+      <div class="right" style="border-left:1px solid #1c1e22">
+        <div class="thread" style="margin:4px 0"><div class="h"><b>you</b> · on "different fields … merge automatically"</div><div class="b">What if one device deletes the record while the other edits a field?</div><div class="f"><span class="btn pri">Add to review</span></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+</body>
+</html>
