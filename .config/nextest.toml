@@ -46,3 +46,8 @@ slow-timeout = { period = "300s", terminate-after = 1 }
 [[profile.default.overrides]]
 filter =  'package(editor) and test(test_random_blocks)'
 slow-timeout = { period = "300s", terminate-after = 1 }
+
+# photon: smart-block perf tests compare CPU times within 10%, so they run without other tests.
+[[profile.default.overrides]]
+filter = 'package(photon_terminal) and test(/smart_blocks_.*(within_10_percent|under_1ms)/)'
+threads-required = 'num-cpus'

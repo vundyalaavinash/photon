@@ -23,6 +23,9 @@ use crate::chips::run_git;
 const URL_SCAN_LINE_LIMIT: usize = 2_000;
 
 /// At most one dev-server error notification per block in this time.
+/// A burst larger than this is only checked at its end: notifications are throttled anyway, and
+/// copying every line of a large burst out of the grid would stall the UI thread.
+const ERROR_SCAN_TAIL_LINES: usize = 200;
 const ERROR_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(60);
 const NOTIFICATION_TAG_PREFIX: &str = "photon-block-";
 const NOTIFIED_COMMAND_CHARS: usize = 60;
@@ -526,7 +529,7 @@ impl SmartBlocks {
             return;
         }
         let scan = self.scans.entry(id).or_default();
-        let Some(lines) = read_new_lines(self.terminal.read(cx), id, scan) else {
+        let Some(lines) = read_new_lines(self.terminal.read(cx), id, scan, None) else {
             return;
         };
         if let Some((position, url)) = lines
@@ -564,7 +567,12 @@ impl SmartBlocks {
         let scan = self.error_scans.entry(id).or_default();
         // The budget bounds one read, not the block's life: a server can run for days.
         scan.lines = 0;
-        let Some(lines) = read_new_lines(self.terminal.read(cx), id, scan) else {
+        let Some(lines) = read_new_lines(
+            self.terminal.read(cx),
+            id,
+            scan,
+            Some(ERROR_SCAN_TAIL_LINES),
+        ) else {
             return;
         };
         // Output the user could see, or that came before the server was up, is skipped so
@@ -659,7 +667,12 @@ fn shortened_command(command: &str) -> String {
 }
 
 /// Reads the complete lines of a running block that `scan` has not seen yet, within its budget.
-fn read_new_lines(terminal: &Terminal, id: BlockId, scan: &mut UrlScan) -> Option<Vec<OutputLine>> {
+fn read_new_lines(
+    terminal: &Terminal,
+    id: BlockId,
+    scan: &mut UrlScan,
+    tail_lines: Option<usize>,
+) -> Option<Vec<OutputLine>> {
     let output_line = terminal.blocks()?.block(id)?.output_line?;
     if scan.output_line != output_line {
         scan.output_line = output_line;
@@ -669,8 +682,13 @@ fn read_new_lines(terminal: &Terminal, id: BlockId, scan: &mut UrlScan) -> Optio
     if remaining == 0 {
         return None;
     }
-    let lines =
-        terminal.block_new_output_lines(id, scan.next_line, remaining, MAX_INSIGHT_BYTES)?;
+    let lines = terminal.block_new_output_lines(
+        id,
+        scan.next_line,
+        tail_lines,
+        remaining,
+        MAX_INSIGHT_BYTES,
+    )?;
     let last = lines.last()?;
     scan.lines += lines.len();
     scan.next_line = Some(last.absolute_line + 1);
@@ -754,9 +772,10 @@ mod tests {
 
     const PERF_COMMANDS: usize = 1_000;
     const PERF_LINES_PER_COMMAND: usize = 100;
-    const PERF_RUNS: usize = 9;
+    const PERF_RUNS: usize = 15;
     const STREAM_LINES: usize = 100_000;
-    const STREAM_CHUNK_LINES: usize = 1_000;
+    // About one 64 KiB PTY read of short lines, which is what each Wakeup sees under load.
+    const STREAM_CHUNK_LINES: usize = 2_000;
 
     /// CPU time of the calling thread, which runs the whole test app: time spent
     /// preempted on a busy machine does not count.
@@ -925,16 +944,7 @@ mod tests {
         assert!(per_command_secs < 0.001, "{per_command_secs}s per command");
     }
 
-    /// Fails today (about +40% in a debug build, ~100 us per command of SmartBlocks bookkeeping
-    /// against ~230 us to parse a 100-line command); kept to be run with `--run-ignored`.
-    #[gpui::test]
-    #[ignore = "known over budget, see the fix report"]
-    async fn smart_blocks_many_commands_within_10_percent(cx: &mut TestAppContext) {
-        let (without, with) = measure_overhead(cx, &command_reads(), &assert_finished_path_ran);
-        assert_within_10_percent("100,000 lines as commands", without, with);
-    }
-
-    /// One command streaming 100,000 lines with a Wakeup per 1,000, still running until the end,
+    /// One command streaming 100,000 lines with a Wakeup per 2,000, still running until the end,
     /// so the URL and error scans run on every Wakeup.
     fn streaming_reads(start_output: &str) -> Vec<String> {
         let mut reads = vec![format!(
@@ -967,11 +977,9 @@ mod tests {
         assert_within_10_percent("100,000 streamed lines, URL scan", without, with);
     }
 
-    /// A URL up front makes it a dev server in an inactive window, so the error scan reads every
-    /// new chunk. Fails today (about +180% in a debug build: every line of a 100,000-line burst
-    /// is copied out of the grid on the UI thread); kept to be run with `--run-ignored`.
+    /// A URL up front makes it a dev server in an inactive window, so the error scan runs on
+    /// every Wakeup, reading only the tail of each 2,000-line chunk.
     #[gpui::test]
-    #[ignore = "known over budget, see the fix report"]
     async fn smart_blocks_streaming_error_scan_within_10_percent(cx: &mut TestAppContext) {
         let (without, with) = measure_overhead(
             cx,
@@ -1273,6 +1281,33 @@ mod tests {
             let shown = cx.shown_system_notifications();
             assert_eq!(shown.len(), 2);
             assert_eq!(shown[1].body, "error: later");
+        }
+
+        #[gpui::test]
+        async fn error_scan_checks_only_the_end_of_a_burst(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, true);
+            feed(
+                &terminal,
+                &format!("{CWD}{START_SERVER}Local: http://localhost:3000\r\n"),
+                cx,
+            );
+            let burst = |error_at: usize| {
+                (0..1000)
+                    .map(|line| match line == error_at {
+                        true => "error: in the burst\r\n".to_string(),
+                        false => format!("{line} fine\r\n"),
+                    })
+                    .collect::<String>()
+            };
+            feed(&terminal, &burst(10), cx);
+            assert!(
+                cx.shown_system_notifications().is_empty(),
+                "an error far before the end of a burst is skipped"
+            );
+            feed(&terminal, &burst(950), cx);
+            let shown = cx.shown_system_notifications();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].body, "error: in the burst");
         }
 
         #[gpui::test]

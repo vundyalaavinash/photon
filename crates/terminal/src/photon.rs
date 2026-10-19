@@ -294,6 +294,7 @@ impl Terminal {
             output_line: self.blocks()?.block(id)?.output_line?,
             end_line: self.blocks()?.block(id)?.end_line,
             from_line: None,
+            tail_lines: None,
             completed_only: false,
             truncate: false,
             max_lines,
@@ -304,12 +305,13 @@ impl Terminal {
     }
 
     /// Complete logical lines of a running block that start at or after `from_line`, at most
-    /// `max_lines` of them (the rest are left unread). The line holding the cursor is still
+    /// `max_lines` of them (the rest are left unread); with `tail_lines`, only the last that many. The line holding the cursor is still
     /// being printed, so it is left for a later read.
     pub fn block_new_output_lines(
         &self,
         id: BlockId,
         from_line: Option<i64>,
+        tail_lines: Option<usize>,
         max_lines: usize,
         max_bytes: usize,
     ) -> Option<Vec<photon_blocks::OutputLine>> {
@@ -318,6 +320,7 @@ impl Terminal {
             output_line: block.output_line?,
             end_line: block.end_line,
             from_line,
+            tail_lines,
             completed_only: true,
             truncate: true,
             max_lines,
@@ -375,6 +378,8 @@ struct OutputRead {
     output_line: i64,
     end_line: Option<i64>,
     from_line: Option<i64>,
+    /// Read only this many of the last logical lines; the earlier ones are skipped uncopied.
+    tail_lines: Option<usize>,
     /// Stop before the logical line holding the cursor.
     completed_only: bool,
     /// Stop at the limits with what was read, instead of returning None.
@@ -422,29 +427,63 @@ fn read_output_lines(
         first += 1;
     }
 
+    if let Some(tail) = read.tail_lines {
+        let mut starts = 0;
+        let mut row: Line = last;
+        while row >= first {
+            let above: Line = row - 1;
+            if row <= grid.topmost_line()
+                || !grid[above][last_column].flags.contains(Flags::WRAPLINE)
+            {
+                starts += 1;
+                if starts == tail {
+                    first = row;
+                    break;
+                }
+            }
+            row -= 1;
+        }
+    }
     let mut lines: Vec<photon_blocks::OutputLine> = Vec::new();
     let mut bytes = 0;
     let mut continuing = false;
     let mut line = first;
     while line <= last {
         let row = &grid[line];
-        let mut text = String::new();
+        let wraps = row[last_column].flags.contains(Flags::WRAPLINE);
+        let cells = &row[alacritty_terminal::index::Column(0)
+            ..alacritty_terminal::index::Column(grid.columns())];
+        // Trailing blanks are trimmed anyway unless the row continues on the next one.
+        let cells = if wraps {
+            cells
+        } else {
+            let used = cells
+                .iter()
+                .rposition(|cell| cell.c != ' ')
+                .map_or(0, |last| last + 1);
+            &cells[..used]
+        };
+        let mut text = String::with_capacity(cells.len());
         let mut in_tab = false;
-        for column in 0..grid.columns() {
-            let cell = &row[alacritty_terminal::index::Column(column)];
+        for (column, cell) in cells.iter().enumerate() {
             // A TAB leaves a '\t' cell followed by blank cells up to the next tab stop; read it
             // back as the single '\t' the program printed, as alacritty's own copy does.
             // ponytail: assumes the default 8-column tab stops; alacritty keeps custom stops
             // private.
-            if in_tab && column % TAB_WIDTH != 0 && cell.c == ' ' {
-                continue;
-            }
-            in_tab = cell.c == '\t';
-            if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            // Spacer cells are blank, so the flag check only matters for blanks.
+            if cell.c == ' ' {
+                if in_tab && column % TAB_WIDTH != 0 {
+                    continue;
+                }
+                in_tab = false;
+                if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    text.push(' ');
+                }
+            } else {
+                in_tab = cell.c == '\t';
                 text.push(cell.c);
             }
         }
-        let wraps = row[last_column].flags.contains(Flags::WRAPLINE);
         match lines.last_mut().filter(|_| continuing) {
             Some(open) => open.text.push_str(&text),
             None => lines.push(photon_blocks::OutputLine {
