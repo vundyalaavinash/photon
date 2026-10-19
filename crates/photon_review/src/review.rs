@@ -14,9 +14,10 @@ use editor::{
 };
 use futures::future::{join_all, try_join_all};
 use gpui::{
-    Action as _, AnyWindowHandle, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, Entity,
-    EntityId, EventEmitter, FocusHandle, Focusable, Global, HighlightStyle, PromptLevel, Render,
-    SharedString, Stateful, StyledText, Subscription, Task, WeakEntity, Window, actions, rgb,
+    Action as _, AnyWindowHandle, App, AsyncApp, AsyncWindowContext, BackgroundExecutor,
+    ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global,
+    HighlightStyle, PromptLevel, Render, SharedString, Stateful, StyledText, Subscription, Task,
+    WeakEntity, Window, actions, rgb,
 };
 use language::{Buffer, Capability, Point};
 use multi_buffer::{ToPoint as _, build_excerpt_ranges};
@@ -37,14 +38,14 @@ use crate::{
     CallerMark, ChangedFunction, Checkout, ChecksState, ContextCache, ContextError, ContextExcerpt,
     Draft, FileAnalysis, FileDiff, FileKind, FileStatus, FunctionContext, GhError, GhRunner,
     LoadedFile, MapFile, MapFunction, PostState, PrDetail, PrKey, PrSummary, Reanchor, RepoId,
-    ReviewDb, ReviewEvent, ReviewThread, Side, SinceReviewPlan, Step, ToggleChangesSinceReview,
-    Tracked, analyse_loaded_file, auth_status_request, base_text, build_loaded_file,
-    build_review_map, call_edges, caller_touched, candidate_repos, classify_caller, classify_path,
-    commentable_lines, context::buffer_path, context_excerpts, deleted_lines, detail_request,
-    fetch_url, find_clone, functions, gh_runner, git_diff, is_sendable, landing_note,
-    parse_auth_status, parse_detail, parse_mutation, parse_reply, place, plan_since_review,
-    prepare_checkout, reanchor, reply_request, resolve_request, review_request, review_root,
-    since_review_files, viewed_request,
+    ReviewDb, ReviewEvent, ReviewThread, SUMMARY_SLOT, Side, SinceReviewPlan, Step,
+    ToggleChangesSinceReview, Tracked, analyse_loaded_file, auth_status_request, base_text,
+    build_loaded_file, build_review_map, call_edges, caller_touched, candidate_repos,
+    classify_caller, classify_path, commentable_lines, context::buffer_path, context_excerpts,
+    deleted_lines, detail_request, fetch_url, find_clone, functions, gh_runner, git_diff,
+    is_sendable, landing_note, parse_auth_status, parse_detail, parse_mutation, parse_reply, place,
+    plan_since_review, prepare_checkout, reanchor, reply_request, reply_slot, resolve_request,
+    review_request, review_root, since_review_files, viewed_request,
 };
 
 actions!(
@@ -136,6 +137,71 @@ impl DraftSync {
     }
 }
 
+/// The database side of one composer's unsent text: the summary or a thread's reply. As with
+/// `DraftSync`, one writer drains it, so the newest text always lands last.
+#[derive(Default)]
+struct TextSync {
+    pending: Option<String>,
+    in_flight: bool,
+    latest: String,
+}
+
+fn queue_text_write(
+    sync: &Arc<Mutex<TextSync>>,
+    database: &ReviewDb,
+    key: &PrKey,
+    slot: &str,
+    body: String,
+    executor: &BackgroundExecutor,
+) {
+    {
+        let mut state = sync.lock();
+        state.latest = body.clone();
+        state.pending = Some(body);
+        if std::mem::replace(&mut state.in_flight, true) {
+            return;
+        }
+    }
+    let sync = sync.clone();
+    let database = database.clone();
+    let key = key.clone();
+    let slot = slot.to_string();
+    // Detached so closing the review never cancels the write of what the user typed.
+    executor
+        .spawn(async move {
+            loop {
+                let body = {
+                    let mut state = sync.lock();
+                    let Some(body) = state.pending.take() else {
+                        state.in_flight = false;
+                        return;
+                    };
+                    body
+                };
+                database
+                    .save_composer_text(key.clone(), slot.clone(), body)
+                    .await
+                    .log_err();
+            }
+        })
+        .detach();
+}
+
+/// Clears a sent composer's stored text unless it was edited after sending.
+fn clear_sent_text(
+    sync: &Arc<Mutex<TextSync>>,
+    sent: &str,
+    database: &ReviewDb,
+    key: &PrKey,
+    slot: &str,
+    executor: &BackgroundExecutor,
+) {
+    let unchanged = sync.lock().latest == sent;
+    if unchanged {
+        queue_text_write(sync, database, key, slot, String::new(), executor);
+    }
+}
+
 struct DraftView {
     local_id: usize,
     composer: Option<Entity<Editor>>,
@@ -179,6 +245,7 @@ pub struct ReviewItem {
     draft_views: Vec<DraftView>,
     next_draft_id: usize,
     reply_editors: HashMap<String, Entity<Editor>>,
+    text_syncs: HashMap<String, Arc<Mutex<TextSync>>>,
     comment_blocks: HashSet<CustomBlockId>,
     login: String,
     summary_editor: Entity<Editor>,
@@ -910,19 +977,39 @@ impl ReviewItem {
             .iter()
             .map(|file| (file.diff.path.clone(), commentable_lines(&file.diff)))
             .collect();
+        let composer_texts = database
+            .composer_texts(&detail.summary.key)
+            .log_err()
+            .unwrap_or_default();
         let summary_editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, COMPOSER_MAX_LINES as usize, window, cx);
             editor.set_placeholder_text("Leave a summary (optional)", window, cx);
+            if let Some(text) = composer_texts.get(SUMMARY_SLOT) {
+                editor.set_text(text.as_str(), window, cx);
+            }
             editor
         });
         // Comment is enabled by summary text, so the actions area redraws as it is typed.
-        subscriptions.push(
-            cx.subscribe(&summary_editor, |_, _, event: &EditorEvent, cx| {
+        subscriptions.push(cx.subscribe(
+            &summary_editor,
+            |this, editor, event: &EditorEvent, cx| {
                 if matches!(event, EditorEvent::BufferEdited) {
+                    let text = editor.read(cx).text(cx);
+                    this.queue_text(SUMMARY_SLOT, text, cx);
                     cx.notify();
                 }
-            }),
-        );
+            },
+        ));
+        let text_syncs = composer_texts
+            .iter()
+            .map(|(slot, text)| {
+                let sync = TextSync {
+                    latest: text.clone(),
+                    ..TextSync::default()
+                };
+                (slot.clone(), Arc::new(Mutex::new(sync)))
+            })
+            .collect();
         let stored_drafts = database
             .drafts(&detail.summary.key)
             .log_err()
@@ -966,6 +1053,7 @@ impl ReviewItem {
             draft_views: Vec::new(),
             next_draft_id: 0,
             reply_editors: HashMap::new(),
+            text_syncs,
             comment_blocks: HashSet::new(),
             login,
             summary_editor,
@@ -990,7 +1078,7 @@ impl ReviewItem {
         for draft in stored_drafts {
             this.push_draft(draft);
         }
-        this.add_reply_editors(window, cx);
+        this.add_reply_editors(&composer_texts, window, cx);
         this.rebuild_map(&[], cx);
         this._context_task = this.load_context(cx);
         this._reanchor_task = this.reanchor_drafts(cx);
@@ -1115,18 +1203,57 @@ impl ReviewItem {
     }
 
     /// Gives each thread without one a reply box, keeping what was typed in existing ones.
-    fn add_reply_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for thread in &self.detail.threads {
-            if self.reply_editors.contains_key(&thread.id) {
-                continue;
-            }
+    /// `stored` is unsent text from the database, by slot.
+    fn add_reply_editors(
+        &mut self,
+        stored: &HashMap<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_ids: Vec<String> = self
+            .detail
+            .threads
+            .iter()
+            .map(|thread| thread.id.clone())
+            .filter(|thread_id| !self.reply_editors.contains_key(thread_id))
+            .collect();
+        for thread_id in thread_ids {
+            let slot = reply_slot(&thread_id);
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
                 editor.set_placeholder_text("Reply…", window, cx);
+                if let Some(text) = stored.get(&slot) {
+                    editor.set_text(text.as_str(), window, cx);
+                }
                 editor
             });
-            self.reply_editors.insert(thread.id.clone(), editor);
+            self._subscriptions.push(cx.subscribe(
+                &editor,
+                move |this, editor, event: &EditorEvent, cx| {
+                    if matches!(event, EditorEvent::BufferEdited) {
+                        let text = editor.read(cx).text(cx);
+                        this.queue_text(&slot, text, cx);
+                    }
+                },
+            ));
+            self.reply_editors.insert(thread_id, editor);
         }
+    }
+
+    fn text_sync(&mut self, slot: &str) -> Arc<Mutex<TextSync>> {
+        self.text_syncs.entry(slot.to_string()).or_default().clone()
+    }
+
+    fn queue_text(&mut self, slot: &str, body: String, cx: &mut Context<Self>) {
+        let sync = self.text_sync(slot);
+        queue_text_write(
+            &sync,
+            &self.database,
+            &self.detail.summary.key,
+            slot,
+            body,
+            cx.background_executor(),
+        );
     }
 
     fn sendable_drafts(&self) -> usize {
@@ -1230,6 +1357,7 @@ impl ReviewItem {
         let key = self.detail.summary.key.clone();
         let head_sha = self.checkout.head_sha.clone();
         let summary = self.summary_editor.read(cx).text(cx);
+        let summary_sync = self.text_sync(SUMMARY_SLOT);
         let commentable = self.commentable.clone();
         let languages = self.draft_languages(cx);
         let marked: Vec<(usize, Arc<Mutex<DraftSync>>)> = self
@@ -1363,6 +1491,16 @@ impl ReviewItem {
                 posted
             });
             let review_open = finished.is_ok();
+            if !review_open {
+                clear_sent_text(
+                    &summary_sync,
+                    &summary,
+                    &database,
+                    &key,
+                    SUMMARY_SLOT,
+                    cx.background_executor(),
+                );
+            }
             let posted = match finished {
                 Ok(posted) => posted,
                 // The review closed while posting: each draft's latest queued version says
@@ -1429,7 +1567,7 @@ impl ReviewItem {
                     this.last_review = Some(commit.clone());
                 }
                 this.detail = detail;
-                this.add_reply_editors(window, cx);
+                this.add_reply_editors(&HashMap::new(), window, cx);
                 this.show_comments(cx);
                 cx.notify();
             })
@@ -1463,14 +1601,29 @@ impl ReviewItem {
         else {
             return Task::ready(Err(anyhow!("This thread has no comment to reply to.")));
         };
-        let request = reply_request(&self.detail.summary.key, first_comment.database_id, &body);
+        let key = self.detail.summary.key.clone();
+        let request = reply_request(&key, first_comment.database_id, &body);
         let runner = gh_runner(cx);
         let thread_id = thread_id.to_string();
+        let slot = reply_slot(&thread_id);
+        let reply_sync = self.text_sync(&slot);
+        let database = self.database.clone();
         cx.spawn(async move |this, cx| {
             let result = match runner.run(request).await {
                 Ok(output) => parse_reply(&output),
                 Err(error) => Err(error.into()),
             };
+            // The review may have closed meanwhile; the stored reply still goes once it's posted.
+            if result.is_ok() {
+                clear_sent_text(
+                    &reply_sync,
+                    &body,
+                    &database,
+                    &key,
+                    &slot,
+                    cx.background_executor(),
+                );
+            }
             this.update(cx, |this, cx| {
                 match &result {
                     Ok(comment) => {
@@ -4817,6 +4970,74 @@ fn verify_password(user: &str, password: &str) -> bool {
             assert!(item.submit_error.is_none());
             assert!(item.summary_editor.read(cx).text(cx).is_empty());
         });
+    }
+
+    fn reopen(
+        database: &ReviewDb,
+        cx: &mut TestAppContext,
+    ) -> impl std::future::Future<Output = (Entity<ReviewItem>, VisualTestContext, Arc<AtomicUsize>)>
+    {
+        open_item_with(
+            cx,
+            login_tree(),
+            vec![login_with_hunk()],
+            login_graph(),
+            true,
+            None,
+            false,
+            Some(database.clone()),
+        )
+    }
+
+    fn reply_editor(item: &Entity<ReviewItem>, cx: &mut VisualTestContext) -> Entity<Editor> {
+        item.read_with(cx, |item, _| {
+            item.reply_editors
+                .get("PRRT_1")
+                .cloned()
+                .expect("reply editor")
+        })
+    }
+
+    #[gpui::test]
+    async fn summary_and_reply_text_survive_a_reload(cx: &mut TestAppContext) {
+        let (item, mut item_cx, database) = open_with_drafts(cx, Vec::new()).await;
+        item.update_in(&mut item_cx, |item, window, cx| {
+            item.summary_editor
+                .update(cx, |editor, cx| editor.set_text("Mostly fine.", window, cx))
+        });
+        let editor = reply_editor(&item, &mut item_cx);
+        type_text(&editor, "Agreed.", &mut item_cx);
+        item_cx.run_until_parked();
+        drop(item);
+
+        let (item, mut item_cx, _) = reopen(&database, cx).await;
+        item.read_with(&item_cx, |item, cx| {
+            assert_eq!(item.summary_editor.read(cx).text(cx), "Mostly fine.");
+        });
+        let editor = reply_editor(&item, &mut item_cx);
+        assert_eq!(
+            editor.read_with(&item_cx, |editor, cx| editor.text(cx)),
+            "Agreed."
+        );
+
+        let fake = install_fake(&mut item_cx);
+        fake.respond(
+            |request| {
+                request
+                    .args
+                    .iter()
+                    .any(|argument| argument.ends_with("/replies"))
+            },
+            Ok(r#"{"id":2001,"user":{"login":"alice"},"body":"Agreed.","created_at":"t"}"#.into()),
+        );
+        fake.respond(is_review_post, Ok("{}".into()));
+        fake.respond(is_detail, Ok(DETAIL.into()));
+        let task = item.update(&mut item_cx, |item, cx| item.click_reply("PRRT_1", cx));
+        item_cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("replied");
+        submit(&item, crate::ReviewEvent::Comment, &mut item_cx).expect("submitted");
+        item_cx.run_until_parked();
+        assert!(database.composer_texts(&key()).expect("texts").is_empty());
     }
 
     #[gpui::test]

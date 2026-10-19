@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
@@ -7,6 +7,12 @@ use db::sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection};
 use crate::{PrKey, Side};
 
 pub struct ReviewDb(ThreadSafeConnection);
+
+pub const SUMMARY_SLOT: &str = "summary";
+
+pub fn reply_slot(thread_id: &str) -> String {
+    format!("reply:{thread_id}")
+}
 
 impl Domain for ReviewDb {
     const NAME: &str = "photon_review";
@@ -48,6 +54,15 @@ impl Domain for ReviewDb {
             PRIMARY KEY(host, owner, repo, number, step_key)
         ) STRICT;",
         "ALTER TABLE drafts ADD COLUMN sending INTEGER NOT NULL DEFAULT 0;",
+        "CREATE TABLE composer_texts(
+            host TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            slot TEXT NOT NULL,
+            body TEXT NOT NULL,
+            PRIMARY KEY(host, owner, repo, number, slot)
+        ) STRICT;",
     ];
 }
 
@@ -314,6 +329,44 @@ impl ReviewDb {
         .await
     }
 
+    /// Unsent composer text by slot: `SUMMARY_SLOT`, or `reply_slot(thread_id)`.
+    pub fn composer_texts(&self, key: &PrKey) -> Result<HashMap<String, String>> {
+        let number = i64::try_from(key.number)?;
+        Ok(
+            self.select_bound::<(String, String, String, i64), (String, String)>(
+                "SELECT slot, body FROM composer_texts
+                 WHERE host = ?1 AND owner = ?2 AND repo = ?3 AND number = ?4",
+            )?((
+                key.host.clone(),
+                key.owner.clone(),
+                key.repo.clone(),
+                number,
+            ))?
+            .into_iter()
+            .collect(),
+        )
+    }
+
+    /// Blank text removes the slot's row.
+    pub async fn save_composer_text(&self, key: PrKey, slot: String, body: String) -> Result<()> {
+        let number = i64::try_from(key.number)?;
+        self.write(move |connection| {
+            if body.trim().is_empty() {
+                connection.exec_bound::<(String, String, String, i64, String)>(
+                    "DELETE FROM composer_texts
+                     WHERE host = ?1 AND owner = ?2 AND repo = ?3 AND number = ?4 AND slot = ?5",
+                )?((key.host, key.owner, key.repo, number, slot))
+            } else {
+                connection.exec_bound::<(String, String, String, i64, String, String)>(
+                    "INSERT INTO composer_texts(host, owner, repo, number, slot, body)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(host, owner, repo, number, slot) DO UPDATE SET body = excluded.body",
+                )?((key.host, key.owner, key.repo, number, slot, body))
+            }
+        })
+        .await
+    }
+
     pub fn viewed_steps(&self, key: &PrKey) -> Result<HashSet<String>> {
         let number = i64::try_from(key.number)?;
         Ok(self.select_bound::<(String, String, String, i64), String>(
@@ -394,6 +447,42 @@ mod tests {
         db.untrack(key(7)).await.unwrap();
         assert_eq!(db.tracked().unwrap(), vec![tracked(9)]);
         assert_eq!(db.last_review(&key(7)).unwrap(), None);
+    }
+
+    #[gpui::test]
+    async fn composer_texts_round_trip(cx: &mut gpui::TestAppContext) {
+        let db = cx
+            .foreground_executor()
+            .block_test(ReviewDb::open_test_db("composer_texts_round_trip"));
+        db.save_composer_text(key(7), "summary".into(), "Looks good".into())
+            .await
+            .unwrap();
+        db.save_composer_text(key(7), "reply:PRRT_1".into(), "Agreed".into())
+            .await
+            .unwrap();
+        db.save_composer_text(key(9), "summary".into(), "Other".into())
+            .await
+            .unwrap();
+        db.save_composer_text(key(7), "summary".into(), "Looks great".into())
+            .await
+            .unwrap();
+        let texts = db.composer_texts(&key(7)).unwrap();
+        assert_eq!(
+            texts.get("summary").map(String::as_str),
+            Some("Looks great")
+        );
+        assert_eq!(
+            texts.get("reply:PRRT_1").map(String::as_str),
+            Some("Agreed")
+        );
+        assert_eq!(texts.len(), 2);
+
+        db.save_composer_text(key(7), "summary".into(), "  ".into())
+            .await
+            .unwrap();
+        let texts = db.composer_texts(&key(7)).unwrap();
+        assert_eq!(texts.get("summary"), None);
+        assert_eq!(texts.len(), 1);
     }
 
     fn draft(number: u64, path: &str, start_line: u32) -> Draft {
