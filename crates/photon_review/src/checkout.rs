@@ -316,6 +316,16 @@ pub async fn cleanup_checkout(checkout_repo: &Path, key: &PrKey, worktree: &Path
     Ok(())
 }
 
+/// For a worktree `cleanup_checkout` could not remove, such as one with deleted contents.
+pub(crate) async fn force_remove_worktree(checkout_repo: &Path, worktree: &Path) -> Result<()> {
+    safe_git(
+        checkout_repo,
+        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+    )
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 static COMMAND_LOG: parking_lot::Mutex<Vec<Vec<String>>> = parking_lot::Mutex::new(Vec::new());
 

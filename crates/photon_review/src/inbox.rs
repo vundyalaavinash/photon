@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use futures::future::join_all;
@@ -14,9 +14,10 @@ use workspace::{
 };
 
 use crate::{
-    ChecksState, GhError, GhRunner, Inbox, InboxGroup, PrSummary, ReviewDb, SinceReview,
-    auth_status_request, cleanup_checkout, gh_runner, inbox_request, parse_auth_status,
-    parse_inbox,
+    ChecksState, GhError, GhRunner, Inbox, InboxGroup, PrSummary, ReviewDb, SinceReview, Tracked,
+    auth_status_request,
+    checkout::{force_remove_worktree, review_root},
+    cleanup_checkout, gh_runner, inbox_request, parse_auth_status, parse_inbox,
 };
 
 actions!(
@@ -36,7 +37,17 @@ const EMPTY_INBOX_TEXT: &str = "No open pull requests.";
 pub(crate) fn init_inbox(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleInbox, window, cx| {
-            workspace.toggle_panel_focus::<InboxPanel>(window, cx);
+            let Some(panel) = workspace.panel::<InboxPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, _| panel.user_activated = true);
+            if workspace.toggle_panel_focus::<InboxPanel>(window, cx) {
+                panel.update(cx, |panel, cx| {
+                    if matches!(panel.state, InboxState::Idle) {
+                        panel.refresh(cx);
+                    }
+                });
+            }
         });
         workspace.register_action(|workspace, _: &RefreshInbox, _, cx| {
             if let Some(panel) = workspace.panel::<InboxPanel>(cx) {
@@ -158,6 +169,9 @@ pub struct InboxPanel {
     _workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     state: InboxState,
+    refreshing: bool,
+    // Dock restoration calls `set_active(true)` at startup; nothing may load until the user acts.
+    user_activated: bool,
     load_task: Task<()>,
 }
 
@@ -172,6 +186,8 @@ impl InboxPanel {
                     _workspace: workspace,
                     focus_handle: cx.focus_handle(),
                     state: InboxState::Idle,
+                    refreshing: false,
+                    user_activated: false,
                     load_task: Task::ready(()),
                 })
             })
@@ -185,11 +201,24 @@ impl InboxPanel {
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let runner = gh_runner(cx);
         let database = ReviewDb::global(cx);
-        self.state = InboxState::Loading;
+        self.user_activated = true;
+        self.refreshing = true;
+        if matches!(self.state, InboxState::Idle) {
+            self.state = InboxState::Loading;
+        }
         self.load_task = cx.spawn(async move |this, cx| {
-            let state = cx.background_spawn(load_inbox(runner, database)).await;
+            let (state, closed) = cx
+                .background_spawn({
+                    let database = database.clone();
+                    load_inbox(runner, database)
+                })
+                .await;
+            // Detached so a newer refresh never cancels a half-finished cleanup.
+            cx.background_spawn(cleanup_closed(closed, database, review_root()))
+                .detach();
             this.update(cx, |this, cx| {
                 this.state = state;
+                this.refreshing = false;
                 cx.notify();
             })
             .log_err();
@@ -204,16 +233,19 @@ fn failed(error: anyhow::Error) -> GhError {
     }
 }
 
-async fn load_inbox(runner: Arc<dyn GhRunner>, database: ReviewDb) -> InboxState {
+async fn load_inbox(runner: Arc<dyn GhRunner>, database: ReviewDb) -> (InboxState, Vec<Tracked>) {
     let hosts = match runner.run(auth_status_request()).await {
         Ok(output) => match parse_auth_status(&output) {
             Ok(hosts) => hosts,
-            Err(error) => return InboxState::Failed(failed(error)),
+            Err(error) => return (InboxState::Failed(failed(error)), Vec::new()),
         },
-        Err(error) => return InboxState::Failed(error),
+        Err(error) => return (InboxState::Failed(error), Vec::new()),
     };
     if hosts.is_empty() {
-        return InboxState::Failed(GhError::LoggedOut { host: None });
+        return (
+            InboxState::Failed(GhError::LoggedOut { host: None }),
+            Vec::new(),
+        );
     }
 
     let tracked = database.tracked().log_err().unwrap_or_default();
@@ -245,22 +277,50 @@ async fn load_inbox(runner: Arc<dyn GhRunner>, database: ReviewDb) -> InboxState
     }))
     .await;
 
+    let mut closed = Vec::new();
     for host in &results {
         let Ok(inbox) = &host.result else { continue };
-        for node_id in &inbox.closed_tracked {
-            let Some(closed) = tracked
+        closed.extend(
+            tracked
                 .iter()
-                .find(|tracked| tracked.key.host == host.host && &tracked.node_id == node_id)
-            else {
-                continue;
+                .filter(|tracked| {
+                    tracked.key.host == host.host && inbox.closed_tracked.contains(&tracked.node_id)
+                })
+                .cloned(),
+        );
+    }
+    (InboxState::Loaded(results), closed)
+}
+
+async fn cleanup_closed(closed: Vec<Tracked>, database: ReviewDb, review_root: PathBuf) {
+    for pull_request in closed {
+        let Tracked {
+            key,
+            repo_dir,
+            worktree,
+            ..
+        } = pull_request;
+        let mut cleaned = cleanup_checkout(&repo_dir, &key, &worktree).await;
+        if cleaned.is_err() && worktree.exists() {
+            // Only Photon's own worktree is forced or deleted; never `worktree prune`, which
+            // would touch the user's other worktrees.
+            let removed = match force_remove_worktree(&repo_dir, &worktree).await {
+                Ok(()) => Ok(()),
+                Err(error) if worktree.starts_with(&review_root) => {
+                    Err::<(), _>(error).log_err();
+                    std::fs::remove_dir_all(&worktree).map_err(anyhow::Error::from)
+                }
+                Err(error) => Err(error),
             };
-            let cleaned = cleanup_checkout(&closed.repo_dir, &closed.key, &closed.worktree).await;
-            if cleaned.log_err().is_some() {
-                database.untrack(closed.key.clone()).await.log_err();
-            }
+            cleaned = match removed {
+                Ok(()) => cleanup_checkout(&repo_dir, &key, &worktree).await,
+                Err(error) => Err(error),
+            };
+        }
+        if cleaned.log_err().is_some() {
+            database.untrack(key).await.log_err();
         }
     }
-    InboxState::Loaded(results)
 }
 
 impl EventEmitter<PanelEvent> for InboxPanel {}
@@ -312,7 +372,11 @@ impl Panel for InboxPanel {
 
     fn set_active(&mut self, active: bool, _: &mut Window, cx: &mut Context<Self>) {
         if active {
-            self.refresh(cx);
+            if self.user_activated {
+                self.refresh(cx);
+            }
+        } else {
+            self.user_activated = true;
         }
     }
 }
@@ -379,7 +443,15 @@ impl Render for InboxPanel {
             .overflow_y_scroll();
         let mut host_line_text = None;
         match &self.state {
-            InboxState::Idle => {}
+            InboxState::Idle => {
+                body = body.child(
+                    Button::new("photon-review-load", "Refresh to load")
+                        .style(ButtonStyle::Filled)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(RefreshInbox.boxed_clone(), cx)
+                        }),
+                )
+            }
             InboxState::Loading => body = body.child(Self::render_note("Loading…", Color::Muted)),
             InboxState::Failed(error) => {
                 body = body.child(Self::render_note(error.to_string(), Color::Error))
@@ -388,6 +460,9 @@ impl Render for InboxPanel {
                 host_line_text = Some(host_line(hosts));
                 let mut any_rows = false;
                 for host in hosts {
+                    if hosts.len() > 1 {
+                        body = body.child(Label::new(host.host.clone()));
+                    }
                     match &host.result {
                         Err(error) => {
                             body = body.child(Self::render_note(error.to_string(), Color::Error))
@@ -427,6 +502,13 @@ impl Render for InboxPanel {
                     .gap_2()
                     .justify_between()
                     .child(Label::new("Pull requests"))
+                    .when(self.refreshing, |header| {
+                        header.child(
+                            Label::new("Refreshing…")
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                        )
+                    })
                     .children(
                         host_line_text.map(|text| {
                             Label::new(text).color(Color::Muted).size(LabelSize::Small)
@@ -522,7 +604,10 @@ mod tests {
     }
 
     fn set_active(panel: &Entity<InboxPanel>, active: bool, cx: &mut VisualTestContext) {
-        panel.update_in(cx, |panel, window, cx| panel.set_active(active, window, cx));
+        panel.update_in(cx, |panel, window, cx| {
+            panel.user_activated = true;
+            panel.set_active(active, window, cx)
+        });
         cx.run_until_parked();
     }
 
@@ -726,6 +811,140 @@ mod tests {
         }
         assert_eq!(db.tracked().expect("tracked"), vec![]);
         drop(panel);
+    }
+
+    #[gpui::test]
+    async fn restored_open_dock_loads_nothing_until_user_acts(cx: &mut TestAppContext) {
+        let fake = FakeGh::new();
+        init_test(cx, &fake);
+        respond_auth(&fake, AUTH_ONE_HOST);
+        respond_inbox(&fake, "github.com");
+        let (workspace, panel, mut cx) = add_panel(cx).await;
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace
+                .right_dock()
+                .update(cx, |dock, cx| dock.set_open(true, window, cx));
+        });
+        cx.run_until_parked();
+        assert!(fake.requests().is_empty());
+        panel.read_with(&cx, |panel, _| {
+            assert!(matches!(panel.state(), InboxState::Idle))
+        });
+        render(&panel, &mut cx);
+
+        workspace.update_in(&mut cx, |_, window, cx| {
+            window.dispatch_action(RefreshInbox.boxed_clone(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(request_summary(&fake), ["auth", "api github.com"]);
+    }
+
+    #[gpui::test]
+    async fn toggling_the_panel_loads(cx: &mut TestAppContext) {
+        let fake = FakeGh::new();
+        init_test(cx, &fake);
+        respond_auth(&fake, AUTH_ONE_HOST);
+        respond_inbox(&fake, "github.com");
+        let (workspace, _panel, mut cx) = add_panel(cx).await;
+        workspace.update_in(&mut cx, |_, window, cx| {
+            window.dispatch_action(ToggleInbox.boxed_clone(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(request_summary(&fake), ["auth", "api github.com"]);
+    }
+
+    #[gpui::test]
+    async fn refresh_keeps_previous_list_visible(cx: &mut TestAppContext) {
+        let fake = FakeGh::new();
+        init_test(cx, &fake);
+        for _ in 0..2 {
+            respond_auth(&fake, AUTH_ONE_HOST);
+            respond_inbox(&fake, "github.com");
+        }
+        let (_workspace, panel, mut cx) = add_panel(cx).await;
+        set_active(&panel, true, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.refresh(cx);
+            assert!(panel.refreshing);
+            assert!(matches!(panel.state(), InboxState::Loaded(_)));
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| assert!(!panel.refreshing));
+    }
+
+    #[gpui::test]
+    async fn cleanup_force_removes_damaged_worktree(cx: &mut TestAppContext) {
+        use crate::checkout::git;
+        cx.executor().allow_parking();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let worktree = repo.path().join("pr-worktree");
+        let identity = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        git(repo.path(), &["init", "-q"]).await.expect("init");
+        git(
+            repo.path(),
+            &[
+                identity[0],
+                identity[1],
+                identity[2],
+                identity[3],
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        )
+        .await
+        .expect("commit");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &worktree.to_string_lossy(),
+            ],
+        )
+        .await
+        .expect("worktree add");
+        std::fs::remove_file(worktree.join(".git")).expect("damage worktree");
+        std::fs::write(worktree.join("leftover.txt"), "x").expect("leftover");
+        assert!(worktree.exists());
+
+        let fake = FakeGh::new();
+        init_test(cx, &fake);
+        let database = cx.update(|cx| ReviewDb::global(cx));
+        let key = PrKey {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            repo: "damaged".into(),
+            number: 9,
+        };
+        database
+            .track(Tracked {
+                key: key.clone(),
+                node_id: "PR_damaged".into(),
+                repo_dir: repo.path().to_path_buf(),
+                worktree: worktree.clone(),
+            })
+            .await
+            .expect("track");
+        let closed = database
+            .tracked()
+            .expect("tracked")
+            .into_iter()
+            .filter(|tracked| tracked.key == key)
+            .collect();
+        cleanup_closed(closed, database.clone(), repo.path().to_path_buf()).await;
+        assert!(!worktree.exists());
+        assert!(
+            database
+                .tracked()
+                .expect("tracked")
+                .iter()
+                .all(|tracked| tracked.key != key)
+        );
     }
 
     #[test]
