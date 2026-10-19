@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 use buffer_diff::BufferDiff;
-use gpui::{App, AppContext as _, Entity, Task};
+use gpui::{App, AppContext as _, AsyncApp, Entity, Task};
 use language::Buffer;
 use project::Project;
 
@@ -270,6 +270,28 @@ pub async fn base_text(worktree: &Path, commit: &str, file: &FileDiff) -> Result
     Ok(Some(git_raw(worktree, &["show", &object]).await?))
 }
 
+const RELOAD_ATTEMPTS: usize = 3;
+
+/// A newer reload of the buffer (the file watcher's, after the checkout wrote the file) replaces
+/// ours and cancels its receiver, so ours is retried until it lands. A dirty buffer keeps its
+/// edits, as with Zed's own watcher.
+async fn reload_from_disk(buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
+    for _ in 0..RELOAD_ATTEMPTS {
+        if buffer.read_with(cx, |buffer, _| buffer.is_dirty()) {
+            return;
+        }
+        if buffer
+            .update(cx, |buffer, cx| buffer.reload(cx))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        log::debug!("buffer reload was superseded, retrying");
+    }
+    log::warn!("buffer reload kept being superseded; showing its current text");
+}
+
 pub fn build_loaded_file(
     project: &Entity<Project>,
     abs_path: PathBuf,
@@ -304,7 +326,7 @@ pub fn build_loaded_file(
         // The project may still hold this buffer from a review of an older head; read the text
         // the checkout just wrote rather than waiting for the file watcher.
         if diff.status != FileStatus::Deleted {
-            buffer.update(cx, |buffer, cx| buffer.reload(cx)).await?;
+            reload_from_disk(&buffer, cx).await;
         }
         let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
         let buffer_diff = cx.new(|cx| {
@@ -336,6 +358,7 @@ mod tests {
     use serde_json::json;
     use settings::SettingsStore;
     use std::process::Command;
+    use std::sync::Arc;
 
     fn file(path: &str, status: FileStatus, binary: bool) -> FileDiff {
         FileDiff {
@@ -826,5 +849,47 @@ index 1..2 100644
             .await
             .expect("loaded");
         assert!(loaded.contents.is_none());
+    }
+
+    async fn open_text_buffer(cx: &mut TestAppContext) -> (Arc<FakeFs>, Entity<Buffer>) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/repo", json!({ "a.txt": "old\n" })).await;
+        let project = Project::test(fs.clone(), ["/repo".as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer("/repo/a.txt", cx)
+            })
+            .await
+            .expect("buffer");
+        (fs, buffer)
+    }
+
+    #[gpui::test]
+    async fn superseded_reload_still_reads_disk(cx: &mut TestAppContext) {
+        let (fs, buffer) = open_text_buffer(cx).await;
+        fs.insert_file("/repo/a.txt", b"new\n".to_vec()).await;
+        let mut async_cx = cx.to_async();
+        let mut reload = Box::pin(reload_from_disk(&buffer, &mut async_cx));
+        assert!(futures::poll!(reload.as_mut()).is_pending());
+        // Replaces our reload, as the file watcher's reload would.
+        let _newer = buffer.update(cx, |buffer, cx| buffer.reload(cx));
+        reload.await;
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "new\n");
+    }
+
+    #[gpui::test]
+    async fn reload_keeps_unsaved_edits(cx: &mut TestAppContext) {
+        let (fs, buffer) = open_text_buffer(cx).await;
+        buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "edited ")], None, cx));
+        fs.insert_file("/repo/a.txt", b"new\n".to_vec()).await;
+        reload_from_disk(&buffer, &mut cx.to_async()).await;
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "edited old\n"
+        );
     }
 }
