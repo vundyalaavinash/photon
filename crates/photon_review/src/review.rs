@@ -95,6 +95,9 @@ struct DraftSync {
     error: Option<SharedString>,
     /// Woken when the queue runs dry, so Submit can wait for its marks to land.
     idle_waiters: Vec<futures::channel::oneshot::Sender<()>>,
+    /// The draft as last queued, or `None` once discarded, for settling a submit that finishes
+    /// after its review closed.
+    latest: Option<Draft>,
 }
 
 /// An empty body is never stored, so emptying a draft removes its row until text comes back.
@@ -702,6 +705,32 @@ fn claim_sync(sync: &Mutex<DraftSync>) -> bool {
     !std::mem::replace(&mut sync.lock().in_flight, true)
 }
 
+/// Runs the draft's queued writes now, unless a writer is already running them.
+async fn flush_sync(
+    this: &WeakEntity<ReviewItem>,
+    local_id: usize,
+    sync: &Arc<Mutex<DraftSync>>,
+    database: &ReviewDb,
+    cx: &mut AsyncApp,
+) {
+    if claim_sync(sync) {
+        drain_sync(this.clone(), local_id, sync.clone(), database.clone(), cx).await;
+    }
+}
+
+/// Queues the draft's last known text with a new post state, for when the review has closed.
+fn requeue_latest(sync: &Mutex<DraftSync>, post_state: PostState) {
+    let mut state = sync.lock();
+    let latest = state
+        .latest
+        .clone()
+        .filter(|draft| !draft.body.trim().is_empty());
+    if let Some(mut latest) = latest {
+        latest.post_state = post_state;
+        state.pending = Some(PendingWrite::Save(latest));
+    }
+}
+
 /// Runs a draft's queued writes in order. It works whether or not the review is still open, so a
 /// delete queued after the review closes still follows any save in flight.
 async fn drain_sync(
@@ -1020,27 +1049,19 @@ impl ReviewItem {
         let key = self.detail.summary.key.clone();
         let head_sha = self.checkout.head_sha.clone();
         let summary = self.summary_editor.read(cx).text(cx);
+        let commentable = self.commentable.clone();
         let languages = self.draft_languages(cx);
-        let request = review_request(
-            &key,
-            &head_sha,
-            event,
-            summary.trim(),
-            &self.drafts,
-            &self.commentable,
-            &|path| languages.get(path).cloned(),
-        );
-        let sent: Vec<(usize, Arc<Mutex<DraftSync>>, String)> = self
+        let marked: Vec<(usize, Arc<Mutex<DraftSync>>)> = self
             .drafts
             .iter()
             .zip(&self.draft_views)
             .filter(|(draft, _)| is_sendable(draft, &head_sha))
-            .map(|(draft, view)| (view.local_id, view.sync.clone(), draft.body.clone()))
+            .map(|(_, view)| (view.local_id, view.sync.clone()))
             .collect();
         // Marked through each draft's own queue, so the mark lands after any save in flight,
         // a first insert included, and the request waits until every queue has run dry.
         let mut marks = Vec::new();
-        for (local_id, sync, _) in &sent {
+        for (local_id, sync) in &marked {
             if let Some(index) = self.draft_index(*local_id) {
                 self.drafts[index].post_state = PostState::Sending;
                 self.queue_save(*local_id, cx);
@@ -1062,10 +1083,37 @@ impl ReviewItem {
             for idle in marks {
                 idle.await.ok();
             }
-            let unmarked = sent.iter().any(|(_, sync, _)| {
+            // Built after the wait from each draft's latest version, which works even if the
+            // review closed: a draft removed or emptied meanwhile is left out, and one edited
+            // meanwhile goes with its newer text.
+            let mut sent = Vec::new();
+            let mut drafts = Vec::new();
+            let mut unmarked = false;
+            for (local_id, sync) in &marked {
                 let state = sync.lock();
-                state.error.is_some() || state.id.is_none()
-            });
+                let Some(latest) = state
+                    .latest
+                    .as_ref()
+                    .filter(|draft| !draft.body.trim().is_empty())
+                else {
+                    continue;
+                };
+                unmarked |= state.error.is_some() || state.id.is_none();
+                drafts.push(Draft {
+                    post_state: PostState::Unposted,
+                    ..latest.clone()
+                });
+                sent.push((*local_id, sync.clone(), latest.body.clone()));
+            }
+            let request = review_request(
+                &key,
+                &head_sha,
+                event,
+                summary.trim(),
+                &drafts,
+                &commentable,
+                &|path| languages.get(path).cloned(),
+            );
             let posted = if unmarked {
                 Err(anyhow!(
                     "Couldn't save the drafts before posting, so nothing was sent."
@@ -1073,26 +1121,42 @@ impl ReviewItem {
             } else {
                 runner.run(request).await.map_err(anyhow::Error::from)
             };
+
             if let Err(error) = posted {
-                // A closed review leaves its rows marked: they may need a second look, but they
-                // are never lost or sent twice.
-                this.update(cx, |this, cx| {
-                    this.submitting = false;
-                    this.submit_error = Some(format!("{error:#}").into());
-                    for (local_id, _, _) in &sent {
-                        if let Some(index) = this.draft_index(*local_id) {
-                            this.drafts[index].post_state = PostState::Unposted;
-                            this.queue_save(*local_id, cx);
+                let review_open = this
+                    .update(cx, |this, cx| {
+                        this.submitting = false;
+                        this.submit_error = Some(format!("{error:#}").into());
+                        for (local_id, _) in &marked {
+                            if let Some(index) = this.draft_index(*local_id) {
+                                this.drafts[index].post_state = PostState::Unposted;
+                                this.queue_save(*local_id, cx);
+                            }
                         }
+                        cx.notify();
+                    })
+                    .is_ok();
+                // Nothing reached GitHub, so the marks are cleared even if the review closed.
+                if !review_open {
+                    for (local_id, sync) in &marked {
+                        requeue_latest(sync, PostState::Unposted);
+                        flush_sync(&this, *local_id, sync, &database, cx).await;
                     }
-                    cx.notify();
-                })
-                .log_err();
+                }
                 return Err(error);
             }
 
             let finished = this.update_in(cx, |this, window, cx| {
                 this.submitting = false;
+                // Emptied while waiting, so left out of the review.
+                for (local_id, _) in &marked {
+                    let left_out = sent.iter().all(|(sent_id, _, _)| sent_id != local_id);
+                    if let Some(index) = this.draft_index(*local_id)
+                        && left_out
+                    {
+                        this.drafts[index].post_state = PostState::Unposted;
+                    }
+                }
                 let mut posted = Vec::new();
                 for (local_id, sync, body) in &sent {
                     let Some(index) = this.draft_index(*local_id) else {
@@ -1118,16 +1182,29 @@ impl ReviewItem {
                 posted
             });
             let review_open = finished.is_ok();
-            let posted = finished.unwrap_or_else(|_| {
-                sent.iter()
+            let posted = match finished {
+                Ok(posted) => posted,
+                // The review closed while posting: each draft's latest queued version says
+                // whether it was edited after it was sent.
+                Err(_) => sent
+                    .iter()
+                    .filter(|(_, sync, body)| {
+                        let latest_body = sync.lock().latest.as_ref().map(|d| d.body.clone());
+                        let edited = latest_body
+                            .is_some_and(|latest| latest != *body && !latest.trim().is_empty());
+                        if edited {
+                            requeue_latest(sync, PostState::EarlierVersionPosted);
+                        }
+                        !edited
+                    })
                     .map(|(local_id, sync, _)| (*local_id, sync.clone()))
-                    .collect()
-            });
-            for (local_id, sync) in posted {
+                    .collect(),
+            };
+            for (_, sync) in &posted {
                 sync.lock().pending = Some(PendingWrite::DeleteRow);
-                if claim_sync(&sync) {
-                    drain_sync(this.clone(), local_id, sync, database.clone(), cx).await;
-                }
+            }
+            for (local_id, sync, _) in &sent {
+                flush_sync(&this, *local_id, sync, &database, cx).await;
             }
 
             let mut problem = match database.set_last_review(key, head_sha).await {
@@ -1388,6 +1465,7 @@ impl ReviewItem {
         self.next_draft_id += 1;
         let sync = Arc::new(Mutex::new(DraftSync {
             id: draft.id,
+            latest: Some(draft.clone()),
             ..DraftSync::default()
         }));
         self.drafts.push(draft);
@@ -1450,7 +1528,11 @@ impl ReviewItem {
             PendingWrite::Save(draft.clone())
         };
         let sync = self.draft_views[index].sync.clone();
-        sync.lock().pending = Some(write);
+        {
+            let mut state = sync.lock();
+            state.pending = Some(write);
+            state.latest = Some(draft.clone());
+        }
         self.start_sync(local_id, sync, cx);
     }
 
@@ -1470,7 +1552,11 @@ impl ReviewItem {
         };
         self.drafts.remove(index);
         let view = self.draft_views.remove(index);
-        view.sync.lock().pending = Some(PendingWrite::DeleteRow);
+        {
+            let mut state = view.sync.lock();
+            state.pending = Some(PendingWrite::DeleteRow);
+            state.latest = None;
+        }
         self.start_sync(local_id, view.sync, cx);
         self.show_comments(cx);
         cx.notify();
@@ -4758,15 +4844,28 @@ fn verify_password(user: &str, password: &str) -> bool {
             vec![current_draft("src/login.rs", 3, "    audit(user);")],
         )
         .await;
-        let fake = install_fake(&mut cx);
+        let fake = FakeGh::new();
         fake.respond(is_review_post, Ok("{}".into()));
         fake.respond(is_detail, Ok(DETAIL.into()));
+        let (release, gate) = futures::channel::oneshot::channel::<()>();
+        cx.update(|_, cx| {
+            crate::set_gh_runner(
+                Arc::new(GatedGh {
+                    fake: fake.clone(),
+                    gate: gate.shared(),
+                }),
+                cx,
+            )
+        });
         let task = item.update_in(&mut cx, |item, window, cx| {
-            let task = item.submit(crate::ReviewEvent::Comment, window, cx);
+            item.submit(crate::ReviewEvent::Comment, window, cx)
+        });
+        cx.run_until_parked();
+        item.update(&mut cx, |item, cx| {
             item.drafts[0].body = "Edited while posting".into();
             item.queue_save(0, cx);
-            task
         });
+        release.send(()).expect("release");
         cx.run_until_parked();
         task.now_or_never().expect("finished").expect("posted");
         item.read_with(&cx, |item, _| {
@@ -4802,5 +4901,106 @@ fn verify_password(user: &str, password: &str) -> bool {
         let stored = database.drafts(&key()).expect("drafts");
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].post_state, PostState::Unposted);
+    }
+
+    /// Answers like the fake, but only once the gate opens.
+    struct GatedGh {
+        fake: Arc<FakeGh>,
+        gate: Gate,
+    }
+
+    impl GhRunner for GatedGh {
+        fn run(
+            &self,
+            request: crate::GhRequest,
+        ) -> futures::future::BoxFuture<'static, Result<String, GhError>> {
+            let answer = self.fake.run(request);
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                gate.await.ok();
+                answer.await
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn edit_during_post_survives_closing_the_review(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(
+            cx,
+            vec![current_draft("src/login.rs", 3, "    audit(user);")],
+        )
+        .await;
+        let fake = FakeGh::new();
+        fake.respond(is_review_post, Ok("{}".into()));
+        let (release, gate) = futures::channel::oneshot::channel::<()>();
+        cx.update(|_, cx| {
+            crate::set_gh_runner(
+                Arc::new(GatedGh {
+                    fake: fake.clone(),
+                    gate: gate.shared(),
+                }),
+                cx,
+            )
+        });
+        let task = item.update_in(&mut cx, |item, window, cx| {
+            item.submit(crate::ReviewEvent::Comment, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(fake.requests().len(), 1);
+        item.update(&mut cx, |item, cx| {
+            item.drafts[0].body = "Edited while posting".into();
+            item.queue_save(0, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.remove_window());
+        drop(item);
+        release.send(()).expect("release");
+        cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("posted");
+        let stored = database.drafts(&key()).expect("drafts");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].body, "Edited while posting");
+        assert_eq!(stored[0].post_state, PostState::EarlierVersionPosted);
+    }
+
+    #[gpui::test]
+    async fn drafts_removed_or_emptied_while_waiting_are_left_out(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(
+            cx,
+            vec![
+                current_draft("src/login.rs", 3, "    audit(user);"),
+                current_draft("src/login.rs", 5, "}"),
+                current_draft("src/login.rs", 2, "    let user = user.trim();"),
+            ],
+        )
+        .await;
+        let fake = install_fake(&mut cx);
+        fake.respond(is_review_post, Ok("{}".into()));
+        fake.respond(is_detail, Ok(DETAIL.into()));
+        let task = item.update_in(&mut cx, |item, window, cx| {
+            let task = item.submit(crate::ReviewEvent::Comment, window, cx);
+            item.discard_draft(0, cx);
+            if let Some(index) = item.draft_index(1) {
+                item.drafts[index].body = String::new();
+            }
+            item.queue_save(1, cx);
+            task
+        });
+        cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("posted");
+        let posts: Vec<_> = fake.requests().into_iter().filter(is_review_post).collect();
+        let comments = request_json(&posts[0])["comments"].clone();
+        assert_eq!(comments.as_array().expect("comments").len(), 1);
+        assert_eq!(comments[0]["line"], 2);
+        assert!(database.drafts(&key()).expect("drafts").is_empty());
+        item.read_with(&cx, |item, _| {
+            assert!(item.submit_error.is_none());
+            let left: Vec<_> = item
+                .drafts()
+                .iter()
+                .map(|draft| (draft.body.as_str(), draft.post_state))
+                .collect();
+            assert_eq!(left, vec![("", PostState::Unposted)]);
+        });
     }
 }
