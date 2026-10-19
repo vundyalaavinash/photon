@@ -124,17 +124,6 @@ pub fn build_review_map(
             union_find.union(caller, callee);
         }
     }
-    let mut callees_of = vec![Vec::new(); functions.len()];
-    for &(caller, callee) in &edges {
-        if let Some(callees) = callees_of.get_mut(caller) {
-            callees.push(callee);
-        }
-    }
-    for component in strongly_connected_components(&callees_of, &is_node) {
-        for &member in &component {
-            union_find.union(component[0], member);
-        }
-    }
     let connected: BTreeSet<usize> = edges
         .iter()
         .flat_map(|&(caller, callee)| [caller, callee])
@@ -148,34 +137,57 @@ pub fn build_review_map(
         union_find.union(first, index);
     }
 
-    let mut members_by_root: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for index in (0..functions.len()).filter(|&index| node_at(index)) {
-        members_by_root
-            .entry(union_find.find(index))
-            .or_default()
-            .push(index);
-    }
-    let mut clusters: Vec<Vec<usize>> = members_by_root.into_values().collect();
-    for members in &mut clusters {
-        members.sort_by_key(|&index| sort_key(index));
-    }
-    clusters.sort_by_key(|members| members.first().map(|&index| sort_key(index)));
+    // Merging by file can make the cluster graph cyclic even when the function
+    // graph is not, so keep merging cyclic clusters until it is a DAG.
+    let (clusters, cluster_of, cluster_edges) = loop {
+        let mut members_by_root: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for index in (0..functions.len()).filter(|&index| node_at(index)) {
+            members_by_root
+                .entry(union_find.find(index))
+                .or_default()
+                .push(index);
+        }
+        let mut clusters: Vec<Vec<usize>> = members_by_root.into_values().collect();
+        for members in &mut clusters {
+            members.sort_by_key(|&index| sort_key(index));
+        }
+        clusters.sort_by_key(|members| members.first().map(|&index| sort_key(index)));
 
-    let mut cluster_of = vec![usize::MAX; functions.len()];
-    for (cluster_index, members) in clusters.iter().enumerate() {
-        for &member in members {
-            if let Some(slot) = cluster_of.get_mut(member) {
-                *slot = cluster_index;
+        let mut cluster_of = vec![usize::MAX; functions.len()];
+        for (cluster_index, members) in clusters.iter().enumerate() {
+            for &member in members {
+                if let Some(slot) = cluster_of.get_mut(member) {
+                    *slot = cluster_index;
+                }
             }
         }
-    }
+        let cluster_edges: BTreeSet<(usize, usize)> = edges
+            .iter()
+            .map(|&(caller, callee)| (cluster_of[caller], cluster_of[callee]))
+            .filter(|(caller, callee)| caller != callee)
+            .collect();
+        let mut callees_of = vec![Vec::new(); clusters.len()];
+        for &(caller, callee) in &cluster_edges {
+            callees_of[caller].push(callee);
+        }
+        let cycles = strongly_connected_components(&callees_of);
+        if cycles.is_empty() {
+            break (clusters, cluster_of, cluster_edges);
+        }
+        for cycle in cycles {
+            let mut first_functions = cycle
+                .iter()
+                .filter_map(|&cluster| clusters[cluster].first());
+            if let Some(&anchor) = first_functions.next() {
+                for &other in first_functions {
+                    union_find.union(anchor, other);
+                }
+            }
+        }
+    };
+
     let mut pending_callees = vec![0usize; clusters.len()];
     let mut callers_of = vec![Vec::new(); clusters.len()];
-    let cluster_edges: BTreeSet<(usize, usize)> = edges
-        .iter()
-        .map(|&(caller, callee)| (cluster_of[caller], cluster_of[callee]))
-        .filter(|(caller, callee)| caller != callee)
-        .collect();
     for &(caller, callee) in &cluster_edges {
         pending_callees[caller] += 1;
         callers_of[callee].push(caller);
@@ -196,6 +208,18 @@ pub fn build_review_map(
             }
         }
     }
+    // Unreachable while the loop above guarantees a DAG; never drop a function.
+    if order.len() < clusters.len() {
+        let emitted: BTreeSet<usize> = order.iter().copied().collect();
+        order.extend((0..clusters.len()).filter(|cluster| !emitted.contains(cluster)));
+    }
+
+    let mut has_in_cluster_caller = vec![false; functions.len()];
+    for &(caller, callee) in &edges {
+        if cluster_of[caller] == cluster_of[callee] {
+            has_in_cluster_caller[callee] = true;
+        }
+    }
 
     let mut steps = Vec::new();
     for cluster in order {
@@ -203,11 +227,7 @@ pub fn build_review_map(
         let main = members
             .iter()
             .copied()
-            .find(|&member| {
-                !edges
-                    .iter()
-                    .any(|&(caller, callee)| callee == member && cluster_of[caller] == cluster)
-            })
+            .find(|&member| !has_in_cluster_caller[member])
             .or_else(|| members.first().copied());
         let Some(main) = main.and_then(|main| functions.get(main)) else {
             continue;
@@ -318,69 +338,68 @@ impl UnionFind {
     }
 }
 
-/// Tarjan's algorithm; components with a single member are omitted.
-fn strongly_connected_components(callees_of: &[Vec<usize>], is_node: &[bool]) -> Vec<Vec<usize>> {
-    struct State<'a> {
-        callees_of: &'a [Vec<usize>],
-        next_index: usize,
-        indices: Vec<Option<usize>>,
-        low_links: Vec<usize>,
-        on_stack: Vec<bool>,
-        stack: Vec<usize>,
-        components: Vec<Vec<usize>>,
-    }
-
-    // Recursion depth is bounded by the longest chain of changed functions.
-    fn visit(state: &mut State, node: usize) {
-        state.indices[node] = Some(state.next_index);
-        state.low_links[node] = state.next_index;
-        state.next_index += 1;
-        state.stack.push(node);
-        state.on_stack[node] = true;
-        let callees_of = state.callees_of;
-        for &callee in &callees_of[node] {
-            match state.indices[callee] {
-                None => {
-                    visit(state, callee);
-                    state.low_links[node] = state.low_links[node].min(state.low_links[callee]);
-                }
-                Some(callee_index) if state.on_stack[callee] => {
-                    state.low_links[node] = state.low_links[node].min(callee_index);
-                }
-                Some(_) => {}
-            }
-        }
-        if state.indices[node] == Some(state.low_links[node]) {
-            let mut component = Vec::new();
-            while let Some(member) = state.stack.pop() {
-                state.on_stack[member] = false;
-                component.push(member);
-                if member == node {
-                    break;
-                }
-            }
-            if component.len() > 1 {
-                state.components.push(component);
-            }
-        }
-    }
-
+/// Iterative Tarjan (an explicit stack, so deep call chains cannot overflow
+/// the thread stack); components with a single member are omitted.
+fn strongly_connected_components(callees_of: &[Vec<usize>]) -> Vec<Vec<usize>> {
     let size = callees_of.len();
-    let mut state = State {
-        callees_of,
-        next_index: 0,
-        indices: vec![None; size],
-        low_links: vec![0; size],
-        on_stack: vec![false; size],
-        stack: Vec::new(),
-        components: Vec::new(),
-    };
-    for node in (0..size).filter(|&node| is_node.get(node).copied().unwrap_or(false)) {
-        if state.indices[node].is_none() {
-            visit(&mut state, node);
+    let mut indices: Vec<Option<usize>> = vec![None; size];
+    let mut low_links = vec![0usize; size];
+    let mut on_stack = vec![false; size];
+    let mut component_stack = Vec::new();
+    let mut components = Vec::new();
+    let mut next_index = 0;
+
+    for root in 0..size {
+        if indices[root].is_some() {
+            continue;
+        }
+        let mut call_stack = vec![(root, 0usize)];
+        indices[root] = Some(next_index);
+        low_links[root] = next_index;
+        next_index += 1;
+        component_stack.push(root);
+        on_stack[root] = true;
+
+        while let Some(&mut (node, ref mut next_edge)) = call_stack.last_mut() {
+            if let Some(&callee) = callees_of[node].get(*next_edge) {
+                *next_edge += 1;
+                match indices[callee] {
+                    None => {
+                        indices[callee] = Some(next_index);
+                        low_links[callee] = next_index;
+                        next_index += 1;
+                        component_stack.push(callee);
+                        on_stack[callee] = true;
+                        call_stack.push((callee, 0));
+                    }
+                    Some(callee_index) if on_stack[callee] => {
+                        low_links[node] = low_links[node].min(callee_index);
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
+
+            call_stack.pop();
+            if let Some(&(parent, _)) = call_stack.last() {
+                low_links[parent] = low_links[parent].min(low_links[node]);
+            }
+            if indices[node] == Some(low_links[node]) {
+                let mut component = Vec::new();
+                while let Some(member) = component_stack.pop() {
+                    on_stack[member] = false;
+                    component.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                if component.len() > 1 {
+                    components.push(component);
+                }
+            }
         }
     }
-    state.components
+    components
 }
 
 #[cfg(test)]
@@ -615,5 +634,74 @@ mod tests {
             .collect();
         let shuffled = build_review_map(&reversed_files, &reversed_functions, &reversed_edges);
         assert_eq!(keys(&baseline), keys(&shuffled));
+    }
+
+    #[test]
+    fn weakly_connected_file_clusters_forming_a_cycle_are_merged() {
+        let files = [file("a.rs", FileKind::Code), file("b.rs", FileKind::Code)];
+        let functions = [
+            function("a.rs", "f", 1),
+            function("a.rs", "g", 2),
+            function("a.rs", "z", 3),
+            function("b.rs", "p", 1),
+            function("b.rs", "q", 2),
+            function("b.rs", "r", 3),
+        ];
+        let edges = [(0, 2), (1, 2), (3, 5), (4, 5), (0, 3), (4, 1)];
+        let steps = build_review_map(&files, &functions, &edges);
+        assert_eq!(steps.len(), 1);
+        assert_every_function_once(&steps, functions.len());
+    }
+
+    fn assert_every_function_once(steps: &[Step], function_count: usize) {
+        let mut seen: Vec<usize> = steps
+            .iter()
+            .flat_map(|step| step.functions.iter().copied())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, (0..function_count).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn random_graphs_keep_every_function_exactly_once() {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for _ in 0..200 {
+            let file_count = 1 + next(4);
+            let files: Vec<MapFile> = (0..file_count)
+                .map(|index| file(&format!("f{index}.rs"), FileKind::Code))
+                .collect();
+            let function_count = 1 + next(12);
+            let functions: Vec<MapFunction> = (0..function_count)
+                .map(|index| {
+                    function(
+                        &format!("f{}.rs", next(file_count)),
+                        &format!("n{index}"),
+                        index as u32,
+                    )
+                })
+                .collect();
+            let edges: Vec<(usize, usize)> = (0..next(25))
+                .map(|_| (next(function_count), next(function_count)))
+                .collect();
+            let steps = build_review_map(&files, &functions, &edges);
+            assert_every_function_once(&steps, function_count);
+        }
+    }
+
+    #[test]
+    fn long_call_chain_does_not_overflow() {
+        let count = 200_000;
+        let files = [file("a.rs", FileKind::Code)];
+        let functions: Vec<MapFunction> = (0..count)
+            .map(|index| function("a.rs", &format!("n{index}"), index as u32))
+            .collect();
+        let edges: Vec<(usize, usize)> = (0..count - 1).map(|index| (index, index + 1)).collect();
+        assert_eq!(build_review_map(&files, &functions, &edges).len(), 1);
     }
 }
