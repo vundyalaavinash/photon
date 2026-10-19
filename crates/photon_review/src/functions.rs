@@ -147,23 +147,66 @@ fn strip_modifiers(mut text: &str) -> &str {
 }
 
 /// Outlines of most languages give no body range, so the header is cut at the first top-level
-/// `{` or `;`, or at the `:` that ends a Python `def`.
+/// `;`, at the `:` that ends a Python `def`, right after an arrow function's `=>`, or at a `{`
+/// that opens a body: one at top level not following a `:` return-type marker, or one directly
+/// after `)` at any depth, as in a `function () {` callback passed to a call.
 fn header_of(text: &str) -> &str {
     let python_def = strip_keyword(strip_modifiers(strip_visibility(text)), "def").is_some();
-    let mut nesting = 0usize;
+    // One entry per open bracket, true once a `:` annotation starts inside it: a `=>` there
+    // belongs to a function type such as `(cb: (x: number) => void)`, not to an arrow function.
+    let mut annotations: Vec<bool> = Vec::new();
     let mut previous = ' ';
     for (index, character) in text.char_indices() {
+        let in_annotation = annotations.last().copied().unwrap_or(false);
         match character {
-            '(' | '[' | '<' => nesting += 1,
-            ')' | ']' => nesting = nesting.saturating_sub(1),
-            '>' if previous != '-' && previous != '=' => nesting = nesting.saturating_sub(1),
-            '{' | ';' if nesting == 0 => return &text[..index],
-            ':' if python_def && nesting == 0 => return &text[..index],
+            '{' if previous == ')' || (annotations.is_empty() && previous != ':') => {
+                return &text[..index];
+            }
+            '(' | '[' | '<' | '{' => annotations.push(in_annotation),
+            ')' | ']' | '}' => {
+                annotations.pop();
+            }
+            '>' if previous == '=' && !in_annotation => return &text[..index + 1],
+            '>' if previous != '-' && previous != '=' => {
+                annotations.pop();
+            }
+            ';' if annotations.is_empty() => return &text[..index],
+            ':' if python_def && annotations.is_empty() => return &text[..index],
+            ':' | ',' => {
+                let outer = annotations
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|outer| annotations.get(outer))
+                    .copied()
+                    .unwrap_or(false);
+                if let Some(current) = annotations.last_mut() {
+                    *current = character == ':' || outer;
+                }
+            }
             _ => {}
         }
-        previous = character;
+        if !character.is_whitespace() {
+            previous = character;
+        }
     }
     text
+}
+
+// `type(text) {` is a method named `type`; a type keyword is followed by a name, or by `<` as in
+// Rust's `impl<T>`.
+fn starts_with_type_keyword(kind: &str) -> bool {
+    TYPE_KEYWORDS
+        .iter()
+        .chain(["object"].iter())
+        .any(|keyword| {
+            kind.strip_prefix(keyword).is_some_and(|rest| {
+                rest.starts_with('<')
+                    || (rest.starts_with(char::is_whitespace)
+                        && rest.trim_start().starts_with(|character: char| {
+                            character.is_alphabetic() || character == '_' || character == '$'
+                        }))
+            })
+        })
 }
 
 fn assigns_at_top_level(header: &str) -> bool {
@@ -190,12 +233,7 @@ fn assigns_at_top_level(header: &str) -> bool {
 
 fn is_callable(header: &str) -> bool {
     let kind = strip_modifiers(header);
-    if TYPE_KEYWORDS
-        .iter()
-        .chain(["object"].iter())
-        .any(|keyword| strip_keyword(kind, keyword).is_some())
-        || !kind.contains('(')
-    {
+    if starts_with_type_keyword(kind) || !kind.contains('(') {
         return false;
     }
     // `const LIMIT: Duration = Duration::from_secs(1)` is a value, `const run = () => {}` is not.
@@ -816,5 +854,96 @@ function top(a: number, b: number): number {
             functions(analyse_with(cx, TYPESCRIPT, &head, Some(typescript_lang())).await);
         assert_eq!(found, vec![]);
         assert_eq!(rows, vec![3..4]);
+    }
+
+    const CALLBACKS: &str = "\
+import { x } from './x';
+
+describe('suite', () => {
+    it('adds', () => {
+        expect(1).toBe(1);
+    });
+});
+
+const handler = useCallback((e) => {
+    console.log(e);
+}, []);
+
+const f = (a) =>
+    compute(a);
+";
+
+    async fn analyse_typescript(
+        cx: &mut TestAppContext,
+        base: &str,
+        head: &str,
+    ) -> Vec<(String, FunctionChange)> {
+        functions(analyse_with(cx, base, head, Some(typescript_lang())).await).0
+    }
+
+    #[gpui::test]
+    async fn typescript_test_block_body_edit_is_body_only(cx: &mut TestAppContext) {
+        let head = CALLBACKS.replace("toBe(1)", "toBe(2)");
+        let found = analyse_typescript(cx, CALLBACKS, &head).await;
+        assert_eq!(found, vec![("adds".into(), FunctionChange::BodyOnly)]);
+    }
+
+    #[gpui::test]
+    async fn typescript_use_callback_body_edit_is_body_only(cx: &mut TestAppContext) {
+        let head = CALLBACKS.replace("console.log(e)", "console.info(e)");
+        let found = analyse_typescript(cx, CALLBACKS, &head).await;
+        assert_eq!(found, vec![("handler".into(), FunctionChange::BodyOnly)]);
+    }
+
+    #[gpui::test]
+    async fn typescript_expression_arrow_body_edit_is_body_only(cx: &mut TestAppContext) {
+        let head = CALLBACKS.replace("compute(a);", "compute(a) + 1;");
+        let found = analyse_typescript(cx, CALLBACKS, &head).await;
+        assert_eq!(found, vec![("f".into(), FunctionChange::BodyOnly)]);
+    }
+
+    #[gpui::test]
+    async fn typescript_arrow_parameter_change_is_signature(cx: &mut TestAppContext) {
+        let head = CALLBACKS.replace("f = (a) =>", "f = (a, b) =>");
+        let found = analyse_typescript(cx, CALLBACKS, &head).await;
+        assert_eq!(found, vec![("f".into(), FunctionChange::Signature)]);
+    }
+
+    #[gpui::test]
+    async fn methods_named_like_type_keywords_are_callable(cx: &mut TestAppContext) {
+        let base = "\
+class Recorder {
+    type(text: string) {
+        return text;
+    }
+
+    record(event: string) {
+        return event;
+    }
+}
+";
+        let head = base.replace("return text;", "return text + 1;");
+        let found = analyse_typescript(cx, base, &head).await;
+        assert_eq!(found, vec![("type".into(), FunctionChange::BodyOnly)]);
+
+        let head = base.replace("return event;", "return event + 1;");
+        let found = analyse_typescript(cx, base, &head).await;
+        assert_eq!(found, vec![("record".into(), FunctionChange::BodyOnly)]);
+    }
+
+    #[gpui::test]
+    async fn typescript_object_return_type_is_part_of_the_signature(cx: &mut TestAppContext) {
+        let base = "\
+function shape(): { a: number } {
+    return { a: 1 };
+}
+";
+        let head = base.replace("a: number", "a: string");
+        let found = analyse_typescript(cx, base, &head).await;
+        assert_eq!(found, vec![("shape".into(), FunctionChange::Signature)]);
+
+        let head = base.replace("a: 1", "a: 2");
+        let found = analyse_typescript(cx, base, &head).await;
+        assert_eq!(found, vec![("shape".into(), FunctionChange::BodyOnly)]);
     }
 }
