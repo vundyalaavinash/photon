@@ -331,6 +331,11 @@ pub(crate) async fn force_remove_worktree(checkout_repo: &Path, worktree: &Path)
 static COMMAND_LOG: parking_lot::Mutex<Vec<Vec<String>>> = parking_lot::Mutex::new(Vec::new());
 
 pub(crate) async fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    Ok(git_raw(dir, args).await?.trim().to_string())
+}
+
+// Patches and file contents must keep their trailing whitespace, which `git` trims.
+pub(crate) async fn git_raw(dir: &Path, args: &[&str]) -> Result<String> {
     #[cfg(test)]
     COMMAND_LOG.lock().push(
         ["-C".to_string(), dir.to_string_lossy().into_owned()]
@@ -349,7 +354,7 @@ pub(crate) async fn git(dir: &Path, args: &[&str]) -> Result<String> {
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]

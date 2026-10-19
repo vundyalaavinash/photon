@@ -17,9 +17,11 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+buffer_diff.workspace = true
 db.workspace = true
 futures.workspace = true
 gpui.workspace = true
+language.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
 project.workspace = true
@@ -30,6 +32,7 @@ util.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+fs = { workspace = true, features = ["test-support"] }
 db = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

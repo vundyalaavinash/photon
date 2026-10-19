@@ -1,10 +1,12 @@
 mod checkout;
+mod diff;
 mod gh;
 mod github;
 mod inbox;
 mod store;
 
 pub use checkout::*;
+pub use diff::*;
 pub use gh::*;
 pub use github::*;
 pub use inbox::*;
