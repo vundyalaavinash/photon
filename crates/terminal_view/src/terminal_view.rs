@@ -4831,6 +4831,13 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(selected(&terminal_view, &mut cx), Some(id));
+        let workspace = terminal_view.read_with(&cx, |view, _| view.workspace.upgrade());
+        let active = workspace
+            .expect("workspace")
+            .read_with(&cx, |workspace, cx| {
+                workspace.active_item(cx).map(|item| item.item_id())
+            });
+        assert_eq!(active, Some(terminal_view.entity_id()));
     }
 
     #[gpui::test]

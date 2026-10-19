@@ -331,6 +331,15 @@ impl TerminalView {
     /// Brings the window and this terminal forward and selects the block a notification is about.
     pub(crate) fn focus_block(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
         window.activate_window();
+        if let Some(workspace) = self.workspace.upgrade() {
+            let item = cx.entity();
+            // The workspace reads this view while activating it, so it must not be mid-update.
+            window.defer(cx, move |window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.activate_item(&item, true, true, window, cx);
+                });
+            });
+        }
         self.focus_handle.focus(window, cx);
         if active_blocks(self.terminal.read(cx)).is_some_and(|blocks| blocks.block(id).is_some()) {
             self.selected_block = Some(id);

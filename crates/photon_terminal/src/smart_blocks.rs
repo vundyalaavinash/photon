@@ -44,6 +44,9 @@ struct NotificationRouter {
 impl Global for NotificationRouter {}
 
 fn route_notification_response(response: SystemNotificationResponse, cx: &mut App) {
+    if !TerminalSettings::get_global(cx).smart_blocks {
+        return;
+    }
     let Some((terminal_id, block_id)) = response
         .tag
         .strip_prefix(NOTIFICATION_TAG_PREFIX)
@@ -137,7 +140,11 @@ impl SmartBlocks {
             cx.on_system_notification_response(route_notification_response);
         }
         let this = cx.weak_entity();
-        cx.global_mut::<NotificationRouter>().listeners.push(this);
+        let router = cx.global_mut::<NotificationRouter>();
+        router
+            .listeners
+            .retain(|listener| listener.upgrade().is_some());
+        router.listeners.push(this);
         Self {
             terminal,
             workspace,
@@ -393,11 +400,9 @@ impl SmartBlocks {
         match event {
             Event::BlocksChanged(change) => {
                 self.forget_removed_blocks(cx);
-                if let Some(BlockEvent::Finished(id)) = change {
+                if let (true, Some(BlockEvent::Finished(id))) = (enabled, change) {
                     self.notify_finished(*id, cx);
-                    if enabled {
-                        self.recognise_block(*id, cx);
-                    }
+                    self.recognise_block(*id, cx);
                 }
             }
             Event::Wakeup if enabled => {
@@ -514,9 +519,6 @@ impl SmartBlocks {
     }
 
     fn scan_running_server_for_errors(&mut self, cx: &mut Context<Self>) {
-        if self.window_active {
-            return;
-        }
         let Some(id) = self
             .terminal
             .read(cx)
@@ -525,13 +527,16 @@ impl SmartBlocks {
         else {
             return;
         };
-        if !self.urls.contains_key(&id) {
-            return;
-        }
         let scan = self.error_scans.entry(id).or_default();
         let Some(lines) = read_new_lines(self.terminal.read(cx), id, scan) else {
             return;
         };
+        // Output the user could see, or that came before the server was up, is skipped so
+        // it never turns into a stale notification; the budget only counts what is watched.
+        if self.window_active || !self.urls.contains_key(&id) {
+            scan.lines = 0;
+            return;
+        }
         if self.error_cooldowns.contains_key(&id) {
             return;
         }
@@ -549,7 +554,7 @@ impl SmartBlocks {
         };
         cx.show_system_notification(SystemNotification {
             tag: self.notification_tag(id),
-            title: format!("Error in {command}").into(),
+            title: format!("Error in {}", shortened_command(&command)).into(),
             body: error_line
                 .text
                 .trim()
@@ -589,12 +594,7 @@ impl SmartBlocks {
             return;
         }
         let mark = if exit_code == 0 { "✓" } else { "✗" };
-        let command = if block.command.chars().count() > NOTIFIED_COMMAND_CHARS {
-            let cut: String = block.command.chars().take(NOTIFIED_COMMAND_CHARS).collect();
-            format!("{cut}…")
-        } else {
-            block.command.clone()
-        };
+        let command = shortened_command(&block.command);
         let notification = SystemNotification {
             tag: self.notification_tag(id),
             title: format!("{mark} {command}").into(),
@@ -611,6 +611,15 @@ impl SmartBlocks {
             id.0
         )
         .into()
+    }
+}
+
+fn shortened_command(command: &str) -> String {
+    if command.chars().count() > NOTIFIED_COMMAND_CHARS {
+        let cut: String = command.chars().take(NOTIFIED_COMMAND_CHARS).collect();
+        format!("{cut}…")
+    } else {
+        command.to_string()
     }
 }
 
@@ -992,6 +1001,38 @@ mod tests {
             let shown = cx.shown_system_notifications();
             assert_eq!(shown.len(), 2);
             assert_eq!(shown[1].body, "error: later");
+        }
+
+        #[gpui::test]
+        async fn smart_blocks_off_does_not_notify(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, false);
+            notify_after(1, cx);
+            run_for_over_a_second(&terminal, cx);
+            feed(
+                &terminal,
+                &format!("{CWD}{START_SERVER}Local: http://localhost:3000\r\nerror: boom\r\n"),
+                cx,
+            );
+            assert!(cx.shown_system_notifications().is_empty());
+        }
+
+        #[gpui::test]
+        async fn error_seen_while_active_is_not_reported_later(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, true);
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            feed(
+                &terminal,
+                &format!("{CWD}{START_SERVER}Local: http://localhost:3000\r\nerror: seen\r\n"),
+                cx,
+            );
+            cx.deactivate_window();
+            feed(&terminal, "fine\r\n", cx);
+            assert!(cx.shown_system_notifications().is_empty());
+            feed(&terminal, "error: new\r\n", cx);
+            let shown = cx.shown_system_notifications();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].body, "error: new");
         }
 
         #[gpui::test]
