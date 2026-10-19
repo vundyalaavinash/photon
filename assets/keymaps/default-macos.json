@@ -1433,8 +1433,8 @@
     },
   },
   {
-    // photon: step through the errors of the selected (or newest) test or build block.
-    "context": "Terminal && photon_blocks",
+    // photon: step through the errors of the selected (or newest) test or build block; a running program gets F8.
+    "context": "Terminal && photon_blocks && !photon_keys_to_pty",
     "use_key_equivalents": true,
     "bindings": {
       "f8": "photon_terminal::NextBlockError",

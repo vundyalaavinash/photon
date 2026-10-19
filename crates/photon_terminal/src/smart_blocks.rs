@@ -9,8 +9,8 @@ use gpui::{
     SystemNotification, SystemNotificationResponse, Task, WeakEntity, Window,
 };
 use photon_blocks::{
-    BlockEvent, BlockId, Insight, MAX_INSIGHT_BYTES, MAX_INSIGHT_LINES, OutputLine, RunDelta,
-    StatusFile, compare_runs, find_local_url, format_duration, is_error_line, recognise,
+    Block, BlockEvent, BlockId, Insight, MAX_INSIGHT_BYTES, MAX_INSIGHT_LINES, OutputLine,
+    RunDelta, StatusFile, compare_runs, find_local_url, format_duration, is_error_line, recognise,
 };
 use settings::Settings as _;
 use terminal::{Event, Terminal, terminal_settings::TerminalSettings};
@@ -22,10 +22,10 @@ use crate::chips::run_git;
 /// How many output lines of a running block are searched for a local URL.
 const URL_SCAN_LINE_LIMIT: usize = 2_000;
 
-/// At most one dev-server error notification per block in this time.
 /// A burst larger than this is only checked at its end: notifications are throttled anyway, and
 /// copying every line of a large burst out of the grid would stall the UI thread.
 const ERROR_SCAN_TAIL_LINES: usize = 200;
+/// At most one dev-server error notification per block in this time.
 const ERROR_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(60);
 const NOTIFICATION_TAG_PREFIX: &str = "photon-block-";
 const NOTIFIED_COMMAND_CHARS: usize = 60;
@@ -107,12 +107,22 @@ pub enum RowMark {
     Discarded,
 }
 
+/// An insight with where the grid had the block when it was read: its line numbers mean
+/// nothing once a width change re-wraps the grid.
+struct Recognised {
+    insight: Insight,
+    output_line: i64,
+    columns: usize,
+}
+
 /// What finished and running command blocks turned out to be, computed off the UI thread.
 pub struct SmartBlocks {
     terminal: Entity<Terminal>,
     workspace: WeakEntity<Workspace>,
-    insights: HashMap<BlockId, Insight>,
-    row_marks: HashMap<(BlockId, i64), RowMark>,
+    insights: HashMap<BlockId, Recognised>,
+    /// The grid's width when insights were last checked against it.
+    columns: usize,
+    row_marks: HashMap<(BlockId, String), RowMark>,
     deltas: HashMap<BlockId, RunDelta>,
     urls: HashMap<BlockId, String>,
     scans: HashMap<BlockId, UrlScan>,
@@ -150,10 +160,12 @@ impl SmartBlocks {
             .listeners
             .retain(|listener| listener.upgrade().is_some());
         router.listeners.push(this);
+        let columns = terminal.read(cx).grid_columns();
         Self {
             terminal,
             workspace,
             insights: HashMap::default(),
+            columns,
             row_marks: HashMap::default(),
             deltas: HashMap::default(),
             urls: HashMap::default(),
@@ -169,7 +181,16 @@ impl SmartBlocks {
     }
 
     pub fn insight(&self, id: BlockId) -> Option<&Insight> {
-        self.insights.get(&id)
+        self.insights.get(&id).map(|recognised| &recognised.insight)
+    }
+
+    /// The insight only while its line numbers still match the grid; after a width change it is
+    /// hidden until the block is recognised again.
+    pub fn located_insight(&self, block: &Block, grid_columns: usize) -> Option<&Insight> {
+        self.insights
+            .get(&block.id)
+            .filter(|recognised| is_located(recognised, block, grid_columns))
+            .map(|recognised| &recognised.insight)
     }
 
     pub fn delta(&self, id: BlockId) -> Option<&RunDelta> {
@@ -180,18 +201,18 @@ impl SmartBlocks {
         self.urls.get(&id).map(String::as_str)
     }
 
-    pub fn row_mark(&self, id: BlockId, absolute_line: i64) -> Option<RowMark> {
-        self.row_marks.get(&(id, absolute_line)).copied()
+    pub fn row_mark(&self, id: BlockId, path: &str) -> Option<RowMark> {
+        self.row_marks.get(&(id, path.to_string())).copied()
     }
 
     pub fn stage(&mut self, id: BlockId, absolute_line: i64, cx: &mut Context<Self>) {
-        let Some(file) = self.status_file(id, absolute_line) else {
+        let Some(file) = self.status_file(id, absolute_line, cx) else {
             return;
         };
         let path = file.path.clone();
         self.run_git_action(
             id,
-            vec![absolute_line],
+            vec![path.clone()],
             ["add", "--", &path],
             RowMark::Staged,
             cx,
@@ -199,11 +220,11 @@ impl SmartBlocks {
     }
 
     pub fn stage_all(&mut self, id: BlockId, cx: &mut Context<Self>) {
-        let Some(Insight::GitStatus { files }) = self.insights.get(&id) else {
+        let Some(Insight::GitStatus { files }) = self.insight(id) else {
             return;
         };
-        let lines = files.iter().map(|file| file.absolute_line).collect();
-        self.run_git_action(id, lines, ["add", "-A"], RowMark::Staged, cx);
+        let paths = files.iter().map(|file| file.path.clone()).collect();
+        self.run_git_action(id, paths, ["add", "-A"], RowMark::Staged, cx);
     }
 
     /// Asks first: `git restore` throws the changes away for good.
@@ -214,7 +235,7 @@ impl SmartBlocks {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(file) = self.status_file(id, absolute_line) else {
+        let Some(file) = self.status_file(id, absolute_line, cx) else {
             return;
         };
         let path = file.path.clone();
@@ -232,7 +253,7 @@ impl SmartBlocks {
             this.update(cx, |this, cx| {
                 this.run_git_action(
                     id,
-                    vec![absolute_line],
+                    vec![path.clone()],
                     ["restore", "--", &path],
                     RowMark::Discarded,
                     cx,
@@ -246,7 +267,7 @@ impl SmartBlocks {
     pub fn open_diff(&self, id: BlockId, absolute_line: i64, window: &mut Window, cx: &mut App) {
         let (Some(block_paths), Some(file)) = (
             self.block_paths(id, cx),
-            self.status_file(id, absolute_line),
+            self.status_file(id, absolute_line, cx),
         ) else {
             return;
         };
@@ -331,8 +352,12 @@ impl SmartBlocks {
         );
     }
 
-    fn status_file(&self, id: BlockId, absolute_line: i64) -> Option<&StatusFile> {
-        let Some(Insight::GitStatus { files }) = self.insights.get(&id) else {
+    fn status_file(&self, id: BlockId, absolute_line: i64, cx: &App) -> Option<&StatusFile> {
+        let terminal = self.terminal.read(cx);
+        let block = terminal.blocks()?.block(id)?;
+        let Some(Insight::GitStatus { files }) =
+            self.located_insight(block, terminal.grid_columns())
+        else {
             return None;
         };
         files
@@ -358,7 +383,7 @@ impl SmartBlocks {
     fn run_git_action<const N: usize>(
         &mut self,
         id: BlockId,
-        lines: Vec<i64>,
+        paths: Vec<String>,
         args: [&str; N],
         mark: RowMark,
         cx: &mut Context<Self>,
@@ -376,8 +401,8 @@ impl SmartBlocks {
             };
             this.update(cx, |this, cx| match result {
                 Ok(_) => {
-                    for line in lines {
-                        this.row_marks.insert((id, line), mark);
+                    for path in paths {
+                        this.row_marks.insert((id, path), mark);
                     }
                     cx.emit(SmartBlocksEvent::Changed);
                 }
@@ -409,6 +434,9 @@ impl SmartBlocks {
                 if let (true, Some(BlockEvent::Finished(id))) = (enabled, change) {
                     self.notify_finished(*id, cx);
                     self.recognise_block(*id, cx);
+                }
+                if enabled {
+                    self.recognise_moved_blocks(cx);
                 }
             }
             Event::Wakeup if enabled => {
@@ -453,11 +481,43 @@ impl SmartBlocks {
         }
     }
 
+    /// A width change re-wraps the grid and moves blocks' lines, so insights that point at
+    /// lines are read again.
+    fn recognise_moved_blocks(&mut self, cx: &mut Context<Self>) {
+        let terminal = self.terminal.read(cx);
+        let columns = terminal.grid_columns();
+        if columns == self.columns {
+            return;
+        }
+        self.columns = columns;
+        let Some(blocks) = terminal.blocks() else {
+            return;
+        };
+        let moved: Vec<BlockId> = self
+            .insights
+            .iter()
+            .filter(|(id, recognised)| {
+                has_line_numbers(&recognised.insight)
+                    && !blocks
+                        .block(**id)
+                        .is_some_and(|block| is_located(recognised, block, columns))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in moved {
+            self.recognise_block(id, cx);
+        }
+    }
+
     fn recognise_block(&mut self, id: BlockId, cx: &mut Context<Self>) {
         let terminal = self.terminal.read(cx);
         let Some(block) = terminal.blocks().and_then(|blocks| blocks.block(id)) else {
             return;
         };
+        let Some(output_line) = block.output_line else {
+            return;
+        };
+        let columns = terminal.grid_columns();
         let command = block.command.clone();
         let exit_code = block.exit_code;
         let Some(read_lines) =
@@ -473,30 +533,47 @@ impl SmartBlocks {
             let insight = task.await;
             this.update(cx, |this, cx| {
                 this.tasks.remove(&id);
-                this.store_insight(id, insight, cx);
+                this.store_insight(id, insight, output_line, columns, cx);
             })
             .log_err();
         });
         self.tasks.insert(id, task);
     }
 
-    fn store_insight(&mut self, id: BlockId, insight: Option<Insight>, cx: &mut Context<Self>) {
-        let exists = self
-            .terminal
-            .read(cx)
-            .blocks()
-            .is_some_and(|blocks| blocks.block(id).is_some());
-        let Some(insight) = insight.filter(|_| exists) else {
+    fn store_insight(
+        &mut self,
+        id: BlockId,
+        insight: Option<Insight>,
+        output_line: i64,
+        columns: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal = self.terminal.read(cx);
+        let Some(block) = terminal.blocks().and_then(|blocks| blocks.block(id)) else {
             return;
         };
-        if let Insight::Tests(run) = &insight
+        let Some(insight) = insight else {
+            return;
+        };
+        let recognised = Recognised {
+            insight,
+            output_line,
+            columns,
+        };
+        // The width changed while the output was read, so it was read from the wrong lines.
+        let moved = has_line_numbers(&recognised.insight)
+            && !is_located(&recognised, block, terminal.grid_columns());
+        if let Insight::Tests(run) = &recognised.insight
             && let Some(delta) = self
                 .previous_run(id, cx)
                 .map(|previous| compare_runs(previous, run))
         {
             self.deltas.insert(id, delta);
         }
-        self.insights.insert(id, insight);
+        self.insights.insert(id, recognised);
+        if moved {
+            self.recognise_block(id, cx);
+        }
         cx.emit(SmartBlocksEvent::Changed);
     }
 
@@ -510,7 +587,7 @@ impl SmartBlocks {
             .skip_while(|block| block.id != id)
             .skip(1)
             .filter(|block| block.command == current.command && block.cwd == current.cwd)
-            .find_map(|block| match self.insights.get(&block.id) {
+            .find_map(|block| match self.insight(block.id) {
                 Some(Insight::Tests(run)) => Some(run),
                 _ => None,
             })
@@ -655,6 +732,14 @@ impl SmartBlocks {
         )
         .into()
     }
+}
+
+fn has_line_numbers(insight: &Insight) -> bool {
+    matches!(insight, Insight::GitStatus { .. } | Insight::GitLog { .. })
+}
+
+fn is_located(recognised: &Recognised, block: &Block, grid_columns: usize) -> bool {
+    recognised.columns == grid_columns && block.output_line == Some(recognised.output_line)
 }
 
 fn shortened_command(command: &str) -> String {
@@ -1534,10 +1619,10 @@ mod tests {
             let line = files[0].absolute_line;
             smart.update(&mut cx, |smart, cx| smart.stage(id, line, cx));
             wait_until(&mut cx, |cx| {
-                smart.read_with(cx, |smart, _| smart.row_mark(id, line).is_some())
+                smart.read_with(cx, |smart, _| smart.row_mark(id, "a.txt").is_some())
             });
             smart.read_with(&cx, |smart, _| {
-                assert!(matches!(smart.row_mark(id, line), Some(RowMark::Staged)));
+                assert!(matches!(smart.row_mark(id, "a.txt"), Some(RowMark::Staged)));
             });
             assert_eq!(
                 git_stdout(path, &["diff", "--cached", "--name-only"]).await,
@@ -1562,7 +1647,7 @@ mod tests {
             let line = status_files(&smart, id, &mut cx)[0].absolute_line;
             smart.update(&mut cx, |smart, cx| smart.stage(id, line, cx));
             wait_until(&mut cx, |cx| {
-                smart.read_with(cx, |smart, _| smart.row_mark(id, line).is_some())
+                smart.read_with(cx, |smart, _| smart.row_mark(id, "a.txt").is_some())
             });
             assert_eq!(
                 git_stdout(path, &["diff", "--cached", "--name-only"]).await,
@@ -1589,7 +1674,7 @@ mod tests {
             let line = files[0].absolute_line;
             smart.update(&mut cx, |smart, cx| smart.stage(id, line, cx));
             wait_until(&mut cx, |cx| {
-                smart.read_with(cx, |smart, _| smart.row_mark(id, line).is_some())
+                smart.read_with(cx, |smart, _| smart.row_mark(id, "a b.txt").is_some())
             });
             assert_eq!(
                 git_stdout(path, &["diff", "--cached", "--name-only"]).await,
@@ -1623,7 +1708,9 @@ mod tests {
                 std::fs::read_to_string(path.join("a.txt")).expect("read"),
                 "two"
             );
-            smart.read_with(&cx, |smart, _| assert!(smart.row_mark(id, line).is_none()));
+            smart.read_with(&cx, |smart, _| {
+                assert!(smart.row_mark(id, "a.txt").is_none())
+            });
 
             smart.update_in(&mut cx, |smart, window, cx| {
                 smart.discard(id, line, window, cx)
@@ -1631,10 +1718,13 @@ mod tests {
             cx.run_until_parked();
             cx.simulate_prompt_answer("Discard");
             wait_until(&mut cx, |cx| {
-                smart.read_with(cx, |smart, _| smart.row_mark(id, line).is_some())
+                smart.read_with(cx, |smart, _| smart.row_mark(id, "a.txt").is_some())
             });
             smart.read_with(&cx, |smart, _| {
-                assert!(matches!(smart.row_mark(id, line), Some(RowMark::Discarded)));
+                assert!(matches!(
+                    smart.row_mark(id, "a.txt"),
+                    Some(RowMark::Discarded)
+                ));
             });
             assert_eq!(
                 std::fs::read_to_string(path.join("a.txt")).expect("read"),
@@ -1662,7 +1752,9 @@ mod tests {
             wait_until(&mut cx, |cx| {
                 workspace.read_with(cx, |workspace, _| workspace.has_notification(&toast))
             });
-            smart.read_with(&cx, |smart, _| assert!(smart.row_mark(id, line).is_none()));
+            smart.read_with(&cx, |smart, _| {
+                assert!(smart.row_mark(id, "missing.txt").is_none())
+            });
         }
     }
 }

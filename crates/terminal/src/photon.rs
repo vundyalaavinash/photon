@@ -254,6 +254,11 @@ impl Terminal {
         cx.emit(Event::BlocksChanged(None));
     }
 
+    /// The grid's width, which moves to a new size only when the resize is processed.
+    pub fn grid_columns(&self) -> usize {
+        self.term.lock().columns()
+    }
+
     /// Absolute line of the first visible row.
     pub fn top_absolute_line(&self) -> i64 {
         top_absolute_line(&self.term.lock())

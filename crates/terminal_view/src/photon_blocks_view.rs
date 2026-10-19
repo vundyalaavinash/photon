@@ -16,7 +16,7 @@ use workspace::searchable::SearchEvent;
 
 use crate::{
     TerminalMode, TerminalView,
-    photon_smart_blocks_view::{block_summary, block_toolbar},
+    photon_smart_blocks_view::{block_summary, block_toolbar, delta_text},
 };
 
 actions!(
@@ -104,6 +104,7 @@ pub(crate) fn layout_block_chrome(
     };
     let screen_rows = i32::try_from(screen_rows).unwrap_or(i32::MAX);
     let top_absolute_line = terminal.top_absolute_line();
+    let at_prompt = terminal.input_target() == InputTarget::BlockInput;
     visible_blocks(blocks, top_absolute_line, screen_rows)
         .iter()
         .filter_map(|visible| {
@@ -136,7 +137,10 @@ pub(crate) fn layout_block_chrome(
             // The selected block's toolbar takes the metadata's place on the header row.
             let toolbar_covers_metadata = is_selected
                 && metadata_row.is_none()
-                && smart_blocks.is_some_and(|smart| !block_toolbar(block, smart).is_empty());
+                && smart_blocks.is_some_and(|smart| {
+                    !block_toolbar(block, smart, at_prompt).is_empty()
+                        || smart.delta(block.id).and_then(delta_text).is_some()
+                });
             let metadata = [
                 block
                     .cwd

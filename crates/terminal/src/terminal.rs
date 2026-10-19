@@ -1849,6 +1849,8 @@ impl Terminal {
                 resize(term, new_bounds);
                 if let (Some(blocks), Some(distances)) = (&mut self.blocks, block_distances) {
                     blocks.restore_from_cursor(term, &distances);
+                    // photon: smart blocks read again the blocks whose lines moved.
+                    cx.emit(Event::BlocksChanged(None));
                 }
                 if columns_changed {
                     self.reset_cwd_history();

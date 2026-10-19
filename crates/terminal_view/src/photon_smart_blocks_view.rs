@@ -10,7 +10,7 @@ use photon_blocks::{
 use photon_terminal::{RowMark, SmartBlocks, TableItem};
 use settings::Settings as _;
 use terminal::terminal_settings::TerminalSettings;
-use terminal::{BlockPart, PathLikeTarget};
+use terminal::{BlockPart, InputTarget, PathLikeTarget};
 use ui::{ButtonSize, ContextMenu, prelude::*};
 use util::ResultExt as _;
 use workspace::{Pane, Workspace};
@@ -212,12 +212,18 @@ pub(crate) fn block_summary(
     )
 }
 
-pub(crate) fn block_toolbar(block: &Block, smart_blocks: &SmartBlocks) -> Vec<ToolbarButton> {
+/// `at_prompt`: the shell waits for a command, so a re-run would not be typed into a program.
+pub(crate) fn block_toolbar(
+    block: &Block,
+    smart_blocks: &SmartBlocks,
+    at_prompt: bool,
+) -> Vec<ToolbarButton> {
     let insight = smart_blocks.insight(block.id);
-    let rerun_available = matches!(
-        insight,
-        Some(Insight::Tests(run)) if rerun_failed_command(&block.command, run).is_some()
-    );
+    let rerun_available = at_prompt
+        && matches!(
+            insight,
+            Some(Insight::Tests(run)) if rerun_failed_command(&block.command, run).is_some()
+        );
     toolbar_buttons(
         insight,
         rerun_available,
@@ -304,6 +310,9 @@ pub(crate) fn register_smart_block_actions(
             }
         }))
         .on_action(cx.listener(|this, _: &StopBlock, _, cx| {
+            if this.enabled_smart_blocks(cx).is_none() {
+                return;
+            }
             let terminal = this.terminal.read(cx);
             let running = active_blocks(terminal).and_then(|blocks| blocks.running());
             if !this.read_only && running.is_some() && running == this.selected_block {
@@ -311,43 +320,40 @@ pub(crate) fn register_smart_block_actions(
                     .update(cx, |terminal, _| terminal.input(b"\x03".as_slice()));
             }
         }))
-        .on_action(|_: &OpenInGitPanel, window, cx| {
-            window.dispatch_action(Box::new(zed_actions::git_panel::ToggleFocus), cx)
-        })
+        .on_action(cx.listener(|this, _: &OpenInGitPanel, window, cx| {
+            if this.enabled_smart_blocks(cx).is_some() {
+                window.dispatch_action(Box::new(zed_actions::git_panel::ToggleFocus), cx)
+            }
+        }))
 }
 
 pub(crate) fn smart_block_menu_items(
     menu: ContextMenu,
-    buttons: Vec<ToolbarButton>,
+    buttons: Vec<(ToolbarButton, String)>,
 ) -> ContextMenu {
-    buttons
-        .into_iter()
-        .filter(|button| {
-            matches!(
-                button,
-                ToolbarButton::RerunFailed
-                    | ToolbarButton::OpenErrors
-                    | ToolbarButton::OpenAsJson
-                    | ToolbarButton::OpenAsTable
-                    | ToolbarButton::CopyAsCsv
-            )
-        })
-        .fold(menu, |menu, button| {
-            menu.action(button.label(None), button.action())
-        })
+    buttons.into_iter().fold(menu, |menu, (button, label)| {
+        menu.action(label, button.action())
+    })
 }
 
 impl TerminalView {
-    pub(crate) fn selected_block_buttons(&self, cx: &App) -> Vec<ToolbarButton> {
+    /// The selected block's actions with their labels.
+    pub(crate) fn selected_block_buttons(&self, cx: &App) -> Vec<(ToolbarButton, String)> {
         let (Some(smart_blocks), Some(selected)) =
             (self.enabled_smart_blocks(cx), self.selected_block)
         else {
             return Vec::new();
         };
-        active_blocks(self.terminal.read(cx))
-            .and_then(|blocks| blocks.block(selected))
-            .map(|block| block_toolbar(block, smart_blocks))
-            .unwrap_or_default()
+        let terminal = self.terminal.read(cx);
+        let Some(block) = active_blocks(terminal).and_then(|blocks| blocks.block(selected)) else {
+            return Vec::new();
+        };
+        let at_prompt = terminal.input_target() == InputTarget::BlockInput;
+        let local_url = running_url(block, smart_blocks);
+        block_toolbar(block, smart_blocks, at_prompt)
+            .into_iter()
+            .map(|button| (button, button.label(local_url)))
+            .collect()
     }
 
     /// Brings the window and this terminal forward and selects the block a notification is about.
@@ -396,11 +402,14 @@ impl TerminalView {
             .update(cx, |terminal, cx| terminal.run_command(&command, cx));
     }
 
+    /// Without errors to step through, the key is left to the terminal.
     fn open_block_error(&mut self, step: ErrorStep, window: &mut Window, cx: &mut Context<Self>) {
         let Some(smart_blocks) = self.enabled_smart_blocks(cx) else {
+            cx.propagate();
             return;
         };
         let Some(blocks) = active_blocks(self.terminal.read(cx)) else {
+            cx.propagate();
             return;
         };
         let has_locations = |id: BlockId| !block_locations(smart_blocks.insight(id)).is_empty();
@@ -408,10 +417,12 @@ impl TerminalView {
             Some(selected) => blocks.block(selected),
             None => blocks.blocks().rev().find(|block| has_locations(block.id)),
         }) else {
+            cx.propagate();
             return;
         };
         let locations = block_locations(smart_blocks.insight(block.id));
         if locations.is_empty() {
+            cx.propagate();
             return;
         }
         let current = self
@@ -563,13 +574,15 @@ impl TerminalView {
         else {
             return Vec::new();
         };
-        let Some(Insight::GitStatus { files }) = smart_blocks.insight(selected) else {
+        let terminal = self.terminal.read(cx);
+        let Some(block) = active_blocks(terminal).and_then(|blocks| blocks.block(selected)) else {
             return Vec::new();
         };
-        let terminal = self.terminal.read(cx);
-        if active_blocks(terminal).is_none() {
+        let Some(Insight::GitStatus { files }) =
+            smart_blocks.located_insight(block, terminal.grid_columns())
+        else {
             return Vec::new();
-        }
+        };
         let top_line = terminal.top_absolute_line();
         let screen_rows = terminal.last_content.terminal_bounds.num_lines();
         let mut rows: Vec<(usize, i64, RowContent)> = Vec::new();
@@ -586,7 +599,7 @@ impl TerminalView {
             {
                 continue;
             }
-            let content = match smart_blocks.row_mark(selected, file.absolute_line) {
+            let content = match smart_blocks.row_mark(selected, &file.path) {
                 Some(mark) => RowContent::Mark(mark),
                 None => RowContent::Buttons(row_buttons(
                     files
@@ -690,9 +703,12 @@ impl TerminalView {
         let row = (offset.y / bounds.line_height()).floor() as i64;
         let column = (offset.x / bounds.cell_width()).floor() as i64;
         let line = terminal.top_absolute_line() + row;
-        let columns = bounds.num_columns() as i64;
+        let grid_columns = terminal.grid_columns();
+        let columns = grid_columns as i64;
         blocks.blocks().find_map(|block| {
-            let Some(Insight::GitLog { commits }) = smart_blocks.insight(block.id) else {
+            let Some(Insight::GitLog { commits }) =
+                smart_blocks.located_insight(block, grid_columns)
+            else {
                 return None;
             };
             commits.iter().find_map(|commit| {
@@ -733,8 +749,10 @@ impl TerminalView {
         let smart_blocks = self.enabled_smart_blocks(cx)?;
         let terminal = self.terminal.read(cx);
         let block = active_blocks(terminal)?.block(selected)?;
-        let buttons = block_toolbar(block, smart_blocks);
-        if buttons.is_empty() {
+        let at_prompt = terminal.input_target() == InputTarget::BlockInput;
+        let buttons = block_toolbar(block, smart_blocks, at_prompt);
+        let delta = self.selected_block_delta(cx);
+        if buttons.is_empty() && delta.is_none() {
             return None;
         }
         let local_url = running_url(block, smart_blocks).map(str::to_string);
@@ -760,6 +778,9 @@ impl TerminalView {
                         .occlude()
                         .h(line_height)
                         .gap_1()
+                        .children(delta.map(|delta| {
+                            Label::new(delta).size(LabelSize::Small).color(Color::Muted)
+                        }))
                         .children(buttons.into_iter().map(|button| {
                             let focus_handle = focus_handle.clone();
                             Button::new(

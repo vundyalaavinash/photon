@@ -172,9 +172,7 @@ pub struct TerminalView {
     // photon: the editor-style command line of a block terminal.
     block_input: Option<Entity<photon_terminal::BlockInput>>,
     block_input_shown: bool,
-    // photon: what finished and running blocks turned out to be (tests, git, servers); the
-    // block chrome reads it in later SP1b tasks.
-    #[allow(dead_code)]
+    // photon: what finished and running blocks turned out to be (tests, git, servers).
     smart_blocks: Option<(Entity<photon_terminal::SmartBlocks>, Subscription)>,
     // photon: the error F8 / shift-F8 last opened, as (block, index into its locations).
     block_error_cursor: Option<(photon_blocks::BlockId, usize)>,
@@ -1138,10 +1136,10 @@ impl TerminalView {
             // photon: a selected block's keys apply only while one is selected.
             if self.selected_block.is_some() {
                 dispatch_context.add("photon_block_selected");
-                // photon: a running program (less -X, fzf, a REPL) needs escape more than the selection does.
-                if self.terminal.read(cx).input_target() == terminal::InputTarget::Pty {
-                    dispatch_context.add("photon_keys_to_pty");
-                }
+            }
+            // photon: a running program (less -X, fzf, a REPL) needs escape and F8 more than blocks do.
+            if self.terminal.read(cx).input_target() == terminal::InputTarget::Pty {
+                dispatch_context.add("photon_keys_to_pty");
             }
         }
 
@@ -5315,5 +5313,278 @@ mod tests {
                 .is_some()
         });
         assert!(opened, "cmd-click on the hash opens the commit view");
+    }
+
+    fn set_columns(terminal: &Entity<Terminal>, columns: usize, cx: &mut VisualTestContext) {
+        terminal.update_in(cx, |terminal, window, cx| {
+            let current = terminal.last_content.terminal_bounds;
+            terminal.set_size(TerminalBounds::new(
+                current.line_height,
+                current.cell_width,
+                gpui::bounds(
+                    current.bounds.origin,
+                    gpui::size(
+                        current.cell_width * columns as f32,
+                        current.bounds.size.height,
+                    ),
+                ),
+            ));
+            terminal.sync(window, cx);
+        });
+    }
+
+    fn screen_row_text(
+        terminal: &Entity<Terminal>,
+        row: usize,
+        cx: &mut VisualTestContext,
+    ) -> String {
+        terminal.read_with(cx, |terminal, _| {
+            let display_offset = terminal.last_content.display_offset as i32;
+            terminal
+                .last_content
+                .cells
+                .iter()
+                .filter(|cell| cell.point.line + display_offset == row as i32)
+                .map(|cell| cell.character())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+    }
+
+    fn status_row_texts(
+        terminal: &Entity<Terminal>,
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<String> {
+        terminal.update_in(cx, |terminal, window, cx| terminal.sync(window, cx));
+        let rows = terminal_view.read_with(cx, |view, cx| view.selected_status_rows(cx));
+        rows.into_iter()
+            .map(|(row, _, _)| screen_row_text(terminal, row, cx))
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn row_buttons_follow_width_changes(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        set_columns(&terminal, 80, &mut cx);
+        // Re-wrapping keeps the cursor's row, so the rows above a line that wraps differently move.
+        feed_block_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07git status\r\n\x1b]633;E;git status\x07\x1b]133;C\x07Changes not staged for commit:\r\n\tmodified:   a.txt\r\n\r\nUntracked files:\r\n\tc.txt\r\n\r\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07",
+            &mut cx,
+        );
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-up");
+        let expected = ["modified:   a.txt".to_string(), "c.txt".to_string()];
+        assert_eq!(
+            status_row_texts(&terminal, &terminal_view, &mut cx),
+            expected
+        );
+
+        for columns in [50, 80] {
+            set_columns(&terminal, columns, &mut cx);
+            let rows = status_row_texts(&terminal, &terminal_view, &mut cx);
+            assert!(
+                rows.is_empty() || rows == expected,
+                "at {columns} columns before re-recognition: {rows:?}"
+            );
+            cx.run_until_parked();
+            assert_eq!(
+                status_row_texts(&terminal, &terminal_view, &mut cx),
+                expected,
+                "at {columns} columns"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn commit_hashes_follow_width_changes(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        set_columns(&terminal, 80, &mut cx);
+        let first = "0101010101010101010101010101010101010101";
+        let second = "0202020202020202020202020202020202020202";
+        let message = "m".repeat(70);
+        feed_block_output(
+            &terminal,
+            format!(
+                "\x1b]133;A\x07\x1b]133;B\x07git log\r\n\x1b]633;E;git log\x07\x1b]133;C\x07commit {first}\r\n\r\n    {message}\r\n\r\ncommit {second}\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07"
+            )
+            .as_bytes(),
+            &mut cx,
+        );
+        cx.run_until_parked();
+        // The message below the first commit wraps differently at each width, moving it.
+        let hash_under_first_commit = |cx: &mut VisualTestContext| {
+            terminal.update_in(cx, |terminal, window, cx| terminal.sync(window, cx));
+            let rows = terminal.read_with(cx, |terminal, _| {
+                terminal.last_content.terminal_bounds.num_lines()
+            });
+            let row = (0..rows)
+                .find(|row| screen_row_text(&terminal, *row, cx) == format!("commit {first}"))
+                .expect("first commit on screen");
+            let bounds =
+                terminal.read_with(cx, |terminal, _| terminal.last_content.terminal_bounds);
+            let position = bounds.bounds.origin
+                + gpui::point(
+                    bounds.cell_width * 10.5,
+                    bounds.line_height * (row as f32 + 0.5),
+                );
+            terminal_view.read_with(cx, |view, cx| {
+                view.commit_hash_at(position, cx).map(|(_, hash)| hash)
+            })
+        };
+        assert_eq!(hash_under_first_commit(&mut cx).as_deref(), Some(first));
+
+        for columns in [50, 80] {
+            set_columns(&terminal, columns, &mut cx);
+            let hash = hash_under_first_commit(&mut cx);
+            assert!(
+                hash.is_none() || hash.as_deref() == Some(first),
+                "at {columns} columns before re-recognition: {hash:?}"
+            );
+            cx.run_until_parked();
+            assert_eq!(
+                hash_under_first_commit(&mut cx).as_deref(),
+                Some(first),
+                "at {columns} columns"
+            );
+        }
+    }
+
+    fn menu_labels(
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<SharedString> {
+        terminal_view.update_in(cx, |view, window, cx| {
+            view.deploy_context_menu(gpui::point(px(10.), px(10.)), false, window, cx);
+            let (menu, _, _) = view.context_menu.as_ref().expect("context menu");
+            menu.read(cx).entry_labels()
+        })
+    }
+
+    #[gpui::test]
+    async fn block_menu_offers_every_block_action(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07git status -s\r\n\x1b]633;E;git status -s\x07\x1b]133;C\x07 M a.txt\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07serve\r\n\x1b]633;E;serve\x07\x1b]133;C\x07Local: http://localhost:5173/\r\n",
+            &mut cx,
+        );
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-up");
+        let labels = menu_labels(&terminal_view, &mut cx);
+        for expected in ["Open localhost:5173", "Stop"] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "{expected}: {labels:?}"
+            );
+        }
+
+        // Escape closes the menu; the running block stays selected.
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("cmd-up");
+        let ids = block_ids(&terminal, &mut cx);
+        assert_eq!(selected(&terminal_view, &mut cx), Some(ids[ids.len() - 2]));
+        let labels = menu_labels(&terminal_view, &mut cx);
+        for expected in ["Stage all", "Open in Git panel"] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "{expected}: {labels:?}"
+            );
+        }
+        assert!(labels.iter().all(|label| label != "Stop"), "{labels:?}");
+    }
+
+    #[gpui::test]
+    async fn toolbar_shows_delta_of_a_second_test_run(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_smart_block_view(cx).await;
+        feed_block_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07cargo test\r\n\x1b]633;E;cargo test\x07\x1b]133;C\x07test result: ok. 43 passed; 0 failed; 0 ignored\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07",
+            &mut cx,
+        );
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-up");
+        terminal_view.update(&mut cx, |view, cx| {
+            assert!(view.smart_block_overlay(cx).is_some(), "toolbar shown");
+            assert_eq!(
+                view.selected_block_delta(cx).as_deref(),
+                Some("0 new failures · 2 fixed")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn f8_reaches_a_running_program(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(&terminal, TWO_LOCATED_FAILURES, &mut cx);
+        cx.run_until_parked();
+        feed_block_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07less -X\r\n\x1b]633;E;less -X\x07\x1b]133;C\x07page\r\n",
+            &mut cx,
+        );
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_keystrokes("f8");
+        assert_eq!(take_pty_writes(&terminal, &mut cx).concat(), b"\x1b[19~");
+    }
+
+    #[gpui::test]
+    async fn smart_blocks_off_leaves_f8_and_stop_to_the_terminal(cx: &mut TestAppContext) {
+        use crate::photon_smart_blocks_view::StopBlock;
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(
+            &terminal,
+            b"serve\r\n\x1b]633;E;serve\x07\x1b]133;C\x07Local: http://localhost:5173/\r\n",
+            &mut cx,
+        );
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.terminal.get_or_insert_default().smart_blocks = Some(false);
+                });
+            });
+        });
+        cx.simulate_keystrokes("cmd-up");
+        let running = block_ids(&terminal, &mut cx).last().copied();
+        assert_eq!(selected(&terminal_view, &mut cx), running);
+        take_pty_writes(&terminal, &mut cx);
+        cx.dispatch_action(StopBlock);
+        assert!(
+            take_pty_writes(&terminal, &mut cx).is_empty(),
+            "stop is off"
+        );
+        cx.simulate_keystrokes("f8");
+        assert_eq!(take_pty_writes(&terminal, &mut cx).concat(), b"\x1b[19~");
+    }
+
+    #[gpui::test]
+    async fn rerun_failed_needs_a_prompt(cx: &mut TestAppContext) {
+        use crate::photon_smart_blocks_view::ToolbarButton;
+        let (terminal, terminal_view, mut cx) = init_smart_block_view(cx).await;
+        cx.simulate_keystrokes("cmd-up");
+        let buttons = |cx: &mut VisualTestContext| {
+            terminal_view.read_with(cx, |view, cx| view.selected_block_buttons(cx))
+        };
+        let has_rerun = |buttons: Vec<(ToolbarButton, String)>| {
+            buttons
+                .iter()
+                .any(|(button, _)| *button == ToolbarButton::RerunFailed)
+        };
+        assert!(has_rerun(buttons(&mut cx)));
+
+        feed_block_output(
+            &terminal,
+            b"less -X\r\n\x1b]633;E;less -X\x07\x1b]133;C\x07page\r\n",
+            &mut cx,
+        );
+        assert!(!has_rerun(buttons(&mut cx)));
+        let labels = menu_labels(&terminal_view, &mut cx);
+        assert!(
+            labels.iter().all(|label| label != "Re-run failed"),
+            "{labels:?}"
+        );
     }
 }

@@ -146,6 +146,7 @@ pub(super) fn open_location_beside_terminal(
     .detach_and_log_err(cx)
 }
 
+// photon: split out of `possibly_open_target` so hovered paths and error locations share it.
 fn open_target_beside_terminal(
     workspace: &WeakEntity<Workspace>,
     path_like_target: &PathLikeTarget,
