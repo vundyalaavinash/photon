@@ -528,13 +528,14 @@ impl SmartBlocks {
             return;
         };
         let scan = self.error_scans.entry(id).or_default();
+        // The budget bounds one read, not the block's life: a server can run for days.
+        scan.lines = 0;
         let Some(lines) = read_new_lines(self.terminal.read(cx), id, scan) else {
             return;
         };
         // Output the user could see, or that came before the server was up, is skipped so
-        // it never turns into a stale notification; the budget only counts what is watched.
+        // it never turns into a stale notification.
         if self.window_active || !self.urls.contains_key(&id) {
-            scan.lines = 0;
             return;
         }
         if self.error_cooldowns.contains_key(&id) {
@@ -1033,6 +1034,24 @@ mod tests {
             let shown = cx.shown_system_notifications();
             assert_eq!(shown.len(), 1);
             assert_eq!(shown[0].body, "error: new");
+        }
+
+        #[gpui::test]
+        async fn server_error_after_many_lines_still_notifies(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, true);
+            feed(
+                &terminal,
+                &format!("{CWD}{START_SERVER}Local: http://localhost:3000\r\n"),
+                cx,
+            );
+            for _ in 0..3 {
+                feed(&terminal, &"noise\r\n".repeat(URL_SCAN_LINE_LIMIT), cx);
+            }
+            assert!(cx.shown_system_notifications().is_empty());
+            feed(&terminal, "error: late\r\n", cx);
+            let shown = cx.shown_system_notifications();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].body, "error: late");
         }
 
         #[gpui::test]
