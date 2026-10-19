@@ -1,10 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::pin::pin;
 use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use futures::future::{self, Either};
 use gpui::{App, AsyncApp, Entity, Task};
 use language::{Buffer, Point, ToPoint as _};
 use project::{IncomingCall, OutgoingCall, Project};
@@ -18,6 +20,8 @@ pub const CONTEXT_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(8),
     Duration::from_secs(15),
 ];
+
+const CONTEXT_FETCH_LIMIT: Duration = Duration::from_secs(30);
 
 pub const UNCHANGED_EXCERPT_LINES: u32 = 8;
 
@@ -59,23 +63,32 @@ impl ContextCache {
         }
         let entries = self.entries.clone();
         let position = function.selection_point;
+        // A server that hangs instead of erroring would hold each attempt for the whole LSP
+        // request timeout, so the attempts and their delays share one overall limit.
+        let limit = cx.background_executor().timer(CONTEXT_FETCH_LIMIT);
         cx.spawn(async move |cx| {
-            let mut delays = CONTEXT_RETRY_DELAYS.iter();
-            loop {
-                match fetch_once(&project, &buffer, position, cx).await {
-                    Ok(Some(context)) => {
-                        entries.borrow_mut().insert(key, context.clone());
-                        return Ok(context);
-                    }
-                    Ok(None) => return Err(ContextError::NoCallHierarchy),
-                    Err(error) => {
-                        log::debug!("call hierarchy not ready: {error:#}");
-                        match delays.next() {
-                            Some(delay) => cx.background_executor().timer(*delay).await,
-                            None => return Err(ContextError::TimedOut),
+            let attempts = pin!(async {
+                let mut delays = CONTEXT_RETRY_DELAYS.iter();
+                loop {
+                    match fetch_once(&project, &buffer, position, cx).await {
+                        Ok(Some(context)) => {
+                            entries.borrow_mut().insert(key, context.clone());
+                            return Ok(context);
+                        }
+                        Ok(None) => return Err(ContextError::NoCallHierarchy),
+                        Err(error) => {
+                            log::debug!("call hierarchy not ready: {error:#}");
+                            match delays.next() {
+                                Some(delay) => cx.background_executor().timer(*delay).await,
+                                None => return Err(ContextError::TimedOut),
+                            }
                         }
                     }
                 }
+            });
+            match future::select(attempts, limit).await {
+                Either::Left((result, _)) => result,
+                Either::Right(_) => Err(ContextError::TimedOut),
             }
         })
     }
@@ -99,6 +112,8 @@ async fn fetch_once(
     };
     // Local requests drop server errors (rust-analyzer's "content modified" while indexing) and
     // answer with no items, so an empty answer from a capable server means "not ready yet".
+    // ponytail: a server with genuinely nothing at this position also answers empty, so it
+    // reports TimedOut after 30 s; tell "indexing" from "nothing here" via LSP `$/progress`.
     let item = items
         .into_iter()
         .next()
@@ -255,7 +270,9 @@ pub fn context_excerpts(
             continue;
         };
         let snapshot = item.buffer.read(cx).snapshot();
-        let range = item.range.start.to_point(&snapshot)..item.range.end.to_point(&snapshot);
+        let start = item.range.start.to_point(&snapshot);
+        // A server may answer with an inverted range; show its start row alone.
+        let range = start..item.range.end.to_point(&snapshot).max(start);
         let is_changed = changed_rows.get(&path).is_some_and(|rows| {
             rows.iter()
                 .any(|changed| changed.start <= range.end.row && range.start.row < changed.end)
@@ -277,7 +294,7 @@ pub fn context_excerpts(
             .min()
             .unwrap_or(range.start.row)
             + 1;
-        let full_rows = range.end.row - range.start.row + 1;
+        let full_rows = range.end.row.saturating_sub(range.start.row) + 1;
         let shown = if full_rows > UNCHANGED_EXCERPT_LINES {
             let last_row = range.start.row + UNCHANGED_EXCERPT_LINES - 1;
             range.start..Point::new(last_row, snapshot.line_len(last_row))
@@ -623,6 +640,76 @@ fn caller() {
         cx.executor().run_until_parked();
         assert_eq!(prepares.load(Ordering::SeqCst), 6);
         assert_eq!(task.await.err(), Some(ContextError::TimedOut));
+    }
+
+    #[gpui::test]
+    async fn hanging_server_times_out_at_thirty_seconds(cx: &mut TestAppContext) {
+        let setup = setup(cx, true).await;
+        setup
+            .server
+            .set_request_handler::<lsp::request::CallHierarchyPrepare, _, _>(|_, _| {
+                futures::future::pending::<anyhow::Result<Option<Vec<lsp::CallHierarchyItem>>>>()
+            });
+        let function = changed_function("changed", 0, 2, FunctionChange::BodyOnly);
+        let mut cache = ContextCache::default();
+        let task = cx.update(|cx| {
+            cache.fetch(
+                "head",
+                setup.project.clone(),
+                setup.buffer.clone(),
+                &function,
+                cx,
+            )
+        });
+        let result = Rc::new(RefCell::new(None));
+        cx.update(|cx| {
+            cx.spawn({
+                let result = result.clone();
+                async move |_| *result.borrow_mut() = Some(task.await.err())
+            })
+            .detach()
+        });
+        cx.executor().run_until_parked();
+        for _ in 0..29 {
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.executor().run_until_parked();
+        }
+        assert_eq!(*result.borrow(), None);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.executor().run_until_parked();
+        assert_eq!(*result.borrow(), Some(Some(ContextError::TimedOut)));
+    }
+
+    #[gpui::test]
+    async fn inverted_range_does_not_underflow(cx: &mut TestAppContext) {
+        let setup = setup(cx, true).await;
+        answer_calls(&setup);
+        setup
+            .server
+            .set_request_handler::<lsp::request::CallHierarchyOutgoingCalls, _, _>({
+                let uri = setup.uri.clone();
+                move |_, _| {
+                    let mut helper = lsp_item("helper", &uri, 6, 6);
+                    helper.range =
+                        lsp::Range::new(lsp::Position::new(6, 0), lsp::Position::new(4, 1));
+                    async move {
+                        Ok(Some(vec![lsp::CallHierarchyOutgoingCall {
+                            to: helper,
+                            from_ranges: vec![line_range(1, 4, 10)],
+                        }]))
+                    }
+                }
+            });
+        let context = fetch(cx, &mut ContextCache::default(), "head", &setup)
+            .await
+            .expect("context");
+        let function = changed_function("changed", 0, 2, FunctionChange::BodyOnly);
+        let changed_rows = HashMap::from_iter([("src/main.rs".to_string(), vec![1..2])]);
+        let excerpts = cx.read(|cx| context_excerpts(&function, &context, &changed_rows, cx));
+        let helper = excerpts.first().expect("helper excerpt");
+        // Project already reorders the endpoints when it converts the LSP range.
+        assert_eq!(helper.range, Point::new(4, 1)..Point::new(6, 0));
+        assert_eq!(helper.full_rows, 3);
     }
 
     #[gpui::test]
