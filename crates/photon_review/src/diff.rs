@@ -1,7 +1,7 @@
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use buffer_diff::BufferDiff;
 use gpui::{App, AppContext as _, Entity, Task};
 use language::Buffer;
@@ -41,17 +41,25 @@ pub struct LoadedFile {
 
 pub fn parse_unified_diff(patch: &str) -> Result<Vec<FileDiff>> {
     let mut files: Vec<FileDiff> = Vec::new();
+    let mut skipping = false;
     for line in patch.split_inclusive('\n') {
         let text = line.strip_suffix('\n').unwrap_or(line);
         if let Some(header) = text.strip_prefix("diff --git ") {
-            let (_, new_path) = split_header_paths(header)
-                .ok_or_else(|| anyhow!("malformed diff header {text:?}"))?;
+            let Some((_, new_path)) = split_header_paths(header) else {
+                log::warn!("skipping file with malformed diff header {text:?}");
+                skipping = true;
+                continue;
+            };
+            skipping = false;
             files.push(FileDiff {
                 path: new_path,
                 status: FileStatus::Modified,
                 binary: false,
                 hunks: Vec::new(),
             });
+            continue;
+        }
+        if skipping {
             continue;
         }
         let Some(file) = files.last_mut() else {
@@ -196,6 +204,13 @@ fn unquote_git_path(path: &str) -> Result<String> {
 pub async fn git_diff(worktree: &Path, from: &str, to: &str) -> Result<Vec<FileDiff>> {
     // `diff` and `show` read only local objects: no hooks or credentials apply, so the plain
     // helper is enough here.
+    for reference in [from, to] {
+        if reference.starts_with('-') {
+            bail!("invalid ref {reference:?}");
+        }
+    }
+    // The explicit flags override user and system diff config, so hunks and statuses match
+    // GitHub's diff and `commentable_lines` lines up with it.
     let patch = git_raw(
         worktree,
         &[
@@ -204,19 +219,36 @@ pub async fn git_diff(worktree: &Path, from: &str, to: &str) -> Result<Vec<FileD
             "diff",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
+            "--diff-algorithm=myers",
+            "--inter-hunk-context=0",
+            "--ignore-submodules=none",
             "--find-renames",
             "-U3",
             "--src-prefix=a/",
             "--dst-prefix=b/",
             from,
             to,
+            "--",
         ],
     )
     .await?;
     parse_unified_diff(&patch)
 }
 
+/// A gitlink change diffs as `Subproject commit <sha>` lines instead of file content.
+fn is_submodule(file: &FileDiff) -> bool {
+    file.hunks.iter().any(|hunk| {
+        hunk.body.lines().any(|line| {
+            line.starts_with("+Subproject commit ") || line.starts_with("-Subproject commit ")
+        })
+    })
+}
+
 pub fn commentable_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
+    if is_submodule(file) {
+        return Vec::new();
+    }
     file.hunks
         .iter()
         .filter(|hunk| hunk.new_len > 0)
@@ -224,7 +256,11 @@ pub fn commentable_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
         .collect()
 }
 
+/// `None` for added, binary and submodule entries, which have no text base to show.
 pub async fn base_text(worktree: &Path, commit: &str, file: &FileDiff) -> Result<Option<String>> {
+    if file.binary || is_submodule(file) {
+        return Ok(None);
+    }
     let old_path = match &file.status {
         FileStatus::Added => return Ok(None),
         FileStatus::Renamed { from } => from,
@@ -472,6 +508,105 @@ rename to new name.rs
         let mut diff = file("a.rs", FileStatus::Modified, false);
         diff.hunks = vec![hunk(10, 7), hunk(30, 2), hunk(50, 0)];
         assert_eq!(commentable_lines(&diff), vec![10..=16, 30..=31]);
+    }
+
+    #[test]
+    fn malformed_header_skips_only_that_file() {
+        let patch = "\
+diff --git garbage
+index 1..2 100644
+@@ -1 +1 @@
+-x
++y
+diff --git a/ok.rs b/ok.rs
+index 1..2 100644
+@@ -1 +1 @@
+-a
++b
+";
+        let files = parse_unified_diff(patch).expect("parse");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "ok.rs");
+        assert_eq!(files[0].hunks.len(), 1);
+    }
+
+    #[gpui::test]
+    async fn submodule_entries_have_no_lines_or_base(_cx: &mut TestAppContext) {
+        let patch = "\
+diff --git a/vendor/lib b/vendor/lib
+index 1111111..2222222 160000
+--- a/vendor/lib
++++ b/vendor/lib
+@@ -1 +1 @@
+-Subproject commit 1111111111111111111111111111111111111111
++Subproject commit 2222222222222222222222222222222222222222
+";
+        let files = parse_unified_diff(patch).expect("parse");
+        assert!(commentable_lines(&files[0]).is_empty());
+        let missing = Path::new("/nonexistent-photon-worktree");
+        assert_eq!(
+            base_text(missing, "HEAD", &files[0]).await.expect("base"),
+            None
+        );
+        let binary = file("logo.png", FileStatus::Modified, true);
+        assert_eq!(
+            base_text(missing, "HEAD", &binary).await.expect("base"),
+            None
+        );
+        assert!(git_diff(missing, "--output=x", "HEAD").await.is_err());
+    }
+
+    #[gpui::test]
+    async fn user_diff_config_does_not_change_hunks(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        run(repo, &["init", "-q"]);
+        run(repo, &["config", "diff.algorithm", "patience"]);
+        run(repo, &["config", "diff.context", "10"]);
+        run(repo, &["config", "diff.interHunkContext", "10"]);
+        let lines = |change: bool| -> String {
+            (1..=40)
+                .map(|number| match (change, number) {
+                    (true, 10 | 25) => format!("changed {number}\n"),
+                    _ => format!("line {number}\n"),
+                })
+                .collect()
+        };
+        std::fs::write(repo.join("a.txt"), lines(false)).expect("write");
+        run(repo, &["add", "."]);
+        run(repo, &["commit", "-q", "-m", "base"]);
+        let base = run(repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("a.txt"), lines(true)).expect("write");
+        run(repo, &["commit", "-q", "-am", "head"]);
+        let head = run(repo, &["rev-parse", "HEAD"]);
+
+        let files = git_diff(repo, &base, &head).await.expect("diff");
+        let expected = run(
+            repo,
+            &[
+                "-c",
+                "diff.algorithm=myers",
+                "-c",
+                "diff.context=3",
+                "-c",
+                "diff.interHunkContext=0",
+                "diff",
+                "-U3",
+                "--no-color",
+                &base,
+                &head,
+            ],
+        );
+        assert_eq!(
+            files,
+            parse_unified_diff(&format!("{expected}\n")).expect("parse")
+        );
+        assert_eq!(files[0].hunks.len(), 2);
+        assert_eq!(files[0].hunks[0].old_len, 7);
     }
 
     fn run(dir: &Path, args: &[&str]) -> String {
