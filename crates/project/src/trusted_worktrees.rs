@@ -51,7 +51,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::debug_panic;
+use util::{debug_panic, paths::PathStyle};
 
 use crate::{project_settings::ProjectSettings, worktree_store::WorktreeStore};
 
@@ -138,6 +138,8 @@ pub struct TrustedWorktreesStore {
     trusted_paths: TrustedPaths,
     restricted: HashMap<WeakEntity<WorktreeStore>, HashSet<WorktreeId>>,
     worktree_trust_serialization: Task<()>,
+    // photon: worktrees under these roots hold someone else's code, so only their own path trusts them
+    parent_trust_refused_under: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -242,7 +244,69 @@ impl TrustedWorktreesStore {
             worktree_stores: HashMap::default(),
             restricted: HashMap::default(),
             worktree_trust_serialization: Task::ready(()),
+            parent_trust_refused_under: Vec::new(), // photon: see the field
         }
+    }
+
+    // photon: PR review worktrees are trusted only by their own path, never through a parent
+    pub fn refuse_parent_trust_under(&mut self, root: PathBuf) {
+        self.parent_trust_refused_under.push(root);
+    }
+
+    // photon: a PR review worktree's trust ends when its code changes; the path is reused per PR
+    pub fn forget_trust(&mut self, abs_path: &Path, cx: &mut Context<Self>) {
+        for paths in self.db_trusted_paths.values_mut() {
+            paths.remove(abs_path);
+        }
+        let mut to_restrict = Vec::new();
+        for (worktree_store, paths) in &mut self.trusted_paths {
+            let worktree_store_entity = worktree_store.upgrade();
+            let mut restricted_ids = HashSet::default();
+            paths.retain(|path| match path {
+                PathTrust::AbsPath(path) => path != abs_path,
+                PathTrust::Worktree(worktree_id) => {
+                    let at_path = worktree_store_entity.as_ref().is_some_and(|store| {
+                        store
+                            .read(cx)
+                            .worktree_for_id(*worktree_id, cx)
+                            .is_some_and(|worktree| {
+                                worktree.read(cx).abs_path().as_ref() == abs_path
+                            })
+                    });
+                    if at_path {
+                        restricted_ids.insert(PathTrust::Worktree(*worktree_id));
+                    }
+                    !at_path
+                }
+            });
+            if !restricted_ids.is_empty() {
+                to_restrict.push((worktree_store.clone(), restricted_ids));
+            }
+        }
+        for (worktree_store, restricted_ids) in to_restrict {
+            self.restrict(worktree_store, restricted_ids, cx);
+        }
+    }
+
+    // photon: `trusted_path` covers `worktree_path` as a parent unless Photon refused that
+    fn trust_covers(
+        &self,
+        worktree_path: &Path,
+        trusted_path: &Path,
+        path_style: PathStyle,
+    ) -> bool {
+        if self.refuses_parent_trust(worktree_path) {
+            worktree_path == trusted_path
+        } else {
+            path_style.starts_with(worktree_path, trusted_path)
+        }
+    }
+
+    // photon: see `parent_trust_refused_under`
+    fn refuses_parent_trust(&self, worktree_path: &Path) -> bool {
+        self.parent_trust_refused_under
+            .iter()
+            .any(|root| worktree_path.starts_with(root))
     }
 
     /// Whether a particular worktree store has associated worktrees that are restricted, or an associated host is restricted.
@@ -339,7 +403,8 @@ impl TrustedWorktreesStore {
 
         new_trusted_other_worktrees.retain(|(worktree_abs_path, _)| {
             new_trusted_abs_paths.iter().all(|new_trusted_path| {
-                !path_style.starts_with(worktree_abs_path, new_trusted_path)
+                // photon: honour refused parent trust
+                !self.trust_covers(worktree_abs_path, new_trusted_path, path_style)
             })
         });
         if !new_trusted_other_worktrees.is_empty() {
@@ -359,7 +424,11 @@ impl TrustedWorktreesStore {
                     let is_file = worktree.read(cx).is_single_file();
 
                     // When trusting an abs path on the host, we transitively trust all single file worktrees on this host too.
-                    if is_file && !new_trusted_abs_paths.is_empty() {
+                    // photon: honour refused parent trust (the third condition)
+                    if is_file
+                        && !new_trusted_abs_paths.is_empty()
+                        && !self.refuses_parent_trust(&worktree.read(cx).abs_path())
+                    {
                         trusted_paths.insert(PathTrust::Worktree(*restricted_worktree));
                         return false;
                     }
@@ -367,7 +436,12 @@ impl TrustedWorktreesStore {
                     let restricted_worktree_path = worktree.read(cx).abs_path();
                     let retain = (!is_file || new_trusted_other_worktrees.is_empty())
                         && new_trusted_abs_paths.iter().all(|new_trusted_path| {
-                            !path_style.starts_with(&restricted_worktree_path, new_trusted_path)
+                            // photon: honour refused parent trust
+                            !self.trust_covers(
+                                &restricted_worktree_path,
+                                new_trusted_path,
+                                path_style,
+                            )
                         });
                     if !retain {
                         trusted_paths.insert(PathTrust::Worktree(*restricted_worktree));
@@ -503,16 +577,19 @@ impl TrustedWorktreesStore {
         // See module documentation for details on trust level.
         if let Some(trusted_paths) = self.trusted_paths.get(&weak_worktree_store) {
             let auto_trusted = worktree_store.read_with(cx, |worktree_store, cx| {
+                // photon: honour refused parent trust
+                let refused = self.refuses_parent_trust(&worktree_path);
                 trusted_paths.iter().any(|trusted_path| match trusted_path {
                     PathTrust::Worktree(worktree_id) => worktree_store
                         .worktree_for_id(*worktree_id, cx)
                         .is_some_and(|worktree| {
                             let worktree = worktree.read(cx);
-                            path_style.starts_with(&worktree_path, &worktree.abs_path())
-                                || (is_file && !worktree.is_single_file())
+                            self.trust_covers(&worktree_path, &worktree.abs_path(), path_style)
+                                || (is_file && !refused && !worktree.is_single_file())
                         }),
                     PathTrust::AbsPath(trusted_path) => {
-                        is_file || path_style.starts_with(&worktree_path, trusted_path)
+                        (is_file && !refused)
+                            || self.trust_covers(&worktree_path, trusted_path, path_style)
                     }
                 })
             });

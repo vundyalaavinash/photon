@@ -298,6 +298,7 @@ mod tests {
                 worktree: self.dir.clone(),
                 head_sha: self.sha(head),
                 merge_base: run(&self.dir, &["merge-base", head, base]),
+                head_changed: false,
             }
         }
 

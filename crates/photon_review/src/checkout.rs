@@ -155,6 +155,8 @@ pub struct Checkout {
     pub worktree: PathBuf,
     pub head_sha: String,
     pub merge_base: String,
+    /// The worktree now holds code it didn't hold before: it was created, or moved to a new head.
+    pub head_changed: bool,
 }
 
 pub(crate) fn ensure_safe_segment(label: &str, segment: &str) -> Result<()> {
@@ -271,6 +273,11 @@ pub async fn prepare_checkout(
     let head_sha = safe_git(&repo_dir, &["rev-parse", &head_ref]).await?;
     let merge_base = safe_git(&repo_dir, &["merge-base", &head_ref, &base_private_ref]).await?;
 
+    let previous_head = if worktree_exists {
+        safe_git(&worktree, &["rev-parse", "HEAD"]).await.log_err()
+    } else {
+        None
+    };
     if worktree_exists {
         safe_git(&worktree, &["checkout", "--detach", &head_sha]).await?;
     } else {
@@ -295,6 +302,7 @@ pub async fn prepare_checkout(
     Ok(Checkout {
         repo_dir,
         worktree,
+        head_changed: previous_head.as_ref() != Some(&head_sha),
         head_sha,
         merge_base,
     })
@@ -681,6 +689,22 @@ pub(crate) mod tests {
         assert_eq!(second.head_sha, newer);
         assert_eq!(run(&second.worktree, &["rev-parse", "HEAD"]), newer);
         assert_eq!(second.merge_base, fixture.main_sha);
+        assert!(
+            first.head_changed,
+            "a new worktree holds code the user hasn't trusted"
+        );
+        assert!(second.head_changed);
+
+        let third = prepare_checkout(
+            &fixture.key(),
+            "main",
+            &fixture.url(),
+            Some(fixture.user.clone()),
+            &fixture.root,
+        )
+        .await
+        .expect("third");
+        assert!(!third.head_changed);
     }
 
     #[gpui::test]

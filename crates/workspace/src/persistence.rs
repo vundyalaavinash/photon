@@ -2587,7 +2587,8 @@ impl WorkspaceDb {
         }).await
     }
 
-    pub(crate) async fn save_trusted_worktrees(
+    // photon: Photon saves the trust it forgets for a PR worktree
+    pub async fn save_trusted_worktrees(
         &self,
         trusted_worktrees: HashMap<Option<RemoteHostLocation>, HashSet<PathBuf>>,
     ) -> anyhow::Result<()> {

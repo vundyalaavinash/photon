@@ -15,7 +15,7 @@ use workspace::{
 
 use crate::{
     Checkout, PrSummary, ReviewDb, Tracked, candidate_repos, fetch_url, find_clone,
-    prepare_checkout, repo_id, review_root,
+    forget_stale_trust, prepare_checkout, repo_id, review_root,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, RegisterSetting)]
@@ -161,6 +161,7 @@ async fn open_terminal(
         })
         .await?;
     let worktree = checkout.worktree.clone();
+    cx.update(|_, cx| forget_stale_trust(&checkout, cx))?;
 
     let existing = cx.update(|_, cx| find_workspace_with_worktree(&app_state, &worktree, cx))?;
     let (window, workspace) = match existing {
@@ -285,7 +286,13 @@ mod tests {
         )
         .await
         .expect("reused");
-        assert_eq!(again, checkout);
+        assert_eq!(
+            again,
+            Checkout {
+                head_changed: false,
+                ..checkout
+            }
+        );
         assert_eq!(fixture.user_state(), before);
     }
 

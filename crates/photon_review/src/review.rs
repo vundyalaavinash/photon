@@ -29,7 +29,7 @@ use project::{
 use ui::{Checkbox, ToggleState, Tooltip, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
-    AppState, Item, OpenMode, OpenOptions, Toast, ToggleWorktreeSecurity, Workspace,
+    AppState, Item, OpenMode, OpenOptions, Toast, ToggleWorktreeSecurity, Workspace, WorkspaceDb,
     notifications::NotificationId, open_paths,
 };
 
@@ -263,6 +263,39 @@ pub fn open_review(
     })
 }
 
+/// The worktree path is reused for every head of a pull request, so trust given to an earlier
+/// head must not carry over to code the user hasn't seen. Runs before the worktree is opened.
+pub(crate) fn forget_stale_trust(checkout: &Checkout, cx: &mut App) {
+    if !checkout.head_changed {
+        return;
+    }
+    let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) else {
+        return;
+    };
+    trusted_worktrees.update(cx, |trusted_worktrees, cx| {
+        trusted_worktrees.forget_trust(&checkout.worktree, cx);
+        // Saved now, as Zed only saves trust when something is trusted.
+        trusted_worktrees.schedule_serialization(cx, |trusted_paths, cx| {
+            let database = WorkspaceDb::global(cx);
+            cx.background_spawn(async move {
+                database
+                    .save_trusted_worktrees(trusted_paths)
+                    .await
+                    .log_err();
+            })
+        });
+    });
+}
+
+/// Trusting a folder that contains Photon's review worktrees must not trust a pull request's code.
+pub(crate) fn refuse_parent_trust(root: PathBuf, cx: &mut App) {
+    if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
+        trusted_worktrees.update(cx, |trusted_worktrees, _| {
+            trusted_worktrees.refuse_parent_trust_under(root)
+        });
+    }
+}
+
 fn find_open_review(
     app_state: &AppState,
     key: &PrKey,
@@ -313,6 +346,7 @@ async fn open_in_new_window(
             }
         })
         .await?;
+    cx.update(|_, cx| forget_stale_trust(&prepared.checkout, cx))?;
     let opened = cx
         .update(|_, cx| {
             open_paths(
@@ -3204,6 +3238,7 @@ mod tests {
             worktree: PathBuf::from(path!("/repo")),
             head_sha: "head".into(),
             merge_base: "base".into(),
+            head_changed: false,
         }
     }
 
@@ -3901,6 +3936,106 @@ fn verify_password(user: &str, password: &str) -> bool {
         assert_eq!(head, fixture.pr_sha);
         assert!(text.contains("    2;"), "{text}");
         assert!(!text.contains("    1;"), "{text}");
+    }
+
+    fn worktree_trusted(project: &Entity<Project>, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| {
+            let worktree_store = project.read(cx).worktree_store();
+            let Some(worktree) = project.read(cx).worktrees(cx).next() else {
+                return false;
+            };
+            let id = worktree.read(cx).id();
+            TrustedWorktrees::try_get_global(cx)
+                .expect("trust store")
+                .update(cx, |trusted, cx| trusted.can_trust(&worktree_store, id, cx))
+        })
+    }
+
+    fn init_trust(saved: &str, cx: &mut TestAppContext) {
+        let mut saved_paths = project::trusted_worktrees::DbTrustedPaths::default();
+        saved_paths
+            .entry(None)
+            .or_default()
+            .insert(PathBuf::from(saved));
+        cx.update(|cx| project::trusted_worktrees::init(saved_paths, cx));
+    }
+
+    #[gpui::test]
+    async fn trust_does_not_survive_a_new_head(cx: &mut TestAppContext) {
+        init_test(cx);
+        init_trust(path!("/reviews/pr"), cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/reviews/pr"), json!({ "a.rs": "" }))
+            .await;
+        let mut checkout = Checkout {
+            worktree: PathBuf::from(path!("/reviews/pr")),
+            head_changed: false,
+            ..checkout()
+        };
+
+        cx.update(|cx| forget_stale_trust(&checkout, cx));
+        let project =
+            Project::test_with_worktree_trust(fs.clone(), [path!("/reviews/pr").as_ref()], cx)
+                .await;
+        assert!(
+            worktree_trusted(&project, cx),
+            "the same head stays trusted"
+        );
+
+        checkout.head_changed = true;
+        cx.update(|cx| forget_stale_trust(&checkout, cx));
+        assert!(!worktree_trusted(&project, cx));
+        let reopened =
+            Project::test_with_worktree_trust(fs, [path!("/reviews/pr").as_ref()], cx).await;
+        assert!(!worktree_trusted(&reopened, cx));
+    }
+
+    #[gpui::test]
+    async fn pr_worktree_is_never_trusted_through_a_parent(cx: &mut TestAppContext) {
+        init_test(cx);
+        init_trust(path!("/reviews"), cx);
+        cx.update(|cx| refuse_parent_trust(PathBuf::from(path!("/reviews/pr_review")), cx));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/reviews/pr_review/pr"), json!({ "a.rs": "" }))
+            .await;
+        let project =
+            Project::test_with_worktree_trust(fs, [path!("/reviews/pr_review/pr").as_ref()], cx)
+                .await;
+        assert!(!worktree_trusted(&project, cx));
+
+        cx.update(|cx| {
+            let worktree_store = project.read(cx).worktree_store();
+            TrustedWorktrees::try_get_global(cx)
+                .expect("trust store")
+                .update(cx, |trusted, cx| {
+                    trusted.trust(
+                        &worktree_store,
+                        [PathTrust::AbsPath(PathBuf::from(path!("/reviews")))]
+                            .into_iter()
+                            .collect(),
+                        cx,
+                    )
+                });
+        });
+        assert!(!worktree_trusted(&project, cx));
+
+        cx.update(|cx| {
+            let worktree_store = project.read(cx).worktree_store();
+            let worktree_ids = project
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| PathTrust::Worktree(worktree.read(cx).id()))
+                .collect();
+            TrustedWorktrees::try_get_global(cx)
+                .expect("trust store")
+                .update(cx, |trusted, cx| {
+                    trusted.trust(&worktree_store, worktree_ids, cx)
+                });
+        });
+        assert!(
+            worktree_trusted(&project, cx),
+            "trusting the worktree itself works"
+        );
     }
 
     #[gpui::test]

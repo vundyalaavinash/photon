@@ -30,4 +30,5 @@ use gpui::App;
 
 pub fn init(cx: &mut App) {
     inbox::init_inbox(cx);
+    review::refuse_parent_trust(checkout::review_root(), cx);
 }
