@@ -57,7 +57,39 @@ pub fn signature_text(snapshot: &BufferSnapshot, item: &OutlineItem<Point>) -> S
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-const MODIFIER_WORDS: [&str; 4] = ["async", "const", "unsafe", "default"];
+const MODIFIER_WORDS: [&str; 17] = [
+    "async",
+    "const",
+    "unsafe",
+    "default",
+    "static",
+    "abstract",
+    "final",
+    "override",
+    "virtual",
+    "declare",
+    "sealed",
+    "synchronized",
+    "native",
+    "readonly",
+    "open",
+    "inline",
+    "suspend",
+];
+const VISIBILITY_WORDS: [&str; 5] = ["public", "private", "protected", "internal", "export"];
+const TYPE_KEYWORDS: [&str; 11] = [
+    "class",
+    "struct",
+    "interface",
+    "enum",
+    "trait",
+    "impl",
+    "record",
+    "type",
+    "mod",
+    "module",
+    "namespace",
+];
 
 // A prefix match inside an identifier (`constant`, `public`) is not a keyword.
 fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
@@ -68,22 +100,32 @@ fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
     Some(rest.trim_start())
 }
 
-fn strip_visibility(text: &str) -> &str {
-    let text = text.trim_start();
-    match strip_keyword(text, "pub") {
-        Some(rest) if rest.starts_with('(') => rest
-            .split_once(')')
-            .map_or(rest, |(_, after)| after.trim_start()),
-        Some(rest) => rest,
-        None => text,
+fn strip_visibility(mut text: &str) -> &str {
+    loop {
+        text = text.trim_start();
+        if let Some(rest) = strip_keyword(text, "pub") {
+            text = match rest.starts_with('(') {
+                true => rest
+                    .split_once(')')
+                    .map_or(rest, |(_, after)| after.trim_start()),
+                false => rest,
+            };
+        } else if let Some(rest) = VISIBILITY_WORDS
+            .iter()
+            .find_map(|word| strip_keyword(text, word))
+        {
+            text = rest;
+        } else {
+            return text;
+        }
     }
 }
 
-/// Whether the text, once modifiers are skipped, is a `fn` item. Modifiers stay part of the
-/// compared signature because they change how callers call the function.
-fn is_function(text: &str) -> bool {
-    let mut text = text.trim_start();
+/// Modifiers stay part of the compared signature because they change how callers call the
+/// function; they are skipped only to see what kind of item the header describes.
+fn strip_modifiers(mut text: &str) -> &str {
     loop {
+        text = text.trim_start();
         let next = MODIFIER_WORDS
             .iter()
             .find_map(|word| strip_keyword(text, word))
@@ -99,18 +141,73 @@ fn is_function(text: &str) -> bool {
             });
         match next {
             Some(rest) => text = rest,
-            None => return strip_keyword(text, "fn").is_some(),
+            None => return text,
         }
     }
 }
 
+/// Outlines of most languages give no body range, so the header is cut at the first top-level
+/// `{` or `;`, or at the `:` that ends a Python `def`.
+fn header_of(text: &str) -> &str {
+    let python_def = strip_keyword(strip_modifiers(strip_visibility(text)), "def").is_some();
+    let mut nesting = 0usize;
+    let mut previous = ' ';
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' | '[' | '<' => nesting += 1,
+            ')' | ']' => nesting = nesting.saturating_sub(1),
+            '>' if previous != '-' && previous != '=' => nesting = nesting.saturating_sub(1),
+            '{' | ';' if nesting == 0 => return &text[..index],
+            ':' if python_def && nesting == 0 => return &text[..index],
+            _ => {}
+        }
+        previous = character;
+    }
+    text
+}
+
+fn assigns_at_top_level(header: &str) -> bool {
+    let characters: Vec<char> = header.chars().collect();
+    let mut nesting = 0usize;
+    for (index, character) in characters.iter().enumerate() {
+        let previous = index.checked_sub(1).and_then(|index| characters.get(index));
+        let next = characters.get(index + 1);
+        match character {
+            '(' | '[' | '<' => nesting += 1,
+            ')' | ']' => nesting = nesting.saturating_sub(1),
+            '>' if !matches!(previous, Some('-' | '=')) => nesting = nesting.saturating_sub(1),
+            '=' if nesting == 0
+                && !matches!(next, Some('>' | '='))
+                && !matches!(previous, Some('<' | '>' | '!' | '=')) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_callable(header: &str) -> bool {
+    let kind = strip_modifiers(header);
+    if TYPE_KEYWORDS
+        .iter()
+        .chain(["object"].iter())
+        .any(|keyword| strip_keyword(kind, keyword).is_some())
+        || !kind.contains('(')
+    {
+        return false;
+    }
+    // `const LIMIT: Duration = Duration::from_secs(1)` is a value, `const run = () => {}` is not.
+    !assigns_at_top_level(kind) || kind.contains("=>") || kind.contains("function")
+}
+
 /// Signature with visibility, whitespace and trailing commas removed, or `None` when the item
-/// is not a function.
-// ponytail: only Rust-style `fn` items count as functions; other languages need their own keyword.
+/// is not callable.
 fn callable_signature(snapshot: &BufferSnapshot, item: &OutlineItem<Point>) -> Option<String> {
     let collapsed = signature_text(snapshot, item);
-    let stripped = strip_visibility(&collapsed);
-    if !is_function(stripped) {
+    let stripped = header_of(strip_visibility(&collapsed)).trim_end();
+    if !is_callable(stripped) {
         return None;
     }
     let compact: Vec<char> = stripped
@@ -315,10 +412,11 @@ mod tests {
     use buffer_diff::BufferDiff;
     use fs::FakeFs;
     use gpui::TestAppContext;
-    use language::Buffer;
+    use language::{Buffer, Language};
     use project::Project;
     use serde_json::json;
     use settings::SettingsStore;
+    use std::sync::Arc;
 
     const BASE: &str = "\
 use std::fmt;
@@ -341,7 +439,15 @@ fn gone() {}
 ";
 
     async fn analyse(cx: &mut TestAppContext, base: &str, head: &str, rust: bool) -> FileAnalysis {
-        let language = rust.then(language::rust_lang);
+        analyse_with(cx, base, head, rust.then(language::rust_lang)).await
+    }
+
+    async fn analyse_with(
+        cx: &mut TestAppContext,
+        base: &str,
+        head: &str,
+        language: Option<Arc<Language>>,
+    ) -> FileAnalysis {
         let buffer = cx.new(|cx| {
             let mut buffer = Buffer::local(head, cx);
             buffer.set_language(language.clone(), cx);
@@ -598,5 +704,117 @@ trait Speak {
             .expect("analysis");
         let (found, _) = functions(analysis);
         assert_eq!(found, vec![("top".into(), FunctionChange::BodyOnly)]);
+    }
+
+    fn python_lang() -> Arc<Language> {
+        Arc::new(
+            Language::new(
+                grammars::load_config("python"),
+                Some(tree_sitter_python::LANGUAGE.into()),
+            )
+            .with_queries(grammars::load_queries("python"))
+            .expect("python queries"),
+        )
+    }
+
+    fn typescript_lang() -> Arc<Language> {
+        Arc::new(
+            Language::new(
+                grammars::load_config("typescript"),
+                Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            )
+            .with_queries(grammars::load_queries("typescript"))
+            .expect("typescript queries"),
+        )
+    }
+
+    const PYTHON: &str = "\
+import os
+
+class Greeter:
+    greeting = 'hi'
+
+    def greet(self, name: str) -> str:
+        return self.greeting + name
+
+def top(a, b):
+    return a
+";
+
+    #[gpui::test]
+    async fn python_body_and_signature_changes(cx: &mut TestAppContext) {
+        let head = PYTHON.replace("return a\n", "return a + b\n");
+        let (found, rows) = functions(analyse_with(cx, PYTHON, &head, Some(python_lang())).await);
+        assert_eq!(found, vec![("top".into(), FunctionChange::BodyOnly)]);
+        assert!(rows.is_empty());
+
+        let head = PYTHON.replace("def top(a, b)", "def top(a, b, c)");
+        let (found, _) = functions(analyse_with(cx, PYTHON, &head, Some(python_lang())).await);
+        assert_eq!(found, vec![("top".into(), FunctionChange::Signature)]);
+    }
+
+    #[gpui::test]
+    async fn python_method_is_the_method_not_the_class(cx: &mut TestAppContext) {
+        let head = PYTHON.replace("self.greeting + name", "name");
+        let (found, _) = functions(analyse_with(cx, PYTHON, &head, Some(python_lang())).await);
+        assert_eq!(found, vec![("greet".into(), FunctionChange::BodyOnly)]);
+
+        let head = PYTHON.replace("name: str", "name: bytes");
+        let (found, _) = functions(analyse_with(cx, PYTHON, &head, Some(python_lang())).await);
+        assert_eq!(found, vec![("greet".into(), FunctionChange::Signature)]);
+    }
+
+    #[gpui::test]
+    async fn python_class_attribute_edit_is_file_level(cx: &mut TestAppContext) {
+        let head = PYTHON.replace("'hi'", "'hello'");
+        let (found, rows) = functions(analyse_with(cx, PYTHON, &head, Some(python_lang())).await);
+        assert_eq!(found, vec![]);
+        assert_eq!(rows, vec![3..4]);
+    }
+
+    const TYPESCRIPT: &str = "\
+import { x } from './x';
+
+class Greeter {
+    greeting: string = 'hi';
+
+    greet(name: string): string {
+        return this.greeting + name;
+    }
+}
+
+function top(a: number, b: number): number {
+    return a;
+}
+";
+
+    #[gpui::test]
+    async fn typescript_body_and_signature_changes(cx: &mut TestAppContext) {
+        let head = TYPESCRIPT.replace("return a;", "return a + b;");
+        let (found, _) =
+            functions(analyse_with(cx, TYPESCRIPT, &head, Some(typescript_lang())).await);
+        assert_eq!(found, vec![("top".into(), FunctionChange::BodyOnly)]);
+
+        let head = TYPESCRIPT.replace("b: number)", "b: string)");
+        let (found, _) =
+            functions(analyse_with(cx, TYPESCRIPT, &head, Some(typescript_lang())).await);
+        assert_eq!(found, vec![("top".into(), FunctionChange::Signature)]);
+    }
+
+    #[gpui::test]
+    async fn typescript_method_is_the_method_not_the_class(cx: &mut TestAppContext) {
+        let head = TYPESCRIPT.replace("this.greeting + name", "name");
+        let (found, _) =
+            functions(analyse_with(cx, TYPESCRIPT, &head, Some(typescript_lang())).await);
+        assert_eq!(found, vec![("greet".into(), FunctionChange::BodyOnly)]);
+    }
+
+    #[gpui::test]
+    async fn typescript_property_edit_is_file_level(cx: &mut TestAppContext) {
+        let head = TYPESCRIPT.replace("'hi'", "'hello'");
+        let (found, rows) =
+            functions(analyse_with(cx, TYPESCRIPT, &head, Some(typescript_lang())).await);
+        assert_eq!(found, vec![]);
+        assert_eq!(rows, vec![3..4]);
     }
 }
