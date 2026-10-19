@@ -4905,6 +4905,116 @@ mod tests {
         });
     }
 
+    const KUBECTL_BLOCK: &[u8] = b"\x1b]133;A\x07\x1b]133;B\x07kubectl get pods\r\n\x1b]633;E;kubectl get pods\x07\x1b]133;C\x07NAME    READY   STATUS    AGE\r\nweb-1   1/1     Running   3d\r\nweb-2   0/1     Pending   1d\r\n\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07";
+    const JSON_BLOCK: &[u8] = b"\x1b]133;A\x07\x1b]133;B\x07curl api\r\n\x1b]633;E;curl api\x07\x1b]133;C\x07{\"a\": 1, \"b\": [1, 2]}\r\n\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07";
+
+    fn pane_beside_terminal(
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<workspace::Pane> {
+        let workspace = terminal_view
+            .read_with(cx, |view, _| view.workspace.upgrade())
+            .expect("workspace");
+        workspace.read_with(cx, |workspace, _| {
+            let terminal_pane = workspace
+                .pane_for_item_id(terminal_view.entity_id())
+                .expect("terminal pane");
+            assert_eq!(workspace.panes().len(), 2);
+            workspace
+                .panes()
+                .iter()
+                .find(|pane| pane.entity_id() != terminal_pane.entity_id())
+                .expect("beside pane")
+                .clone()
+        })
+    }
+
+    #[gpui::test]
+    async fn open_as_json_opens_json_buffer(cx: &mut TestAppContext) {
+        use crate::photon_smart_blocks_view::OpenBlockAsJson;
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.update(|_, cx| editor::init(cx));
+        let languages = terminal_view
+            .read_with(&cx, |view, cx| {
+                view.workspace
+                    .upgrade()
+                    .map(|workspace| workspace.read(cx).project().read(cx).languages().clone())
+            })
+            .expect("workspace");
+        languages.add(std::sync::Arc::new(language::Language::new(
+            language::LanguageConfig {
+                name: "JSON".into(),
+                ..Default::default()
+            },
+            None,
+        )));
+        feed_block_output(&terminal, JSON_BLOCK, &mut cx);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-up");
+        cx.dispatch_action(OpenBlockAsJson);
+        cx.run_until_parked();
+
+        let pane = pane_beside_terminal(&terminal_view, &mut cx);
+        pane.read_with(&cx, |pane, cx| {
+            let editor = pane
+                .active_item()
+                .and_then(|item| item.downcast::<Editor>())
+                .expect("editor item");
+            let editor = editor.read(cx);
+            assert_eq!(
+                editor.text(cx),
+                "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ]\n}"
+            );
+            let buffer = editor.buffer().read(cx).as_singleton().expect("buffer");
+            assert_eq!(
+                buffer
+                    .read(cx)
+                    .language()
+                    .map(|language| language.name().to_string()),
+                Some("JSON".to_string())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn open_as_table_opens_table_item(cx: &mut TestAppContext) {
+        use crate::photon_smart_blocks_view::OpenBlockAsTable;
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(&terminal, KUBECTL_BLOCK, &mut cx);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-up");
+        cx.dispatch_action(OpenBlockAsTable);
+        cx.run_until_parked();
+
+        let pane = pane_beside_terminal(&terminal_view, &mut cx);
+        pane.read_with(&cx, |pane, cx| {
+            let item = pane
+                .active_item()
+                .and_then(|item| item.downcast::<photon_terminal::TableItem>())
+                .expect("table item");
+            assert_eq!(
+                workspace::Item::tab_content_text(item.read(cx), 0, cx).as_ref(),
+                "kubectl get pods"
+            );
+            assert_eq!(item.read(cx).table().read(cx).data_row_count(), 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn copy_as_csv_writes_clipboard(cx: &mut TestAppContext) {
+        use crate::photon_smart_blocks_view::CopyBlockAsCsv;
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(&terminal, KUBECTL_BLOCK, &mut cx);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-up");
+        cx.dispatch_action(CopyBlockAsCsv);
+        let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(
+            copied.as_deref(),
+            Some("NAME,READY,STATUS,AGE\nweb-1,1/1,Running,3d\nweb-2,0/1,Pending,1d\n")
+        );
+    }
+
     #[gpui::test]
     async fn next_error_cycles_and_wraps(cx: &mut TestAppContext) {
         let (terminal, terminal_view, mut cx) = init_block_view(cx).await;

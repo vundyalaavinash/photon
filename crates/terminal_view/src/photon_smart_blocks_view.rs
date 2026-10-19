@@ -1,20 +1,24 @@
+use editor::Editor;
 use gpui::{
-    Action, Anchor, AnyElement, Div, Hsla, Pixels, Point, SharedString, Stateful, actions,
-    anchored, point, rgb,
+    Action, Anchor, AnyElement, ClipboardItem, Div, Entity, EntityId, Hsla, Pixels, Point,
+    SharedString, Stateful, actions, anchored, point, rgb,
 };
 use photon_blocks::{
-    Block, BlockId, FileState, Insight, RunDelta, SourceLocation, rerun_failed_command, url_label,
+    Block, BlockId, FileState, Insight, RunDelta, SourceLocation, rerun_failed_command,
+    table_to_csv, url_label,
 };
-use photon_terminal::{RowMark, SmartBlocks};
+use photon_terminal::{RowMark, SmartBlocks, TableItem};
 use settings::Settings as _;
-use terminal::PathLikeTarget;
 use terminal::terminal_settings::TerminalSettings;
+use terminal::{BlockPart, PathLikeTarget};
 use ui::{ButtonSize, ContextMenu, prelude::*};
+use util::ResultExt as _;
+use workspace::{Pane, Workspace};
 
 use crate::{
     TerminalView,
     photon_blocks_view::{active_blocks, layout_block_chrome},
-    terminal_path_like_target::open_location_beside_terminal,
+    terminal_path_like_target::{focus_pane_beside_center_terminal, open_location_beside_terminal},
 };
 
 actions!(
@@ -222,6 +226,17 @@ pub(crate) fn block_toolbar(block: &Block, smart_blocks: &SmartBlocks) -> Vec<To
     )
 }
 
+/// The pane to the right of a center terminal, or the active pane for the dock terminal.
+fn pane_beside_terminal(
+    workspace: &mut Workspace,
+    terminal_id: EntityId,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<Pane> {
+    focus_pane_beside_center_terminal(workspace, terminal_id, window, cx)
+        .unwrap_or_else(|| workspace.active_pane().clone())
+}
+
 fn block_locations(insight: Option<&Insight>) -> Vec<&SourceLocation> {
     match insight {
         Some(Insight::Tests(run)) => run
@@ -277,6 +292,9 @@ pub(crate) fn register_smart_block_actions(
                 smart_blocks.update(cx, |smart_blocks, cx| smart_blocks.stage_all(selected, cx));
             }
         }))
+        .on_action(cx.listener(TerminalView::open_block_as_json))
+        .on_action(cx.listener(TerminalView::open_block_as_table))
+        .on_action(cx.listener(TerminalView::copy_block_as_csv))
         .on_action(cx.listener(|this, _: &OpenBlockUrl, _, cx| {
             if let (Some(smart_blocks), Some(selected)) =
                 (this.enabled_smart_blocks(cx), this.selected_block)
@@ -307,7 +325,11 @@ pub(crate) fn smart_block_menu_items(
         .filter(|button| {
             matches!(
                 button,
-                ToolbarButton::RerunFailed | ToolbarButton::OpenErrors
+                ToolbarButton::RerunFailed
+                    | ToolbarButton::OpenErrors
+                    | ToolbarButton::OpenAsJson
+                    | ToolbarButton::OpenAsTable
+                    | ToolbarButton::CopyAsCsv
             )
         })
         .fold(menu, |menu, button| {
@@ -410,6 +432,113 @@ impl TerminalView {
         };
         self.block_error_cursor = Some((block.id, index));
         open_location_beside_terminal(&self.workspace, &target, window, cx);
+    }
+
+    fn open_block_as_json(
+        &mut self,
+        _: &OpenBlockAsJson,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(smart_blocks), Some(selected)) =
+            (self.enabled_smart_blocks(cx), self.selected_block)
+        else {
+            return;
+        };
+        if !matches!(smart_blocks.insight(selected), Some(Insight::Json)) {
+            return;
+        }
+        let Some(output) = self
+            .terminal
+            .read(cx)
+            .block_text(selected, BlockPart::Output)
+        else {
+            return;
+        };
+        let text = match output.trim() {
+            single_line if !single_line.contains('\n') => {
+                serde_json::from_str::<serde_json::Value>(single_line)
+                    .and_then(|value| serde_json::to_string_pretty(&value))
+                    .unwrap_or_else(|_| single_line.to_string())
+            }
+            _ => output,
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let terminal_id = cx.entity_id();
+        let (project, pane) = workspace.update(cx, |workspace, cx| {
+            let pane = pane_beside_terminal(workspace, terminal_id, window, cx);
+            (workspace.project().clone(), pane)
+        });
+        let language = project.read(cx).languages().language_for_name("JSON");
+        let buffer = project.update(cx, |project, cx| project.create_buffer(None, false, cx));
+        window
+            .spawn(cx, async move |cx| {
+                let buffer = buffer.await?;
+                let language = language.await.log_err();
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_text(text, cx);
+                    if let Some(language) = language {
+                        buffer.set_language(Some(language), cx);
+                    }
+                });
+                workspace.update_in(cx, |workspace, window, cx| {
+                    let editor =
+                        cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+                    workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
+                })
+            })
+            .detach_and_log_err(cx);
+    }
+
+    fn open_block_as_table(
+        &mut self,
+        _: &OpenBlockAsTable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(smart_blocks), Some(selected)) =
+            (self.enabled_smart_blocks(cx), self.selected_block)
+        else {
+            return;
+        };
+        let Some(Insight::Table(table)) = smart_blocks.insight(selected) else {
+            return;
+        };
+        let Some(block) = active_blocks(self.terminal.read(cx)).and_then(|b| b.block(selected))
+        else {
+            return;
+        };
+        let title = SharedString::from(block.command.clone());
+        let rows: Vec<Vec<String>> = std::iter::once(table.headers.clone())
+            .chain(table.rows.iter().cloned())
+            .collect();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let terminal_id = cx.entity_id();
+        // The workspace reads this view while focusing the other pane, so it must not be
+        // mid-update.
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let pane = pane_beside_terminal(workspace, terminal_id, window, cx);
+                let item = cx.new(|cx| TableItem::new(title, rows, window, cx));
+                workspace.add_item(pane, Box::new(item), None, true, true, window, cx);
+            });
+        });
+    }
+
+    fn copy_block_as_csv(&mut self, _: &CopyBlockAsCsv, _: &mut Window, cx: &mut Context<Self>) {
+        let (Some(smart_blocks), Some(selected)) =
+            (self.enabled_smart_blocks(cx), self.selected_block)
+        else {
+            return;
+        };
+        if let Some(Insight::Table(table)) = smart_blocks.insight(selected) {
+            let csv = table_to_csv(table);
+            cx.write_to_clipboard(ClipboardItem::new_string(csv));
+        }
     }
 
     /// Insights recorded before `terminal.smart_blocks` was turned off stay hidden.

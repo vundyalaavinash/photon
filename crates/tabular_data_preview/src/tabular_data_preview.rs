@@ -51,6 +51,26 @@ pub struct TabularDataPreviewPane {
     _table_subscription: gpui::Subscription,
 }
 
+// photon: lets a terminal block's table output feed a `TableView` without an editor buffer.
+/// The first row becomes the headers.
+pub fn table_contents(rows: Vec<Vec<String>>) -> types::TableLikeContent {
+    let csv: String = rows
+        .iter()
+        .map(|row| {
+            let record: Vec<String> = row
+                .iter()
+                .map(|cell| format!("\"{}\"", cell.replace('"', "\"\"")))
+                .collect();
+            record.join(",") + "\n"
+        })
+        .collect();
+    let Ok(buffer_id) = text::BufferId::new(1) else {
+        return types::TableLikeContent::default();
+    };
+    let buffer = text::Buffer::new(text::ReplicaId::LOCAL, buffer_id, csv);
+    parser::from_buffer_with_delimiter(&buffer.snapshot(), ',')
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         TabularDataPreviewPane::register(workspace);

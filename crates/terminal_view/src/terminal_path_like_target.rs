@@ -1,7 +1,7 @@
 use super::{HoverTarget, HoveredWord, TerminalView};
 use anyhow::Result;
 use editor::items::open_resolved_target;
-use gpui::{Context, EntityId, Focusable as _, Task, TaskExt, WeakEntity, Window};
+use gpui::{Context, Entity, EntityId, Focusable as _, Task, TaskExt, WeakEntity, Window};
 use std::path::PathBuf;
 use terminal::PathLikeTarget;
 use workspace::path_link::PathMatching;
@@ -11,7 +11,7 @@ use workspace::path_link::resolve_open_target;
 use workspace::path_link::{
     BackgroundPathChecks, OpenTargetFoundBy, resolve_open_target_with_fs_checks,
 };
-use workspace::{Workspace, path_link::OpenTarget};
+use workspace::{Pane, Workspace, path_link::OpenTarget};
 
 pub(super) fn hover_path_like_target(
     workspace: &WeakEntity<Workspace>,
@@ -189,7 +189,7 @@ fn open_target_beside_terminal(
         if open_target.is_file() {
             let terminal_id = terminal_view.entity_id();
             workspace.update_in(cx, |workspace, window, cx| {
-                focus_pane_beside_center_terminal(workspace, terminal_id, window, cx)
+                focus_pane_beside_center_terminal(workspace, terminal_id, window, cx);
             })?;
         }
         let opened = open_resolved_target(&workspace, &open_target, cx).await?;
@@ -198,20 +198,20 @@ fn open_target_beside_terminal(
 }
 
 /// Does nothing for the dock terminal, which already opens files in the center.
-fn focus_pane_beside_center_terminal(
+// photon: also used to open block output as JSON or a table.
+pub(super) fn focus_pane_beside_center_terminal(
     workspace: &mut Workspace,
     terminal_id: EntityId,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) {
-    let Some(terminal_pane) = workspace.pane_for_item_id(terminal_id) else {
-        return;
-    };
+) -> Option<Entity<Pane>> {
+    let terminal_pane = workspace.pane_for_item_id(terminal_id)?;
     if !workspace.panes().contains(&terminal_pane) {
-        return;
+        return None;
     }
     let target_pane = workspace.adjacent_pane_of(&terminal_pane, window, cx);
     window.focus(&target_pane.focus_handle(cx), cx);
+    Some(target_pane)
 }
 
 #[cfg(test)]

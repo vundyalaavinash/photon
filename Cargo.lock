@@ -13489,6 +13489,7 @@ dependencies = [
  "project",
  "settings",
  "smol",
+ "tabular_data_preview",
  "tempfile",
  "terminal",
  "theme",
