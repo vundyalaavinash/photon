@@ -1,4 +1,4 @@
-   Compiling demo v0.1.0 (/private/tmp/claude-501/-Users-avinashvundyala-Documents-github-warpspeed/22e086d0-f1ce-433f-b93b-f276571f3428/scratchpad/rs)
+   Compiling demo v0.1.0 (/work/demo)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
      Running unittests src/lib.rs (target/debug/deps/demo-01aee8672a305f11)
 

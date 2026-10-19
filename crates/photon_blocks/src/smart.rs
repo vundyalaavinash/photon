@@ -110,24 +110,25 @@ static CARGO_PANIC: LazyLock<Regex> =
     LazyLock::new(|| regex(r"panicked at (.+?):([0-9]+):([0-9]+):?$"));
 static NEXTEST_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
     regex(
-        r"Summary \[[^\]]*\][ 	]+[0-9]+ tests? run: ([0-9]+) passed(?: \([0-9]+ slow\))?(?:, ([0-9]+) failed)?",
+        r"Summary \[[^\]]*\][ \t]+[0-9]+ tests? run: ([0-9]+) passed(?: \([0-9]+ slow\))?(?:, ([0-9]+) failed)?",
     )
 });
 static NEXTEST_FAIL: LazyLock<Regex> =
-    LazyLock::new(|| regex(r"^[ 	]*FAIL \[[^\]]*\](?: \([0-9]+/[0-9]+\))? .*?([^ 	]+)$"));
+    LazyLock::new(|| regex(r"^[ \t]*FAIL \[[^\]]*\](?: \([0-9]+/[0-9]+\))? .*?([^ \t]+)$"));
 static PYTEST_SUMMARY: LazyLock<Regex> =
     LazyLock::new(|| regex(r"^=+ (.+) in [[0-9].]+s(?: \(.*\))? =+$"));
-static PYTEST_FAILED: LazyLock<Regex> = LazyLock::new(|| regex(r"^FAILED ([^ 	]+)"));
+static PYTEST_FAILED: LazyLock<Regex> = LazyLock::new(|| regex(r"^FAILED ([^ \t]+)"));
 static PYTEST_SECTION: LazyLock<Regex> = LazyLock::new(|| regex(r"^_{2,} (.+?) _{2,}$"));
-static PYTEST_TRACEBACK: LazyLock<Regex> = LazyLock::new(|| regex(r"^([^ 	]+\.py):([0-9]+): "));
+static PYTEST_TRACEBACK: LazyLock<Regex> = LazyLock::new(|| regex(r"^([^ \t]+\.py):([0-9]+): "));
 static COUNT: LazyLock<Regex> = LazyLock::new(|| regex(r"([0-9]+) (failed|passed)"));
 static JEST_SUMMARY: LazyLock<Regex> =
-    LazyLock::new(|| regex(r"^[ 	]*Tests(?::[ 	]+|[ 	]{2,})(.*(?:failed|passed).*)$"));
-static JEST_FAILURE: LazyLock<Regex> = LazyLock::new(|| regex(r"^[ 	]*● (.+ › .+)$"));
-static VITEST_FAILURE: LazyLock<Regex> = LazyLock::new(|| regex(r"^[ 	]*FAIL[ 	]+[^ 	]+ > (.+)$"));
-static GO_RESULT: LazyLock<Regex> = LazyLock::new(|| regex(r"^--- (FAIL|PASS|SKIP): ([^ 	]+) \("));
-static GO_PACKAGE: LazyLock<Regex> = LazyLock::new(|| regex(r"^(?:ok|FAIL)\t"));
-static GO_LOCATION: LazyLock<Regex> = LazyLock::new(|| regex(r"^[ 	]+([^ 	]+\.go):([0-9]+):"));
+    LazyLock::new(|| regex(r"^[ \t]*Tests(?::[ \t]+|[ \t]{2,})(.*(?:failed|passed).*)$"));
+static JEST_FAILURE: LazyLock<Regex> = LazyLock::new(|| regex(r"^[ \t]*● (.+ › .+)$"));
+static VITEST_FAILURE: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"^[ \t]*FAIL[ \t]+[^ \t]+ > (.+)$"));
+static GO_RESULT: LazyLock<Regex> = LazyLock::new(|| regex(r"^--- (FAIL|PASS|SKIP): ([^ \t]+) \("));
+static GO_PACKAGE: LazyLock<Regex> = LazyLock::new(|| regex(r"^(?:ok[ ]*|FAIL)\t"));
+static GO_LOCATION: LazyLock<Regex> = LazyLock::new(|| regex(r"^[ \t]+([^ \t]+\.go):([0-9]+):"));
 static GO_BOUNDARY: LazyLock<Regex> = LazyLock::new(|| regex(r"^(?:--- |FAIL|ok|PASS)"));
 
 fn number(captures: &regex::Captures, group: usize) -> usize {
@@ -301,10 +302,16 @@ fn recognise_jest(lines: &[OutputLine]) -> Option<TestRun> {
 
 fn recognise_go(lines: &[OutputLine]) -> Option<TestRun> {
     let (mut passed, mut failed, mut found) = (0, 0, false);
+    let (mut passed_packages, mut failed_packages) = (0, 0);
     let mut failures = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         if GO_PACKAGE.is_match(&line.text) {
             found = true;
+            if line.text.starts_with("ok") {
+                passed_packages += 1;
+            } else {
+                failed_packages += 1;
+            }
         }
         let Some(captures) = GO_RESULT.captures(&line.text) else {
             continue;
@@ -338,6 +345,10 @@ fn recognise_go(lines: &[OutputLine]) -> Option<TestRun> {
             }
             _ => {}
         }
+    }
+    // Plain `go test` prints no per-test lines for passing runs, so fall back to package granularity.
+    if passed == 0 && failed == 0 {
+        (passed, failed) = (passed_packages, failed_packages);
     }
     found.then_some(TestRun {
         tool: TestTool::Go,
@@ -469,6 +480,14 @@ mod tests {
         assert_eq!((run.failed, run.passed), (1, 1));
         assert_eq!(names(&run), ["TestBad"]);
         assert_eq!(run.failures[0].location, location("a_test.go", 5, None));
+    }
+
+    #[test]
+    fn go_plain_passing_run_counts_packages() {
+        let run = tests_of(include_str!("../test_fixtures/smart/go_plain_pass.txt"));
+        assert_eq!(run.tool, TestTool::Go);
+        assert_eq!((run.failed, run.passed), (0, 2));
+        assert!(run.failures.is_empty());
     }
 
     #[test]
