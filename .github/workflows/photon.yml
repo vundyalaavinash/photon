@@ -36,16 +36,17 @@ jobs:
           ./script/clippy -p photon_brand -p paths -p release_channel -p cli -p install_cli
           -p agent_ui -p extension_host -p extensions_ui -p settings -p settings_content
           -p project -p workspace -p zed_credentials_provider -p zed
+          -p ui
           -p photon_blocks -p photon_terminal -p terminal -p terminal_view
           -p tabular_data_preview
       - name: Tests (Photon-touched crates)
         run: >
           cargo nextest run -p photon_brand -p paths -p release_channel -p cli -p install_cli
-          -p agent_ui -p project -p settings -p theme_settings -p zed_credentials_provider -p zed
+          -p agent_ui -p project -p settings -p settings_content -p ui -p theme_settings -p zed_credentials_provider -p zed
           -p photon_blocks -p photon_terminal -p terminal -p terminal_view
           -p tabular_data_preview
           -E 'package(photon_brand) | package(paths) | package(release_channel) | package(cli)
-          | package(settings) | package(theme_settings) | package(zed_credentials_provider)
+          | package(settings) | package(settings_content) | package(ui) | package(theme_settings) | package(zed_credentials_provider)
           | package(photon_blocks) | package(photon_terminal) | package(terminal) | package(terminal_view)
           | package(tabular_data_preview)
           | test(photon) | test(new_window)

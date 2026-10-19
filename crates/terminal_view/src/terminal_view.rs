@@ -3996,6 +3996,37 @@ mod tests {
                 "no chip"
             );
         });
+
+        use crate::photon_smart_blocks_view::ToolbarButton;
+        let labels = terminal_view.update_in(&mut cx, |view, window, cx| {
+            view.deploy_context_menu(gpui::point(px(10.), px(10.)), false, window, cx);
+            let (menu, _, _) = view.context_menu.as_ref().expect("context menu");
+            menu.read(cx).entry_labels()
+        });
+        for sp1a in [
+            "Copy Command",
+            "Copy Output",
+            "Copy Command and Output",
+            "Re-run Command",
+        ] {
+            assert!(
+                labels.iter().any(|label| label == sp1a),
+                "{sp1a}: {labels:?}"
+            );
+        }
+        for button in [
+            ToolbarButton::RerunFailed,
+            ToolbarButton::OpenErrors,
+            ToolbarButton::OpenAsJson,
+            ToolbarButton::OpenAsTable,
+            ToolbarButton::CopyAsCsv,
+        ] {
+            let label = button.label(None);
+            assert!(
+                labels.iter().all(|shown| *shown != label),
+                "{label}: {labels:?}"
+            );
+        }
     }
 
     #[gpui::test]

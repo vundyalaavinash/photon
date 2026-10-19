@@ -718,6 +718,125 @@ mod tests {
         })
     }
 
+    const PERF_COMMANDS: usize = 1_000;
+    const PERF_LINES_PER_COMMAND: usize = 100;
+    const PERF_RUNS: usize = 9;
+
+    /// CPU time of the calling thread, which runs the whole test app: time spent
+    /// preempted on a busy machine does not count.
+    fn thread_cpu_time() -> Duration {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `time` is a valid, writable timespec for the duration of the call.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+        assert_eq!(result, 0, "clock_gettime failed");
+        Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+    }
+
+    /// Streams 100,000 lines as 1,000 `pytest` commands, one PTY read and Wakeup each, and
+    /// returns the foreground CPU time. Recognition runs on the background executor, which only
+    /// runs after the timed section, so this is the cost the UI thread pays.
+    fn stream_commands(cx: &mut TestAppContext, with_smart_blocks: bool) -> Duration {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            cx.set_app_identity("photon", "Photon");
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    let terminal = settings.terminal.get_or_insert_default();
+                    terminal.smart_blocks = Some(with_smart_blocks);
+                    terminal.blocks = Some(with_smart_blocks);
+                });
+            });
+        });
+        let terminal = cx.new(|cx| {
+            let mut terminal = terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                Some(10_000),
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx);
+            if with_smart_blocks {
+                terminal.enable_blocks_for_test(cx);
+            }
+            terminal
+        });
+        let cx = cx.add_empty_window();
+        cx.deactivate_window();
+        let _smart_blocks = with_smart_blocks.then(|| {
+            cx.update(|window, cx| {
+                cx.new(|cx| {
+                    SmartBlocks::new(terminal.clone(), WeakEntity::new_invalid(), window, cx)
+                })
+            })
+        });
+        let reads: Vec<Vec<u8>> = (0..PERF_COMMANDS)
+            .map(|_| {
+                let mut output = "lorem ipsum dolor sit amet\r\n".repeat(PERF_LINES_PER_COMMAND);
+                output.push_str("== 1 failed, 1 passed in 0.02s ==\r\n");
+                command("pytest", &output).into_bytes()
+            })
+            .collect();
+        let started = thread_cpu_time();
+        for read in &reads {
+            terminal.update(cx, |terminal, cx| terminal.write_raw_output(read, cx));
+            terminal.update(cx, |terminal, cx| terminal.process_wakeup_for_test(cx));
+        }
+        let elapsed = thread_cpu_time() - started;
+        cx.run_until_parked();
+        if let Some(smart_blocks) = &_smart_blocks {
+            let last = block_ids(&terminal, cx).last().copied();
+            smart_blocks.read_with(cx, |smart_blocks, _| {
+                assert!(last.is_some_and(|id| smart_blocks.insight(id).is_some()));
+            });
+        }
+        elapsed
+    }
+
+    /// The fastest run is the least disturbed by other load on the machine.
+    fn fastest(durations: Vec<Duration>) -> Duration {
+        durations.into_iter().min().unwrap_or_default()
+    }
+
+    fn measure_smart_blocks_overhead(cx: &mut TestAppContext) -> (Duration, Duration) {
+        let mut without = Vec::new();
+        let mut with = Vec::new();
+        // Interleaved, so a burst of load on the machine hits both sides.
+        for _ in 0..PERF_RUNS {
+            without.push(stream_commands(cx, false));
+            with.push(stream_commands(cx, true));
+        }
+        (fastest(without), fastest(with))
+    }
+
+    #[gpui::test]
+    async fn smart_blocks_heavy_output_within_10_percent(cx: &mut TestAppContext) {
+        let (without, with) = measure_smart_blocks_overhead(cx);
+        eprintln!(
+            "100,000 lines, foreground CPU time: blocks off {without:?}, smart blocks on {with:?}"
+        );
+        assert!(
+            with.as_secs_f64() <= without.as_secs_f64() * 1.10,
+            "smart blocks on {with:?} vs blocks off {without:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn smart_blocks_per_command_overhead_under_1ms(cx: &mut TestAppContext) {
+        let (without, with) = measure_smart_blocks_overhead(cx);
+        let per_command_secs = (with.as_secs_f64() - without.as_secs_f64()) / PERF_COMMANDS as f64;
+        eprintln!(
+            "smart blocks per-command UI-thread overhead: {:.1} us (blocks off {without:?}, on {with:?})",
+            per_command_secs * 1e6
+        );
+        assert!(per_command_secs < 0.001, "{per_command_secs}s per command");
+    }
+
     #[gpui::test]
     async fn finished_test_block_gets_insight(cx: &mut TestAppContext) {
         let (terminal, smart, cx) = setup(cx, true);
