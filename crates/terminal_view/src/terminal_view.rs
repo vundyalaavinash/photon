@@ -3957,6 +3957,48 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn smart_blocks_off_shows_sp1a_blocks(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.terminal.get_or_insert_default().smart_blocks = Some(false);
+                });
+            });
+        });
+        feed_block_output(&terminal, FAILED_CARGO_TEST, &mut cx);
+        cx.run_until_parked();
+        let ids = block_ids(&terminal, &mut cx);
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(selected(&terminal_view, &mut cx), ids.last().copied());
+
+        terminal_view.update(&mut cx, |view, cx| {
+            let (smart_blocks, _) = view.smart_blocks.as_ref().expect("smart blocks");
+            assert!(
+                ids.iter()
+                    .all(|id| smart_blocks.read(cx).insight(*id).is_none()),
+                "no insights are computed while smart blocks are off"
+            );
+            assert!(view.enabled_smart_blocks(cx).is_none());
+            assert!(view.smart_block_overlay(cx).is_none(), "no toolbar");
+            assert!(view.selected_block_buttons(cx).is_empty(), "no menu items");
+            let terminal = terminal.read(cx);
+            let screen_rows = terminal.last_content.terminal_bounds.num_lines();
+            let chrome = photon_blocks_view::layout_block_chrome(
+                terminal,
+                view.selected_block(),
+                view.enabled_smart_blocks(cx),
+                screen_rows,
+            );
+            assert!(!chrome.is_empty());
+            assert!(
+                chrome.iter().all(|chrome| chrome.summary.is_none()),
+                "no chip"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn chip_painted_for_failed_test_block(cx: &mut TestAppContext) {
         let (terminal, terminal_view, cx) = init_smart_block_view(cx).await;
         let summaries = terminal_view.read_with(&cx, |view, cx| {
