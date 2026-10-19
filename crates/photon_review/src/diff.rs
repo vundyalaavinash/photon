@@ -358,7 +358,6 @@ pub fn build_loaded_file(
     let fs = project.read(cx).fs().clone();
     let buffer_task = if diff.status == FileStatus::Deleted {
         let registry = registry.clone();
-        let abs_path = abs_path.clone();
         cx.spawn(async move |cx| {
             let language = registry.load_language_for_file_path(&abs_path).await.ok();
             Ok(Some(cx.new(|cx| {
