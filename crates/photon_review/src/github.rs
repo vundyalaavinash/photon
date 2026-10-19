@@ -1,9 +1,11 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::RangeInclusive;
 
 use anyhow::{Context as _, Result, anyhow};
 use serde::Deserialize;
 
-use crate::gh::{GhRequest, graphql_request};
+use crate::gh::{GhRequest, graphql_request, rest_request};
+use crate::{Draft, Placement, place, quoted_body, review_body};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PrKey {
@@ -550,6 +552,171 @@ pub fn parse_detail(key: &PrKey, json: &str) -> Result<PrDetail> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewEvent {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl ReviewEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewEvent::Comment => "COMMENT",
+            ReviewEvent::Approve => "APPROVE",
+            ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+}
+
+fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Left => "LEFT",
+        Side::Right => "RIGHT",
+    }
+}
+
+/// Whether Submit sends this draft. Outdated drafts stay local until the user re-places them or
+/// posts them as general comments; a draft not yet re-anchored to this head would land on the
+/// wrong lines, so it waits too.
+pub fn is_sendable(draft: &Draft, head_sha: &str) -> bool {
+    !draft.body.trim().is_empty()
+        && (draft.general || (!draft.outdated && draft.commit == head_sha))
+}
+
+pub fn review_request(
+    key: &PrKey,
+    head_sha: &str,
+    event: ReviewEvent,
+    summary: &str,
+    drafts: &[Draft],
+    commentable: &HashMap<String, Vec<RangeInclusive<u32>>>,
+    language_for_path: &dyn Fn(&str) -> Option<String>,
+) -> GhRequest {
+    let mut comments = Vec::new();
+    let mut body_drafts = Vec::new();
+    for draft in drafts.iter().filter(|draft| is_sendable(draft, head_sha)) {
+        // The quote links to the commit the lines were read at, which is the head unless the
+        // draft is an outdated one posted as a general comment.
+        let quoted = || {
+            quoted_body(
+                draft,
+                key,
+                &draft.commit,
+                language_for_path(&draft.path).as_deref(),
+            )
+        };
+        match place(draft, commentable) {
+            Placement::Line {
+                path,
+                side,
+                start_line,
+                line,
+            } => {
+                let mut comment = serde_json::json!({
+                    "path": path,
+                    "body": draft.body,
+                    "line": line,
+                    "side": side_name(side),
+                });
+                if let Some(start_line) = start_line {
+                    comment["start_line"] = start_line.into();
+                    comment["start_side"] = side_name(side).into();
+                }
+                comments.push(comment);
+            }
+            Placement::NearestLine { path, line } => comments.push(serde_json::json!({
+                "path": path,
+                "line": line,
+                "side": "RIGHT",
+                "body": quoted(),
+            })),
+            Placement::ReviewBody { .. } => body_drafts.push((draft, quoted())),
+        }
+    }
+    rest_request(
+        &key.host,
+        "POST",
+        &format!(
+            "repos/{}/{}/pulls/{}/reviews",
+            key.owner, key.repo, key.number
+        ),
+        Some(serde_json::json!({
+            "commit_id": head_sha,
+            "event": event.as_str(),
+            "body": review_body(summary, &body_drafts),
+            "comments": comments,
+        })),
+    )
+}
+
+pub fn reply_request(key: &PrKey, comment_database_id: u64, body: &str) -> GhRequest {
+    rest_request(
+        &key.host,
+        "POST",
+        &format!(
+            "repos/{}/{}/pulls/{}/comments/{comment_database_id}/replies",
+            key.owner, key.repo, key.number
+        ),
+        Some(serde_json::json!({ "body": body })),
+    )
+}
+
+pub fn resolve_request(host: &str, thread_id: &str, resolved: bool) -> GhRequest {
+    let mutation = if resolved {
+        "resolveReviewThread"
+    } else {
+        "unresolveReviewThread"
+    };
+    graphql_request(
+        host,
+        &format!(
+            "mutation($threadId: ID!) {{ {mutation}(input: {{threadId: $threadId}}) \
+             {{ thread {{ isResolved }} }} }}"
+        ),
+        serde_json::json!({ "threadId": thread_id }),
+    )
+}
+
+pub fn viewed_request(host: &str, pr_node_id: &str, path: &str, viewed: bool) -> GhRequest {
+    let mutation = if viewed {
+        "markFileAsViewed"
+    } else {
+        "unmarkFileAsViewed"
+    };
+    graphql_request(
+        host,
+        &format!(
+            "mutation($pullRequestId: ID!, $path: String!) {{ \
+             {mutation}(input: {{pullRequestId: $pullRequestId, path: $path}}) \
+             {{ clientMutationId }} }}"
+        ),
+        serde_json::json!({ "pullRequestId": pr_node_id, "path": path }),
+    )
+}
+
+pub fn parse_mutation(json: &str) -> Result<()> {
+    parse_response::<serde_json::Value>(json).map(|_| ())
+}
+
+#[derive(Deserialize)]
+struct RawRestComment {
+    id: u64,
+    user: Option<RawLogin>,
+    body: String,
+    created_at: String,
+}
+
+pub fn parse_reply(json: &str) -> Result<ThreadComment> {
+    let comment: RawRestComment = serde_json::from_str(json).context("parsing GitHub reply")?;
+    Ok(ThreadComment {
+        database_id: comment.id,
+        author: author_login(comment.user.as_ref()),
+        body: comment.body,
+        created_at: comment.created_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +907,171 @@ mod tests {
                 "{search}"
             );
         }
+    }
+
+    fn draft(path: &str, start_line: u32, end_line: u32, body: &str) -> crate::Draft {
+        crate::Draft {
+            id: None,
+            key: key(),
+            path: path.into(),
+            side: Side::Right,
+            start_line,
+            end_line,
+            commit: "head".into(),
+            anchor_text: "    audit(user);".into(),
+            body: body.into(),
+            outdated: false,
+            general: false,
+        }
+    }
+
+    fn stdin_json(request: &GhRequest) -> serde_json::Value {
+        serde_json::from_str(request.stdin.as_deref().expect("stdin")).expect("json")
+    }
+
+    #[test]
+    fn review_request_shape() {
+        let commentable =
+            std::collections::HashMap::from_iter([("src/upload.rs".to_string(), vec![40..=43])]);
+        let mut left = draft("src/upload.rs", 10, 11, "Why drop this?");
+        left.side = Side::Left;
+        let mut outdated = draft("src/upload.rs", 41, 41, "Stale");
+        outdated.outdated = true;
+        let mut general = draft("src/upload.rs", 41, 41, "Still true");
+        general.outdated = true;
+        general.general = true;
+        let drafts = vec![
+            draft("src/upload.rs", 42, 42, "Retry forever?"),
+            draft("src/upload.rs", 47, 47, "Unchanged here"),
+            draft("src/audit.rs", 3, 3, "Audit this"),
+            left,
+            outdated,
+            general,
+            draft("src/upload.rs", 41, 41, "  "),
+        ];
+        let request = review_request(
+            &key(),
+            "head",
+            ReviewEvent::RequestChanges,
+            "Needs work.",
+            &drafts,
+            &commentable,
+            &|path| path.ends_with(".rs").then(|| "rust".to_string()),
+        );
+        assert_eq!(
+            request.args,
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "POST",
+                "repos/acme/web/pulls/482/reviews",
+                "--input",
+                "-"
+            ]
+        );
+        let body = stdin_json(&request);
+        assert_eq!(body["commit_id"], "head");
+        assert_eq!(body["event"], "REQUEST_CHANGES");
+        let unchanged = crate::quoted_body(&drafts[1], &key(), "head", Some("rust"));
+        assert_eq!(
+            body["comments"],
+            serde_json::json!([
+                {"path": "src/upload.rs", "body": "Retry forever?", "line": 42, "side": "RIGHT"},
+                {"path": "src/upload.rs", "line": 43, "side": "RIGHT", "body": unchanged},
+                {"path": "src/upload.rs", "body": "Why drop this?", "line": 11, "side": "LEFT",
+                 "start_line": 10, "start_side": "LEFT"},
+            ])
+        );
+        let review_body = body["body"].as_str().expect("body");
+        assert!(review_body.starts_with("Needs work.\n\n### src/audit.rs\n\n"));
+        assert!(review_body.contains("Audit this"));
+        assert!(review_body.contains("Still true"));
+        assert!(!review_body.contains("Stale"));
+        assert_eq!(ReviewEvent::Comment.as_str(), "COMMENT");
+        assert_eq!(ReviewEvent::Approve.as_str(), "APPROVE");
+    }
+
+    #[test]
+    fn reply_resolve_and_viewed_requests() {
+        let reply = reply_request(&key(), 1001, "Agreed.");
+        assert_eq!(
+            reply.args,
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "POST",
+                "repos/acme/web/pulls/482/comments/1001/replies",
+                "--input",
+                "-"
+            ]
+        );
+        assert_eq!(stdin_json(&reply), serde_json::json!({"body": "Agreed."}));
+
+        for (resolved, mutation) in [
+            (true, "resolveReviewThread"),
+            (false, "unresolveReviewThread"),
+        ] {
+            let request = resolve_request("ghe.corp", "PRRT_1", resolved);
+            assert_eq!(
+                request.args,
+                graphql_request("ghe.corp", "", serde_json::json!({})).args
+            );
+            let body = stdin_json(&request);
+            assert_eq!(body["variables"], serde_json::json!({"threadId": "PRRT_1"}));
+            let query = body["query"].as_str().expect("query");
+            assert!(
+                query.contains(&format!("{mutation}(input: {{threadId: $threadId}})")),
+                "{query}"
+            );
+        }
+
+        for (viewed, mutation) in [(true, "markFileAsViewed"), (false, "unmarkFileAsViewed")] {
+            let body = stdin_json(&viewed_request(
+                "github.com",
+                "PR_482",
+                "src/a b.rs",
+                viewed,
+            ));
+            assert_eq!(
+                body["variables"],
+                serde_json::json!({"pullRequestId": "PR_482", "path": "src/a b.rs"})
+            );
+            let query = body["query"].as_str().expect("query");
+            assert!(
+                query.contains(&format!(
+                    "{mutation}(input: {{pullRequestId: $pullRequestId, path: $path}})"
+                )),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_and_reply_responses() {
+        assert!(parse_mutation(r#"{"data":{"resolveReviewThread":{}}}"#).is_ok());
+        assert_eq!(
+            parse_mutation(r#"{"data":null,"errors":[{"message":"no access"}]}"#)
+                .expect_err("error")
+                .to_string(),
+            "no access"
+        );
+        let comment = parse_reply(
+            r#"{"id":2001,"user":{"login":"carol"},"body":"Agreed.","created_at":"2026-10-02T09:00:00Z"}"#,
+        )
+        .expect("reply");
+        assert_eq!(
+            comment,
+            ThreadComment {
+                database_id: 2001,
+                author: "carol".into(),
+                body: "Agreed.".into(),
+                created_at: "2026-10-02T09:00:00Z".into(),
+            }
+        );
     }
 
     #[test]

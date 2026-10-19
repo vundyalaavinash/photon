@@ -3,7 +3,7 @@ use std::ops::{Range, RangeInclusive};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use buffer_diff::BufferDiff;
 use editor::{
     Anchor, Editor, EditorEvent, ExcerptRange, MultiBuffer, MultiBufferSnapshot, PathKey,
@@ -14,8 +14,8 @@ use editor::{
 };
 use futures::future::{join_all, try_join_all};
 use gpui::{
-    Action as _, AnyWindowHandle, App, AsyncApp, AsyncWindowContext, Context, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Global, HighlightStyle, PromptLevel, Render,
+    Action as _, AnyWindowHandle, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, Global, HighlightStyle, PromptLevel, Render,
     SharedString, Stateful, StyledText, Subscription, Task, WeakEntity, Window, actions, rgb,
 };
 use language::{Buffer, Capability, Point};
@@ -26,7 +26,7 @@ use project::{
     lsp_store::OpenLspBufferHandle,
     trusted_worktrees::{TrustedWorktrees, TrustedWorktreesEvent},
 };
-use ui::prelude::*;
+use ui::{Checkbox, ToggleState, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
     AppState, Item, OpenMode, OpenOptions, Toast, ToggleWorktreeSecurity, Workspace,
@@ -37,11 +37,13 @@ use crate::{
     CallerMark, ChangedFunction, Checkout, ChecksState, ContextCache, ContextError, ContextExcerpt,
     Draft, FileAnalysis, FileDiff, FileKind, FileStatus, FunctionContext, GhError, GhRunner,
     LoadedFile, MapFile, MapFunction, PrDetail, PrKey, PrSummary, Reanchor, RepoId, ReviewDb,
-    ReviewThread, Side, Step, Tracked, analyse_loaded_file, auth_status_request, base_text,
-    build_loaded_file, build_review_map, call_edges, caller_touched, candidate_repos,
+    ReviewEvent, ReviewThread, Side, Step, Tracked, analyse_loaded_file, auth_status_request,
+    base_text, build_loaded_file, build_review_map, call_edges, caller_touched, candidate_repos,
     classify_caller, classify_path, commentable_lines, context::buffer_path, context_excerpts,
     deleted_lines, detail_request, fetch_url, find_clone, functions, gh_runner, git_diff,
-    landing_note, parse_auth_status, parse_detail, place, prepare_checkout, reanchor, review_root,
+    is_sendable, landing_note, parse_auth_status, parse_detail, parse_mutation, parse_reply, place,
+    prepare_checkout, reanchor, reply_request, resolve_request, review_request, review_root,
+    viewed_request,
 };
 
 actions!(
@@ -163,6 +165,12 @@ pub struct ReviewItem {
     next_draft_id: usize,
     reply_editors: HashMap<String, Entity<Editor>>,
     comment_blocks: HashSet<CustomBlockId>,
+    login: String,
+    summary_editor: Entity<Editor>,
+    submitting: bool,
+    submit_error: Option<SharedString>,
+    thread_errors: HashMap<String, SharedString>,
+    file_errors: HashMap<String, SharedString>,
     _reanchor_task: Task<()>,
     _lsp_handles: Vec<OpenLspBufferHandle>,
     _subscriptions: Vec<Subscription>,
@@ -170,6 +178,7 @@ pub struct ReviewItem {
 }
 
 pub(crate) struct PreparedReview {
+    pub login: String,
     pub checkout: Checkout,
     pub detail: PrDetail,
     pub files: Vec<(FileDiff, Option<String>)>,
@@ -313,6 +322,7 @@ async fn place_review(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let PreparedReview {
+        login,
         checkout,
         detail,
         files,
@@ -334,8 +344,11 @@ async fn place_review(
             let existing = workspace
                 .items_of_type::<ReviewItem>(cx)
                 .find(|item| item.read(cx).detail.summary.key == key);
-            let item = cx
-                .new(|cx| ReviewItem::new(project, detail, checkout, files, database, window, cx));
+            let item = cx.new(|cx| {
+                ReviewItem::new(
+                    project, detail, login, checkout, files, database, window, cx,
+                )
+            });
             let pane = existing.as_ref().and_then(|existing| {
                 workspace
                     .panes()
@@ -403,6 +416,7 @@ pub(crate) async fn prepare_review(
         files.push((diff, base));
     }
     Ok(PreparedReview {
+        login,
         checkout,
         detail,
         files,
@@ -595,29 +609,52 @@ fn draft_renderer(
     })
 }
 
-/// Reply and Resolve are wired to GitHub in Task 11.
-fn thread_renderer(thread: ReviewThread, reply: Option<Entity<Editor>>) -> RenderBlock {
+fn thread_renderer(
+    item: WeakEntity<ReviewItem>,
+    thread: ReviewThread,
+    reply: Option<Entity<Editor>>,
+    error: Option<SharedString>,
+) -> RenderBlock {
     Arc::new(move |block: &mut BlockContext| {
         let id = SharedString::from(format!("photon-review-thread-{}", thread.id));
+        let reply_item = item.clone();
+        let resolve_item = item.clone();
+        let reply_thread = thread.id.clone();
+        let resolve_thread = thread.id.clone();
+        let resolved = thread.is_resolved;
         comment_card(id.into(), block)
             .children(thread.comments.iter().map(|comment| {
                 v_flex()
                     .child(Label::new(comment.author.clone()).size(LabelSize::Small))
                     .child(Label::new(comment.body.clone()).size(LabelSize::Small))
             }))
+            .children(error.clone().map(|error| {
+                Label::new(error)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
+            }))
             .child(
                 h_flex()
                     .gap_1()
                     .children(reply.clone().map(|editor| div().flex_1().child(editor)))
-                    .child(Button::new("reply", "Reply"))
-                    .child(Button::new(
-                        "resolve",
-                        if thread.is_resolved {
-                            "Unresolve"
-                        } else {
-                            "Resolve"
-                        },
-                    )),
+                    .child(Button::new("reply", "Reply").on_click(move |_, _, cx| {
+                        reply_item
+                            .update(cx, |item, cx| {
+                                item.click_reply(&reply_thread, cx).detach_and_log_err(cx)
+                            })
+                            .log_err();
+                    }))
+                    .child(
+                        Button::new("resolve", if resolved { "Unresolve" } else { "Resolve" })
+                            .on_click(move |_, _, cx| {
+                                resolve_item
+                                    .update(cx, |item, cx| {
+                                        item.set_thread_resolved(&resolve_thread, !resolved, cx)
+                                            .detach_and_log_err(cx)
+                                    })
+                                    .log_err();
+                            }),
+                    ),
             )
             .into_any_element()
     })
@@ -627,6 +664,7 @@ impl ReviewItem {
     pub fn new(
         project: Entity<Project>,
         detail: PrDetail,
+        login: String,
         checkout: Checkout,
         files: Vec<LoadedFile>,
         database: ReviewDb,
@@ -683,20 +721,25 @@ impl ReviewItem {
             .iter()
             .map(|file| (file.diff.path.clone(), commentable_lines(&file.diff)))
             .collect();
-        let reply_editors = detail
-            .threads
-            .iter()
-            .map(|thread| {
-                let editor = cx.new(|cx| {
-                    let mut editor = Editor::single_line(window, cx);
-                    editor.set_placeholder_text("Reply…", window, cx);
-                    editor
-                });
-                (thread.id.clone(), editor)
-            })
-            .collect();
+        let summary_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, COMPOSER_MAX_LINES as usize, window, cx);
+            editor.set_placeholder_text("Leave a summary (optional)", window, cx);
+            editor
+        });
+        // Comment is enabled by summary text, so the actions area redraws as it is typed.
+        subscriptions.push(
+            cx.subscribe(&summary_editor, |_, _, event: &EditorEvent, cx| {
+                if matches!(event, EditorEvent::BufferEdited) {
+                    cx.notify();
+                }
+            }),
+        );
         let stored_drafts = database
             .drafts(&detail.summary.key)
+            .log_err()
+            .unwrap_or_default();
+        let viewed_steps = database
+            .viewed_steps(&detail.summary.key)
             .log_err()
             .unwrap_or_default();
         let mut this = Self {
@@ -710,7 +753,7 @@ impl ReviewItem {
             changed_rows,
             steps: Vec::new(),
             selected: 0,
-            viewed_steps: HashSet::new(),
+            viewed_steps,
             context_state: ContextState::Finding,
             editor,
             multibuffer,
@@ -726,8 +769,14 @@ impl ReviewItem {
             drafts: Vec::new(),
             draft_views: Vec::new(),
             next_draft_id: 0,
-            reply_editors,
+            reply_editors: HashMap::new(),
             comment_blocks: HashSet::new(),
+            login,
+            summary_editor,
+            submitting: false,
+            submit_error: None,
+            thread_errors: HashMap::new(),
+            file_errors: HashMap::new(),
             _reanchor_task: Task::ready(()),
             _lsp_handles: lsp_handles,
             _subscriptions: subscriptions,
@@ -736,6 +785,7 @@ impl ReviewItem {
         for draft in stored_drafts {
             this.push_draft(draft);
         }
+        this.add_reply_editors(window, cx);
         this.rebuild_map(&[], cx);
         this._context_task = this.load_context(cx);
         this._reanchor_task = this.reanchor_drafts(cx);
@@ -744,6 +794,333 @@ impl ReviewItem {
 
     pub fn drafts(&self) -> &[Draft] {
         &self.drafts
+    }
+
+    /// Gives each thread without one a reply box, keeping what was typed in existing ones.
+    fn add_reply_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for thread in &self.detail.threads {
+            if self.reply_editors.contains_key(&thread.id) {
+                continue;
+            }
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Reply…", window, cx);
+                editor
+            });
+            self.reply_editors.insert(thread.id.clone(), editor);
+        }
+    }
+
+    fn sendable_drafts(&self) -> usize {
+        self.drafts
+            .iter()
+            .filter(|draft| is_sendable(draft, &self.checkout.head_sha))
+            .count()
+    }
+
+    /// Drafts with text that Submit leaves out: outdated ones, or ones not yet re-anchored.
+    pub fn left_out_drafts(&self) -> usize {
+        self.drafts
+            .iter()
+            .filter(|draft| {
+                !draft.body.trim().is_empty() && !is_sendable(draft, &self.checkout.head_sha)
+            })
+            .count()
+    }
+
+    pub fn can_comment(&self, cx: &App) -> bool {
+        self.sendable_drafts() > 0 || !self.summary_editor.read(cx).text(cx).trim().is_empty()
+    }
+
+    fn buffer_for_path(&self, path: &str, cx: &App) -> Option<Entity<Buffer>> {
+        self.multibuffer
+            .read(cx)
+            .all_buffers_iter()
+            .find(|buffer| buffer_path(buffer, cx).as_deref() == Some(path))
+            .or_else(|| buffer_for(&self.files, path).cloned())
+    }
+
+    fn draft_languages(&self, cx: &App) -> HashMap<String, String> {
+        self.drafts
+            .iter()
+            .filter_map(|draft| {
+                let buffer = self.buffer_for_path(&draft.path, cx)?;
+                let language = buffer.read(cx).language()?.code_fence_block_name();
+                Some((draft.path.clone(), language.to_string()))
+            })
+            .collect()
+    }
+
+    /// Posts every sendable draft as one GitHub review. A failure keeps every draft and shows
+    /// GitHub's message until the next submit.
+    pub fn submit(
+        &mut self,
+        event: ReviewEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.submitting {
+            return Task::ready(Err(anyhow!("This review is already being submitted.")));
+        }
+        let key = self.detail.summary.key.clone();
+        let head_sha = self.checkout.head_sha.clone();
+        let summary = self.summary_editor.read(cx).text(cx);
+        let languages = self.draft_languages(cx);
+        let request = review_request(
+            &key,
+            &head_sha,
+            event,
+            summary.trim(),
+            &self.drafts,
+            &self.commentable,
+            &|path| languages.get(path).cloned(),
+        );
+        let sent: Vec<(usize, Option<i64>, String)> = self
+            .drafts
+            .iter()
+            .zip(&self.draft_views)
+            .filter(|(draft, _)| is_sendable(draft, &head_sha))
+            .map(|(draft, view)| (view.local_id, draft.id, draft.body.clone()))
+            .collect();
+        self.submitting = true;
+        self.submit_error = None;
+        cx.notify();
+        let runner = gh_runner(cx);
+        let database = self.database.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = runner.run(request).await {
+                this.update(cx, |this, cx| {
+                    this.submitting = false;
+                    this.submit_error = Some(error.to_string().into());
+                    cx.notify();
+                })
+                .log_err();
+                return Err(error.into());
+            }
+            let updated = this.update_in(cx, |this, window, cx| {
+                this.submitting = false;
+                for (local_id, _, body) in &sent {
+                    // A draft edited while the review was posting keeps its newer text.
+                    let unchanged = this
+                        .draft_index(*local_id)
+                        .is_some_and(|index| this.drafts[index].body == *body);
+                    if unchanged {
+                        this.discard_draft(*local_id, cx);
+                    }
+                }
+                this.summary_editor
+                    .update(cx, |editor, cx| editor.set_text("", window, cx));
+                cx.notify();
+            });
+            if updated.is_err() {
+                // The review closed while posting: delete the sent rows so they aren't sent again.
+                let ids = sent.iter().filter_map(|(_, id, _)| *id).collect();
+                database.delete_drafts(ids).await?;
+            }
+            database.set_last_review(key, head_sha).await.log_err();
+            let refresh = this.update_in(cx, |this, window, cx| this.refresh_detail(window, cx))?;
+            // The review is posted; a failed refresh only delays showing its threads.
+            refresh.await.log_err();
+            Ok(())
+        })
+    }
+
+    fn refresh_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let key = self.detail.summary.key.clone();
+        let request = detail_request(&key, &self.login);
+        let runner = gh_runner(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let detail = parse_detail(&key, &runner.run(request).await?)?;
+            this.update_in(cx, |this, window, cx| {
+                this.detail = detail;
+                this.add_reply_editors(window, cx);
+                this.show_comments(cx);
+                cx.notify();
+            })
+        })
+    }
+
+    /// The Reply button: posts what is typed in the thread's reply box.
+    pub fn click_reply(&mut self, thread_id: &str, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let Some(editor) = self.reply_editors.get(thread_id) else {
+            return Task::ready(Err(anyhow!("No reply box for this thread.")));
+        };
+        let body = editor.read(cx).text(cx);
+        if body.trim().is_empty() {
+            return Task::ready(Ok(()));
+        }
+        self.reply(thread_id, body, cx)
+    }
+
+    pub fn reply(
+        &mut self,
+        thread_id: &str,
+        body: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(first_comment) = self
+            .detail
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .and_then(|thread| thread.comments.first())
+        else {
+            return Task::ready(Err(anyhow!("This thread has no comment to reply to.")));
+        };
+        let request = reply_request(&self.detail.summary.key, first_comment.database_id, &body);
+        let runner = gh_runner(cx);
+        let thread_id = thread_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = match runner.run(request).await {
+                Ok(output) => parse_reply(&output),
+                Err(error) => Err(error.into()),
+            };
+            this.update(cx, |this, cx| {
+                match &result {
+                    Ok(comment) => {
+                        this.thread_errors.remove(&thread_id);
+                        if let Some(thread) = this
+                            .detail
+                            .threads
+                            .iter_mut()
+                            .find(|thread| thread.id == thread_id)
+                        {
+                            thread.comments.push(comment.clone());
+                        }
+                        let buffer = this
+                            .reply_editors
+                            .get(&thread_id)
+                            .and_then(|editor| editor.read(cx).buffer().read(cx).as_singleton());
+                        if let Some(buffer) = buffer
+                            && buffer.read(cx).text() == body
+                        {
+                            buffer.update(cx, |buffer, cx| buffer.set_text("", cx));
+                        }
+                    }
+                    Err(error) => {
+                        this.thread_errors
+                            .insert(thread_id.clone(), format!("{error:#}").into());
+                    }
+                }
+                this.show_comments(cx);
+                cx.notify();
+            })?;
+            result.map(|_| ())
+        })
+    }
+
+    /// Flips the thread at once, as GitHub does, and flips it back if `gh` fails.
+    pub fn set_thread_resolved(
+        &mut self,
+        thread_id: &str,
+        resolved: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(thread) = self
+            .detail
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+        else {
+            return Task::ready(Err(anyhow!("Unknown review thread {thread_id}.")));
+        };
+        thread.is_resolved = resolved;
+        self.thread_errors.remove(thread_id);
+        self.show_comments(cx);
+        cx.notify();
+        let request = resolve_request(&self.detail.summary.key.host, thread_id, resolved);
+        let runner = gh_runner(cx);
+        let thread_id = thread_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = match runner.run(request).await {
+                Ok(output) => parse_mutation(&output),
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = &result {
+                this.update(cx, |this, cx| {
+                    if let Some(thread) = this
+                        .detail
+                        .threads
+                        .iter_mut()
+                        .find(|thread| thread.id == thread_id)
+                    {
+                        thread.is_resolved = !resolved;
+                    }
+                    this.thread_errors
+                        .insert(thread_id.clone(), format!("{error:#}").into());
+                    this.show_comments(cx);
+                    cx.notify();
+                })?;
+            }
+            result
+        })
+    }
+
+    /// Syncs GitHub's Viewed checkbox for a file: flips at once and flips back if `gh` fails.
+    pub fn set_file_viewed(
+        &mut self,
+        path: &str,
+        viewed: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.set_local_file_viewed(path, viewed);
+        self.file_errors.remove(path);
+        cx.notify();
+        let request = viewed_request(
+            &self.detail.summary.key.host,
+            &self.detail.summary.node_id,
+            path,
+            viewed,
+        );
+        let runner = gh_runner(cx);
+        let path = path.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = match runner.run(request).await {
+                Ok(output) => parse_mutation(&output),
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = &result {
+                this.update(cx, |this, cx| {
+                    this.set_local_file_viewed(&path, !viewed);
+                    this.file_errors
+                        .insert(path.clone(), format!("{error:#}").into());
+                    cx.notify();
+                })?;
+            }
+            result
+        })
+    }
+
+    fn set_local_file_viewed(&mut self, path: &str, viewed: bool) {
+        match self.detail.files.iter_mut().find(|file| file.path == path) {
+            Some(file) => file.viewed = viewed,
+            None => self.detail.files.push(crate::PrFile {
+                path: path.to_string(),
+                viewed,
+            }),
+        }
+    }
+
+    fn file_viewed(&self, path: &str) -> bool {
+        self.detail
+            .files
+            .iter()
+            .any(|file| file.path == path && file.viewed)
+    }
+
+    /// Steps exist only in Photon, so their viewed state stays local.
+    pub fn set_step_viewed(&mut self, step_key: &str, viewed: bool, cx: &mut Context<Self>) {
+        if viewed {
+            self.viewed_steps.insert(step_key.to_string());
+        } else {
+            self.viewed_steps.remove(step_key);
+        }
+        cx.notify();
+        let database = self.database.clone();
+        let key = self.detail.summary.key.clone();
+        let step_key = step_key.to_string();
+        cx.background_spawn(async move { database.set_step_viewed(key, step_key, viewed).await })
+            .detach_and_log_err(cx);
     }
 
     fn draft_index(&self, local_id: usize) -> Option<usize> {
@@ -796,6 +1173,8 @@ impl ReviewItem {
             if let Some(index) = this.draft_index(local_id) {
                 this.drafts[index].body = body;
                 this.queue_save(local_id, cx);
+                // The draft count and Comment's enabled state depend on the body.
+                cx.notify();
             }
         });
         let view = &mut self.draft_views[index];
@@ -1152,13 +1531,7 @@ impl ReviewItem {
         let row = line.checked_sub(1)?;
         match side {
             Side::Right => {
-                let buffer = self
-                    .multibuffer
-                    .read(cx)
-                    .all_buffers_iter()
-                    .find(|buffer| buffer_path(buffer, cx).as_deref() == Some(path))
-                    .or_else(|| buffer_for(&self.files, path).cloned())?;
-                let buffer = buffer.read(cx).snapshot();
+                let buffer = self.buffer_for_path(path, cx)?.read(cx).snapshot();
                 if row > buffer.max_point().row {
                     return None;
                 }
@@ -1230,13 +1603,16 @@ impl ReviewItem {
                 .iter()
                 .map(|comment| 1 + comment.body.lines().count().max(1))
                 .sum();
+            let error = self.thread_errors.get(&thread.id).cloned();
             blocks.push(BlockProperties {
                 placement: BlockPlacement::Below(anchor),
-                height: Some(body_rows as u32 + 3),
+                height: Some(body_rows as u32 + 3 + u32::from(error.is_some())),
                 style: BlockStyle::Sticky,
                 render: thread_renderer(
+                    item.clone(),
                     thread.clone(),
                     self.reply_editors.get(&thread.id).cloned(),
+                    error,
                 ),
                 priority: 0,
             });
@@ -1784,6 +2160,52 @@ impl ReviewItem {
                     ),
             );
             if selected {
+                let step_key = step.key.clone();
+                map = map.child(
+                    div().pl_6().child(
+                        Checkbox::new(
+                            ("photon-review-step-viewed", index),
+                            self.viewed_steps.contains(&step.key).into(),
+                        )
+                        .label("Step viewed")
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(
+                            move |this, state: &ToggleState, _, cx| {
+                                this.set_step_viewed(&step_key, *state == ToggleState::Selected, cx)
+                            },
+                        )),
+                    ),
+                );
+                for path in &step.files {
+                    let file_path = path.clone();
+                    map = map.child(
+                        v_flex()
+                            .pl_6()
+                            .child(
+                                Checkbox::new(
+                                    SharedString::from(format!("photon-review-viewed-{path}")),
+                                    self.file_viewed(path).into(),
+                                )
+                                .label(format!("{path} viewed"))
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(
+                                    move |this, state: &ToggleState, _, cx| {
+                                        this.set_file_viewed(
+                                            &file_path,
+                                            *state == ToggleState::Selected,
+                                            cx,
+                                        )
+                                        .detach_and_log_err(cx)
+                                    },
+                                )),
+                            )
+                            .children(self.file_errors.get(path).map(|error| {
+                                Label::new(error.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Error)
+                            })),
+                    );
+                }
                 for function in step
                     .functions
                     .iter()
@@ -1956,6 +2378,12 @@ impl ReviewItem {
                 )
             })
         };
+        let submit = |event: ReviewEvent| {
+            cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
+                this.submit(event, window, cx).detach_and_log_err(cx)
+            })
+        };
+        let left_out = self.left_out_drafts();
         let legend_highlights: Vec<_> = [
             highlight("Red", Color::Error),
             highlight("Amber", Color::Warning),
@@ -2005,19 +2433,39 @@ impl ReviewItem {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                     )
+                    .child(self.summary_editor.clone())
                     .child(
                         h_flex()
                             .gap_1()
                             .flex_wrap()
-                            .child(Button::new("photon-review-comment", "Comment"))
+                            .child(
+                                Button::new("photon-review-comment", "Comment")
+                                    .disabled(self.submitting || !self.can_comment(cx))
+                                    .on_click(submit(ReviewEvent::Comment)),
+                            )
                             .child(
                                 Button::new("photon-review-approve", "Approve")
-                                    .style(ButtonStyle::Filled),
+                                    .style(ButtonStyle::Filled)
+                                    .disabled(self.submitting)
+                                    .on_click(submit(ReviewEvent::Approve)),
                             )
-                            .child(Button::new(
-                                "photon-review-request-changes",
-                                "Request changes",
-                            )),
+                            .child(
+                                Button::new("photon-review-request-changes", "Request changes")
+                                    .disabled(self.submitting)
+                                    .on_click(submit(ReviewEvent::RequestChanges)),
+                            ),
+                    )
+                    .when(left_out > 0, |this| {
+                        this.child(
+                            Label::new(format!("{left_out} outdated drafts not included"))
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        )
+                    })
+                    .children(
+                        self.submit_error.clone().map(|error| {
+                            Label::new(error).size(LabelSize::Small).color(Color::Error)
+                        }),
                     ),
             )
     }
@@ -2366,6 +2814,7 @@ mod tests {
             ReviewItem::new(
                 project.clone(),
                 detail,
+                "alice".into(),
                 checkout(),
                 loaded,
                 database,
@@ -3099,7 +3548,16 @@ fn verify_password(user: &str, password: &str) -> bool {
         cx.run_until_parked();
 
         let window = cx.add_window(|window, cx| {
-            ReviewItem::new(project, detail, checkout(), files, database, window, cx)
+            ReviewItem::new(
+                project,
+                detail,
+                "alice".into(),
+                checkout(),
+                files,
+                database,
+                window,
+                cx,
+            )
         });
         let reopened = window.root(&mut cx).expect("item");
         cx.run_until_parked();
@@ -3301,7 +3759,7 @@ fn verify_password(user: &str, password: &str) -> bool {
         let (item, mut cx, _) = open_item_with(
             cx,
             login_tree(),
-            vec![modified("src/login.rs", LOGIN_BASE)],
+            vec![login_with_hunk()],
             login_graph(),
             true,
             None,
@@ -3311,6 +3769,23 @@ fn verify_password(user: &str, password: &str) -> bool {
         .await;
         settle(&mut cx);
         (item, cx, database)
+    }
+
+    /// Lines 1–4 of the head are in the diff; line 5 (`}`) is unchanged.
+    fn login_with_hunk() -> PrFile {
+        PrFile {
+            hunks: vec![crate::Hunk {
+                old_start: 1,
+                old_len: 2,
+                new_start: 1,
+                new_len: 4,
+                body: " fn login(user: &str, password: &str) -> bool {\n\
+                       +    let user = user.trim();\n\
+                       +    audit(user);\n     verify_password(user, password)\n"
+                    .into(),
+            }],
+            ..modified("src/login.rs", LOGIN_BASE)
+        }
     }
 
     fn current_draft(path: &str, start_line: u32, anchor_text: &str) -> Draft {
@@ -3508,5 +3983,352 @@ fn verify_password(user: &str, password: &str) -> bool {
                 ("src/gone.rs".to_string(), "old".to_string(), true),
             ]
         );
+    }
+
+    fn install_fake(cx: &mut VisualTestContext) -> Arc<FakeGh> {
+        let fake = FakeGh::new();
+        cx.update(|_, cx| crate::set_gh_runner(fake.clone(), cx));
+        fake
+    }
+
+    fn is_review_post(request: &crate::GhRequest) -> bool {
+        request
+            .args
+            .iter()
+            .any(|argument| argument.ends_with("/reviews"))
+    }
+
+    fn is_detail(request: &crate::GhRequest) -> bool {
+        request
+            .stdin
+            .as_deref()
+            .is_some_and(|stdin| stdin.contains("pullRequest(number"))
+    }
+
+    fn request_json(request: &crate::GhRequest) -> serde_json::Value {
+        serde_json::from_str(request.stdin.as_deref().expect("stdin")).expect("json")
+    }
+
+    fn submit_drafts() -> Vec<Draft> {
+        vec![
+            current_draft("src/login.rs", 3, "    audit(user);"),
+            current_draft("src/login.rs", 5, "}"),
+            current_draft("src/password.rs", 2, "    user == password"),
+        ]
+    }
+
+    fn submit(
+        item: &Entity<ReviewItem>,
+        event: crate::ReviewEvent,
+        cx: &mut VisualTestContext,
+    ) -> Result<()> {
+        let task = item.update_in(cx, |item, window, cx| item.submit(event, window, cx));
+        cx.run_until_parked();
+        task.now_or_never().expect("submit finished")
+    }
+
+    #[gpui::test]
+    async fn submit_sends_one_review_with_every_draft(cx: &mut TestAppContext) {
+        let (item, mut cx, _) = open_with_drafts(cx, submit_drafts()).await;
+        let fake = install_fake(&mut cx);
+        fake.respond(is_review_post, Ok("{}".into()));
+        fake.respond(is_detail, Ok(DETAIL.into()));
+        submit(&item, crate::ReviewEvent::RequestChanges, &mut cx).expect("submitted");
+
+        let posts: Vec<_> = fake.requests().into_iter().filter(is_review_post).collect();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            posts[0].args,
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "POST",
+                "repos/acme/web/pulls/482/reviews",
+                "--input",
+                "-"
+            ]
+        );
+        let body = request_json(&posts[0]);
+        assert_eq!(body["commit_id"], "head");
+        assert_eq!(body["event"], "REQUEST_CHANGES");
+        let comments = body["comments"].as_array().expect("comments");
+        assert_eq!(comments.len(), 2);
+        assert_eq!(
+            comments[0],
+            json!({"path": "src/login.rs", "body": "about     audit(user);", "line": 3, "side": "RIGHT"})
+        );
+        assert_eq!(comments[1]["line"], 4);
+        assert_eq!(comments[1]["side"], "RIGHT");
+        assert!(
+            comments[1]["body"]
+                .as_str()
+                .expect("quote")
+                .starts_with(
+                    "Unchanged code, [src/login.rs line 5](https://github.com/acme/web/blob/head/src/login.rs#L5):\n\n```rust\n}\n```"
+                ),
+            "{}",
+            comments[1]["body"]
+        );
+        let review_body = body["body"].as_str().expect("body");
+        assert!(
+            review_body.starts_with("### src/password.rs\n\n"),
+            "{review_body}"
+        );
+        assert!(review_body.contains("about     user == password"));
+    }
+
+    #[gpui::test]
+    async fn failed_submit_keeps_drafts_and_shows_error(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(cx, submit_drafts()).await;
+        let fake = install_fake(&mut cx);
+        let message = "gh: Validation Failed (HTTP 422): line must be part of the diff";
+        fake.respond(
+            is_review_post,
+            Err(GhError::Failed {
+                message: message.into(),
+            }),
+        );
+        let before = item.read_with(&cx, |item, _| item.drafts().to_vec());
+        let stored = database.drafts(&key()).expect("drafts");
+
+        let error = submit(&item, crate::ReviewEvent::Comment, &mut cx).expect_err("failed");
+        assert_eq!(error.to_string(), message);
+        assert_eq!(fake.requests().len(), 1);
+        item.read_with(&cx, |item, _| {
+            assert_eq!(item.drafts(), before.as_slice());
+            assert_eq!(item.submit_error.as_deref(), Some(message));
+            assert!(!item.submitting);
+        });
+        assert_eq!(database.drafts(&key()).expect("drafts"), stored);
+        assert_eq!(database.last_review(&key()).expect("last review"), None);
+    }
+
+    #[gpui::test]
+    async fn submit_success_clears_drafts_and_records_last_review(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(cx, submit_drafts()).await;
+        database
+            .track(Tracked {
+                key: key(),
+                node_id: "PR_482".into(),
+                repo_dir: PathBuf::from(path!("/repo")),
+                worktree: PathBuf::from(path!("/repo")),
+            })
+            .await
+            .expect("track");
+        let fake = install_fake(&mut cx);
+        fake.respond(is_review_post, Ok("{}".into()));
+        fake.respond(is_detail, Ok(DETAIL.into()));
+        item.update_in(&mut cx, |item, window, cx| {
+            item.summary_editor
+                .update(cx, |editor, cx| editor.set_text("Looks good.", window, cx))
+        });
+        submit(&item, crate::ReviewEvent::Approve, &mut cx).expect("submitted");
+
+        assert!(database.drafts(&key()).expect("drafts").is_empty());
+        assert_eq!(
+            database
+                .last_review(&key())
+                .expect("last review")
+                .as_deref(),
+            Some("head")
+        );
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(request_json(&requests[0])["event"], "APPROVE");
+        assert!(is_detail(&requests[1]));
+        item.read_with(&cx, |item, cx| {
+            assert!(item.drafts().is_empty());
+            assert!(item.submit_error.is_none());
+            assert!(item.summary_editor.read(cx).text(cx).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn outdated_drafts_stay_local_on_submit(cx: &mut TestAppContext) {
+        let outdated = Draft {
+            outdated: true,
+            ..stored_draft("src/login.rs", 2, "    gone();")
+        };
+        let (item, mut cx, database) = open_with_drafts(cx, vec![outdated.clone()]).await;
+        item.read_with(&cx, |item, cx| {
+            assert_eq!(item.left_out_drafts(), 1);
+            assert!(!item.can_comment(cx));
+        });
+        let fake = install_fake(&mut cx);
+        fake.respond(is_review_post, Ok("{}".into()));
+        fake.respond(is_detail, Ok(DETAIL.into()));
+        item.update(&mut cx, |item, cx| {
+            let draft = current_draft("src/login.rs", 3, "    audit(user);");
+            item.push_draft(draft);
+            item.queue_save(1, cx);
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, cx| assert!(item.can_comment(cx)));
+        submit(&item, crate::ReviewEvent::Comment, &mut cx).expect("submitted");
+
+        let posts: Vec<_> = fake.requests().into_iter().filter(is_review_post).collect();
+        let body = request_json(&posts[0]);
+        assert_eq!(body["comments"].as_array().expect("comments").len(), 1);
+        assert!(!body.to_string().contains("gone()"));
+        let remaining: Vec<_> = database
+            .drafts(&key())
+            .expect("drafts")
+            .into_iter()
+            .map(|draft| (draft.anchor_text, draft.outdated))
+            .collect();
+        assert_eq!(remaining, vec![("    gone();".to_string(), true)]);
+        item.read_with(&cx, |item, _| assert_eq!(item.drafts().len(), 1));
+    }
+
+    #[gpui::test]
+    async fn reply_posts_only_on_click(cx: &mut TestAppContext) {
+        let (item, mut cx, _) = open_with_drafts(cx, Vec::new()).await;
+        let fake = install_fake(&mut cx);
+        fake.respond(
+            |request| {
+                request
+                    .args
+                    .iter()
+                    .any(|argument| argument.ends_with("/replies"))
+            },
+            Ok(r#"{"id":2001,"user":{"login":"alice"},"body":"Agreed.","created_at":"t"}"#.into()),
+        );
+        let editor = item.read_with(&cx, |item, _| {
+            item.reply_editors
+                .get("PRRT_1")
+                .cloned()
+                .expect("reply editor")
+        });
+        type_text(&editor, "Agreed.", &mut cx);
+        cx.run_until_parked();
+        assert!(fake.requests().is_empty());
+
+        let task = item.update(&mut cx, |item, cx| item.click_reply("PRRT_1", cx));
+        cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("replied");
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .args
+                .contains(&"repos/acme/web/pulls/482/comments/1001/replies".to_string())
+        );
+        assert_eq!(request_json(&requests[0]), json!({"body": "Agreed."}));
+        item.read_with(&cx, |item, _| {
+            let thread = &item.detail.threads[0];
+            let last = thread.comments.last().expect("comment");
+            assert_eq!((last.database_id, last.body.as_str()), (2001, "Agreed."));
+        });
+        assert!(
+            editor
+                .read_with(&cx, |editor, cx| editor.text(cx))
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn resolve_and_viewed_apply_immediately(cx: &mut TestAppContext) {
+        let (item, mut cx, _) = open_with_drafts(cx, Vec::new()).await;
+        let fake = install_fake(&mut cx);
+        let ok = || Ok(r#"{"data":{"x":{}}}"#.to_string());
+        fake.respond(
+            |request| {
+                request
+                    .stdin
+                    .as_deref()
+                    .is_some_and(|stdin| stdin.contains("resolveReviewThread("))
+            },
+            ok(),
+        );
+        fake.respond(
+            |request| {
+                request
+                    .stdin
+                    .as_deref()
+                    .is_some_and(|stdin| stdin.contains("markFileAsViewed("))
+            },
+            ok(),
+        );
+        let resolved = |item: &Entity<ReviewItem>, cx: &mut VisualTestContext| {
+            item.read_with(cx, |item, _| item.detail.threads[0].is_resolved)
+        };
+        let viewed = |item: &Entity<ReviewItem>, path: &str, cx: &mut VisualTestContext| {
+            item.read_with(cx, |item, _| {
+                item.detail
+                    .files
+                    .iter()
+                    .any(|file| file.path == path && file.viewed)
+            })
+        };
+
+        let task = item.update(&mut cx, |item, cx| {
+            item.set_thread_resolved("PRRT_1", true, cx)
+        });
+        assert!(resolved(&item, &mut cx));
+        cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("resolved");
+        assert!(resolved(&item, &mut cx));
+        assert_eq!(fake.requests().len(), 1);
+
+        // No response is queued for unresolve, so FakeGh fails it.
+        let task = item.update(&mut cx, |item, cx| {
+            item.set_thread_resolved("PRRT_1", false, cx)
+        });
+        assert!(!resolved(&item, &mut cx));
+        cx.run_until_parked();
+        assert!(task.now_or_never().expect("finished").is_err());
+        assert!(resolved(&item, &mut cx));
+        item.read_with(&cx, |item, _| {
+            assert!(item.thread_errors.contains_key("PRRT_1"))
+        });
+        assert_eq!(fake.requests().len(), 2);
+
+        let task = item.update(&mut cx, |item, cx| {
+            item.set_file_viewed("src/retry.rs", true, cx)
+        });
+        assert!(viewed(&item, "src/retry.rs", &mut cx));
+        cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("viewed");
+        assert!(viewed(&item, "src/retry.rs", &mut cx));
+        let request = request_json(&fake.requests()[2]);
+        assert_eq!(
+            request["variables"],
+            json!({"pullRequestId": "PR_482", "path": "src/retry.rs"})
+        );
+
+        let task = item.update(&mut cx, |item, cx| {
+            item.set_file_viewed("src/upload.rs", false, cx)
+        });
+        assert!(!viewed(&item, "src/upload.rs", &mut cx));
+        cx.run_until_parked();
+        assert!(task.now_or_never().expect("finished").is_err());
+        assert!(viewed(&item, "src/upload.rs", &mut cx));
+        item.read_with(&cx, |item, _| {
+            assert!(item.file_errors.contains_key("src/upload.rs"))
+        });
+        assert_eq!(fake.requests().len(), 4);
+    }
+
+    #[gpui::test]
+    async fn no_requests_without_user_action(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(cx, submit_drafts()).await;
+        let fake = install_fake(&mut cx);
+        select_text(&item, "audit(user);", &mut cx);
+        cx.dispatch_action(AddComment);
+        cx.run_until_parked();
+        type_text(&composer(&item, &mut cx), "Typed, not sent", &mut cx);
+        let step = step_keys(&item, &mut cx)[0].clone();
+        item.update(&mut cx, |item, cx| item.set_step_viewed(&step, true, cx));
+        cx.run_until_parked();
+        assert!(fake.requests().is_empty());
+        assert!(
+            database
+                .viewed_steps(&key())
+                .expect("steps")
+                .contains(&step)
+        );
+        assert_eq!(database.drafts(&key()).expect("drafts").len(), 4);
     }
 }
