@@ -295,7 +295,7 @@ async fn load_inbox(runner: Arc<dyn GhRunner>, database: ReviewDb) -> (InboxStat
                     .run(inbox_request(&auth.host, &login, &node_ids))
                     .await
                 {
-                    Ok(output) => parse_inbox(&auth.host, &output).map_err(failed),
+                    Ok(output) => parse_inbox(&auth.host, &output, &node_ids).map_err(failed),
                     Err(error) => Err(error),
                 },
             };
@@ -310,6 +310,12 @@ async fn load_inbox(runner: Arc<dyn GhRunner>, database: ReviewDb) -> (InboxStat
     let mut closed = Vec::new();
     for host in &results {
         let Ok(inbox) = &host.result else { continue };
+        // Drafts are kept: they live apart from the tracked row.
+        for gone in tracked.iter().filter(|tracked| {
+            tracked.key.host == host.host && inbox.gone_tracked.contains(&tracked.node_id)
+        }) {
+            database.untrack(gone.key.clone()).await.log_err();
+        }
         closed.extend(
             tracked
                 .iter()
@@ -916,6 +922,76 @@ mod tests {
         }
         assert_eq!(db.tracked().expect("tracked"), vec![]);
         drop(panel);
+    }
+
+    #[gpui::test]
+    async fn partial_error_keeps_the_inbox_and_untracks_the_missing_pr(cx: &mut TestAppContext) {
+        let fake = FakeGh::new();
+        init_test(cx, &fake);
+        respond_auth(&fake, AUTH_ONE_HOST);
+        let mut partial: serde_json::Value = serde_json::from_str(INBOX).expect("fixture");
+        partial["data"]["yours"] = serde_json::Value::Null;
+        partial["data"]["nodes"] = serde_json::json!([null]);
+        partial["errors"] = serde_json::json!([
+            { "message": "Could not resolve to a node with the global id of 'PR_gone'" },
+            { "message": "Resource protected by organization SAML enforcement" }
+        ]);
+        fake.respond(|request| request.args[0] == "api", Ok(partial.to_string()));
+        let key = PrKey {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            repo: "web".into(),
+            number: 9,
+        };
+        let database = cx.update(|cx| ReviewDb::global(cx));
+        database
+            .track(Tracked {
+                key: key.clone(),
+                node_id: "PR_gone".into(),
+                repo_dir: "/nonexistent/repo".into(),
+                worktree: "/nonexistent/worktree".into(),
+            })
+            .await
+            .expect("track");
+        database
+            .save_draft(crate::Draft {
+                id: None,
+                key: key.clone(),
+                path: "src/a.rs".into(),
+                side: crate::Side::Right,
+                start_line: 1,
+                end_line: 1,
+                commit: "a1".into(),
+                anchor_text: "fn a() {}".into(),
+                body: "Keep me".into(),
+                outdated: false,
+                general: false,
+                post_state: crate::PostState::Unposted,
+            })
+            .await
+            .expect("save");
+
+        let (_workspace, panel, mut cx) = add_panel(cx).await;
+        set_active(&panel, true, &mut cx);
+        panel.read_with(&cx, |panel, _| {
+            let InboxState::Loaded(hosts) = panel.state() else {
+                panic!("expected Loaded, got {:?}", panel.state());
+            };
+            let inbox = hosts[0]
+                .result
+                .as_ref()
+                .expect("inbox despite partial errors");
+            let counts: Vec<_> = inbox
+                .sections
+                .iter()
+                .map(|(group, rows)| (*group, rows.len()))
+                .collect();
+            assert!(counts[0].1 > 0, "{counts:?}");
+            assert_eq!(counts[1], (InboxGroup::Yours, 0));
+        });
+        render(&panel, &mut cx);
+        assert_eq!(database.tracked().expect("tracked"), vec![]);
+        assert_eq!(database.drafts(&key).expect("drafts").len(), 1);
     }
 
     #[gpui::test]

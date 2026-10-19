@@ -70,6 +70,8 @@ pub struct PrSummary {
 pub struct Inbox {
     pub sections: Vec<(InboxGroup, Vec<PrSummary>)>,
     pub closed_tracked: Vec<String>,
+    /// Tracked pull requests GitHub no longer resolves (deleted, or access lost).
+    pub gone_tracked: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +177,32 @@ fn parse_response<T: for<'de> Deserialize<'de>>(json: &str) -> Result<T> {
         return Err(anyhow!("{}", error.message));
     }
     response.data.context("GitHub response had no data")
+}
+
+/// Like `parse_response`, but keeps whatever data came back alongside errors, as GitHub returns
+/// for one unreadable node. Only for reads: a mutation with any error has failed.
+fn parse_partial_response<T: for<'de> Deserialize<'de>>(json: &str) -> Result<T> {
+    let response: Response<serde_json::Value> =
+        serde_json::from_str(json).context("parsing GitHub response")?;
+    let first_error = || {
+        response
+            .errors
+            .first()
+            .map(|error| anyhow!("{}", error.message))
+    };
+    let Some(data) = response.data.clone().filter(|data| !data.is_null()) else {
+        return Err(first_error().unwrap_or_else(|| anyhow!("GitHub response had no data")));
+    };
+    match serde_json::from_value(data) {
+        Ok(parsed) => {
+            for error in &response.errors {
+                log::warn!("GitHub returned a partial result: {}", error.message);
+            }
+            Ok(parsed)
+        }
+        Err(error) => Err(first_error()
+            .unwrap_or_else(|| anyhow::Error::new(error).context("parsing GitHub response"))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -403,9 +431,9 @@ pub fn inbox_request(host: &str, login: &str, tracked_node_ids: &[String]) -> Gh
 #[derive(Deserialize)]
 struct RawInbox {
     #[serde(rename = "reviewRequested")]
-    review_requested: Nodes<RawPullRequest>,
-    yours: Nodes<RawPullRequest>,
-    mentioned: Nodes<RawPullRequest>,
+    review_requested: Option<Nodes<RawPullRequest>>,
+    yours: Option<Nodes<RawPullRequest>>,
+    mentioned: Option<Nodes<RawPullRequest>>,
     #[serde(default)]
     nodes: Vec<Option<RawTracked>>,
 }
@@ -416,8 +444,9 @@ struct RawTracked {
     state: Option<String>,
 }
 
-pub fn parse_inbox(host: &str, json: &str) -> Result<Inbox> {
-    let raw: RawInbox = parse_response(json)?;
+/// `tracked_node_ids` are the ids `inbox_request` asked about, in order.
+pub fn parse_inbox(host: &str, json: &str, tracked_node_ids: &[String]) -> Result<Inbox> {
+    let raw: RawInbox = parse_partial_response(json)?;
     let mut seen = HashSet::new();
     let mut sections = Vec::new();
     for (group, nodes) in [
@@ -426,13 +455,24 @@ pub fn parse_inbox(host: &str, json: &str) -> Result<Inbox> {
         (InboxGroup::Mentioned, raw.mentioned),
     ] {
         let mut rows = Vec::new();
-        for pull_request in nodes.nodes.iter().flatten() {
+        for pull_request in nodes.iter().flat_map(|nodes| nodes.nodes.iter().flatten()) {
             if seen.insert(pull_request.id.clone()) {
                 rows.push(summarize(host, None, pull_request)?);
             }
         }
         sections.push((group, rows));
     }
+    // `nodes(ids:)` answers in request order, with null for an id it can't resolve.
+    let gone_tracked = if raw.nodes.len() == tracked_node_ids.len() {
+        raw.nodes
+            .iter()
+            .zip(tracked_node_ids)
+            .filter(|(node, _)| node.is_none())
+            .map(|(_, id)| id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let closed_tracked = raw
         .nodes
         .into_iter()
@@ -443,6 +483,7 @@ pub fn parse_inbox(host: &str, json: &str) -> Result<Inbox> {
     Ok(Inbox {
         sections,
         closed_tracked,
+        gone_tracked,
     })
 }
 
@@ -777,7 +818,7 @@ mod tests {
 
     #[test]
     fn inbox_groups_rows_and_counts() {
-        let inbox = parse_inbox("github.com", INBOX).expect("parse");
+        let inbox = parse_inbox("github.com", INBOX, &[]).expect("parse");
         let groups: Vec<_> = inbox.sections.iter().map(|(group, _)| *group).collect();
         assert_eq!(
             groups,
@@ -803,7 +844,7 @@ mod tests {
 
     #[test]
     fn inbox_dedupes_across_groups() {
-        let inbox = parse_inbox("github.com", INBOX).expect("parse");
+        let inbox = parse_inbox("github.com", INBOX, &[]).expect("parse");
         let numbers = |index: usize| -> Vec<u64> {
             inbox.sections[index]
                 .1
@@ -818,7 +859,7 @@ mod tests {
 
     #[test]
     fn since_review_counts() {
-        let inbox = parse_inbox("github.com", INBOX).expect("parse");
+        let inbox = parse_inbox("github.com", INBOX, &[]).expect("parse");
         assert_eq!(find(&inbox, 482).since_review, SinceReview::NotReviewed);
         assert_eq!(find(&inbox, 483).since_review, SinceReview::UpToDate);
         assert_eq!(find(&inbox, 484).since_review, SinceReview::NewCommits(3));
@@ -828,7 +869,7 @@ mod tests {
 
     #[test]
     fn inbox_reports_closed_tracked() {
-        let inbox = parse_inbox("github.com", INBOX).expect("parse");
+        let inbox = parse_inbox("github.com", INBOX, &[]).expect("parse");
         assert_eq!(inbox.closed_tracked, ["PR_x"]);
     }
 
@@ -869,9 +910,25 @@ mod tests {
     }
 
     #[test]
+    fn inbox_partial_errors_keep_the_data() {
+        let mut partial: serde_json::Value = serde_json::from_str(INBOX).expect("fixture");
+        partial["data"]["mentioned"] = serde_json::Value::Null;
+        partial["errors"] = serde_json::json!([{ "message": "Could not resolve PR_gone" }]);
+        let tracked = ["PR_x".to_string(), "PR_y".into(), "PR_gone".into()];
+        let inbox = parse_inbox("github.com", &partial.to_string(), &tracked).expect("partial");
+        assert!(!inbox.sections[0].1.is_empty());
+        assert!(inbox.sections[2].1.is_empty());
+        assert_eq!(inbox.closed_tracked, ["PR_x"]);
+        assert_eq!(inbox.gone_tracked, ["PR_gone"]);
+        let failed_mutation =
+            r#"{"data":{"addPullRequestReview":null},"errors":[{"message":"no"}]}"#;
+        assert!(parse_mutation(failed_mutation).is_err());
+    }
+
+    #[test]
     fn graphql_errors_are_errors() {
         let json = include_str!("../test_fixtures/graphql_error.json");
-        let message = parse_inbox("github.com", json)
+        let message = parse_inbox("github.com", json, &[])
             .expect_err("error")
             .to_string();
         assert!(
