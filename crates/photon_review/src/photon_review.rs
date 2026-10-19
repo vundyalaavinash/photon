@@ -1,4 +1,5 @@
 mod checkout;
+mod context;
 mod diff;
 mod functions;
 mod gh;
@@ -7,6 +8,7 @@ mod inbox;
 mod store;
 
 pub use checkout::*;
+pub use context::*;
 pub use diff::*;
 pub use functions::*;
 pub use gh::*;

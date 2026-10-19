@@ -13483,6 +13483,7 @@ dependencies = [
  "grammars",
  "language",
  "log",
+ "lsp",
  "parking_lot",
  "paths",
  "project",
