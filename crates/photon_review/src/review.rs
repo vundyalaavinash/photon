@@ -485,6 +485,9 @@ fn status_label(diff: &FileDiff) -> &'static str {
     if diff.submodule {
         return "submodule";
     }
+    if diff.symlink {
+        return "symlink";
+    }
     if diff.binary {
         return "binary file";
     }
@@ -3322,6 +3325,7 @@ mod tests {
                 status: file.status,
                 binary: false,
                 submodule: false,
+                symlink: false,
                 hunks: file.hunks,
             };
             let task = cx.update(|cx| {

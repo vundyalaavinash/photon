@@ -173,9 +173,7 @@ async fn opaque_changed_paths(
         let Some(new_file) = new.iter().find(|file| file.path == old_file.path) else {
             continue;
         };
-        let opaque = [old_file, new_file]
-            .iter()
-            .any(|file| file.binary || file.submodule);
+        let opaque = [old_file, new_file].iter().any(|file| file.is_opaque());
         if !opaque {
             continue;
         }
@@ -481,6 +479,7 @@ mod tests {
             status: FileStatus::Modified,
             binary: false,
             submodule: false,
+            symlink: false,
             hunks: vec![Hunk {
                 old_start: start,
                 old_len: 1,

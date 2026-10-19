@@ -32,7 +32,16 @@ pub struct FileDiff {
     pub status: FileStatus,
     pub binary: bool,
     pub submodule: bool,
+    pub symlink: bool,
     pub hunks: Vec<Hunk>,
+}
+
+impl FileDiff {
+    /// Binary files, submodules and symlinks have no text Photon shows or opens. A symlink is
+    /// never followed: a pull request can point one at any file on the reviewer's machine.
+    pub fn is_opaque(&self) -> bool {
+        self.binary || self.submodule || self.symlink
+    }
 }
 
 pub struct LoadedFile {
@@ -57,6 +66,7 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<FileDiff>> {
                 status: FileStatus::Modified,
                 binary: false,
                 submodule: false,
+                symlink: false,
                 hunks: Vec::new(),
             });
             continue;
@@ -73,12 +83,15 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<FileDiff>> {
             hunk.body.push_str(line);
         } else if text.starts_with("new file mode") {
             file.status = FileStatus::Added;
-            file.submodule |= text.ends_with(GITLINK_MODE);
+            file.mark_mode(text);
         } else if text.starts_with("deleted file mode") {
             file.status = FileStatus::Deleted;
-            file.submodule |= text.ends_with(GITLINK_MODE);
-        } else if text.starts_with("index ") {
-            file.submodule |= text.ends_with(GITLINK_MODE);
+            file.mark_mode(text);
+        } else if text.starts_with("index ")
+            || text.starts_with("old mode ")
+            || text.starts_with("new mode ")
+        {
+            file.mark_mode(text);
         } else if let Some(from) = text.strip_prefix("rename from ") {
             file.status = FileStatus::Renamed {
                 from: unquote_git_path(from)?,
@@ -244,9 +257,17 @@ pub async fn git_diff(worktree: &Path, from: &str, to: &str) -> Result<Vec<FileD
 }
 
 const GITLINK_MODE: &str = " 160000";
+const SYMLINK_MODE: &str = " 120000";
+
+impl FileDiff {
+    fn mark_mode(&mut self, line: &str) {
+        self.submodule |= line.ends_with(GITLINK_MODE);
+        self.symlink |= line.ends_with(SYMLINK_MODE);
+    }
+}
 
 pub fn commentable_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
-    if file.submodule {
+    if file.is_opaque() {
         return Vec::new();
     }
     file.hunks
@@ -259,7 +280,7 @@ pub fn commentable_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
 /// Base lines (1-based) that the diff removes, which are the only lines a `Side::Left` comment
 /// can sit on.
 pub fn deleted_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
-    if file.submodule {
+    if file.is_opaque() {
         return Vec::new();
     }
     let mut ranges: Vec<RangeInclusive<u32>> = Vec::new();
@@ -284,9 +305,9 @@ pub fn deleted_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
     ranges
 }
 
-/// `None` for added, binary and submodule entries, which have no text base to show.
+/// `None` for added and opaque entries, which have no text base to show.
 pub async fn base_text(worktree: &Path, commit: &str, file: &FileDiff) -> Result<Option<String>> {
-    if file.binary || file.submodule {
+    if file.is_opaque() {
         return Ok(None);
     }
     let old_path = match &file.status {
@@ -327,30 +348,50 @@ pub fn build_loaded_file(
     diff: FileDiff,
     cx: &mut App,
 ) -> Task<Result<LoadedFile>> {
-    if diff.binary || diff.submodule {
+    if diff.is_opaque() {
         return Task::ready(Ok(LoadedFile {
             diff,
             contents: None,
         }));
     }
     let registry = project.read(cx).languages().clone();
+    let fs = project.read(cx).fs().clone();
     let buffer_task = if diff.status == FileStatus::Deleted {
         let registry = registry.clone();
         let abs_path = abs_path.clone();
         cx.spawn(async move |cx| {
             let language = registry.load_language_for_file_path(&abs_path).await.ok();
-            Ok(cx.new(|cx| {
+            Ok(Some(cx.new(|cx| {
                 let mut buffer = Buffer::local("", cx);
                 buffer.set_language_registry(registry);
                 buffer.set_language(language, cx);
                 buffer
-            }))
+            })))
         })
     } else {
-        project.update(cx, |project, cx| project.open_local_buffer(abs_path, cx))
+        let project = project.clone();
+        cx.spawn(async move |cx| {
+            // The diff's modes come from the PR; what's on disk is checked again before opening.
+            let metadata = fs.metadata(&abs_path).await?;
+            if metadata
+                .is_some_and(|metadata| metadata.is_symlink || metadata.is_dir || metadata.is_fifo)
+            {
+                return Ok(None);
+            }
+            project
+                .update(cx, |project, cx| project.open_local_buffer(abs_path, cx))
+                .await
+                .map(Some)
+        })
     };
     cx.spawn(async move |cx| {
-        let buffer = buffer_task.await?;
+        let Some(buffer) = buffer_task.await? else {
+            log::warn!("not opening {:?}: it isn't a regular file", diff.path);
+            return Ok(LoadedFile {
+                diff,
+                contents: None,
+            });
+        };
         // The project may still hold this buffer from a review of an older head; read the text
         // the checkout just wrote rather than waiting for the file watcher.
         if diff.status != FileStatus::Deleted {
@@ -394,6 +435,7 @@ mod tests {
             status,
             binary,
             submodule: false,
+            symlink: false,
             hunks: Vec::new(),
         }
     }
@@ -901,6 +943,99 @@ index 1..2 100644
             .await
             .expect("loaded");
         assert!(loaded.contents.is_none());
+    }
+
+    const SYMLINK_PATCH: &str = "\
+diff --git a/key b/key
+new file mode 120000
+index 0000000..1111111
+--- /dev/null
++++ b/key
+@@ -0,0 +1 @@
++/Users/someone/.ssh/id_rsa
+\\ No newline at end of file
+diff --git a/zero b/zero
+index 2222222..3333333 120000
+--- a/zero
++++ b/zero
+@@ -1 +1 @@
+-/tmp/x
+\\ No newline at end of file
++/dev/zero
+\\ No newline at end of file
+diff --git a/old_link b/old_link
+deleted file mode 120000
+index 4444444..0000000
+--- a/old_link
++++ /dev/null
+@@ -1 +0,0 @@
+-target
+\\ No newline at end of file
+diff --git a/plain.rs b/plain.rs
+index 5555555..6666666 100644
+--- a/plain.rs
++++ b/plain.rs
+@@ -1 +1 @@
+-a
++b
+";
+
+    #[test]
+    fn symlinks_are_opaque() {
+        let files = parse_unified_diff(SYMLINK_PATCH).expect("parse");
+        let opaque: Vec<_> = files
+            .iter()
+            .map(|file| (file.path.as_str(), file.symlink, file.is_opaque()))
+            .collect();
+        assert_eq!(
+            opaque,
+            vec![
+                ("key", true, true),
+                ("zero", true, true),
+                ("old_link", true, true),
+                ("plain.rs", false, false),
+            ]
+        );
+        assert!(commentable_lines(&files[0]).is_empty());
+    }
+
+    #[gpui::test]
+    async fn symlink_is_never_opened(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/secret", json!({ "id_rsa": "private" }))
+            .await;
+        fs.insert_tree("/repo", json!({ "plain.rs": "b" })).await;
+        fs.insert_symlink("/repo/key", "/secret/id_rsa".into())
+            .await;
+        let project = Project::test(fs, ["/repo".as_ref()], cx).await;
+
+        let parsed = parse_unified_diff(SYMLINK_PATCH).expect("parse");
+        let key = parsed.into_iter().next().expect("key entry");
+        let loaded = cx
+            .update(|cx| build_loaded_file(&project, "/repo/key".into(), None, key, cx))
+            .await
+            .expect("loaded");
+        assert!(loaded.contents.is_none());
+
+        // A symlink the diff didn't report as one is still skipped.
+        let unmarked = file("key", FileStatus::Added, false);
+        let loaded = cx
+            .update(|cx| build_loaded_file(&project, "/repo/key".into(), None, unmarked, cx))
+            .await
+            .expect("loaded");
+        assert!(loaded.contents.is_none());
+        let is_open = project.read_with(cx, |project, cx| {
+            project
+                .buffer_store()
+                .read(cx)
+                .buffers()
+                .any(|buffer| buffer.read(cx).text() == "private")
+        });
+        assert!(!is_open);
     }
 
     async fn open_text_buffer(cx: &mut TestAppContext) -> (Arc<FakeFs>, Entity<Buffer>) {

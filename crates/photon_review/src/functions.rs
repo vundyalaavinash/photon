@@ -728,6 +728,7 @@ trait Speak {
             status: FileStatus::Modified,
             binary: false,
             submodule: false,
+            symlink: false,
             hunks: Vec::new(),
         };
         let loaded = cx
