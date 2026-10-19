@@ -5,6 +5,7 @@ mod functions;
 mod gh;
 mod github;
 mod inbox;
+mod review_map;
 mod store;
 
 pub use checkout::*;
@@ -14,6 +15,7 @@ pub use functions::*;
 pub use gh::*;
 pub use github::*;
 pub use inbox::*;
+pub use review_map::*;
 pub use store::*;
 
 use gpui::App;
