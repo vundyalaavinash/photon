@@ -284,6 +284,7 @@ impl Terminal {
     ) -> Option<Vec<photon_blocks::OutputLine>> {
         self.block_output_reader(id, max_lines, max_bytes)
             .and_then(|read| read())
+            .map(|(lines, _)| lines)
     }
 
     /// The same read as `block_output_lines`, deferred: the closure walks the grid when called,
@@ -294,7 +295,8 @@ impl Terminal {
         id: BlockId,
         max_lines: usize,
         max_bytes: usize,
-    ) -> Option<impl FnOnce() -> Option<Vec<photon_blocks::OutputLine>> + Send + use<>> {
+    ) -> Option<impl FnOnce() -> Option<(Vec<photon_blocks::OutputLine>, usize)> + Send + use<>>
+    {
         let read = OutputRead {
             output_line: self.blocks()?.block(id)?.output_line?,
             end_line: self.blocks()?.block(id)?.end_line,
@@ -306,7 +308,12 @@ impl Terminal {
             max_bytes,
         };
         let term = self.term.clone();
-        Some(move || read_output_lines(&term.lock(), &read))
+        // The column count comes from the same lock as the rows, so a caller can tell whether the
+        // grid re-wrapped after it captured `output_line`.
+        Some(move || {
+            let term = term.lock();
+            Some((read_output_lines(&term, &read)?, term.columns()))
+        })
     }
 
     /// Complete logical lines of a running block that start at or after `from_line`, at most

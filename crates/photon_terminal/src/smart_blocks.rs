@@ -526,14 +526,22 @@ impl SmartBlocks {
             return;
         };
         let task = cx.background_spawn(async move {
-            let lines = read_lines()?;
-            recognise(&command, &lines, exit_code)
+            let (lines, read_columns) = read_lines()?;
+            Some((recognise(&command, &lines, exit_code), read_columns))
         });
         let task = cx.spawn(async move |this, cx| {
-            let insight = task.await;
+            let result = task.await;
             this.update(cx, |this, cx| {
                 this.tasks.remove(&id);
-                this.store_insight(id, insight, output_line, columns, cx);
+                match result {
+                    // The grid re-wrapped between capturing `output_line` and reading the rows,
+                    // so the rows may belong to other lines: read again at the current width.
+                    Some((_, read_columns)) if read_columns != columns => {
+                        this.recognise_block(id, cx)
+                    }
+                    Some((insight, _)) => this.store_insight(id, insight, output_line, columns, cx),
+                    None => {}
+                }
             })
             .log_err();
         });
@@ -898,7 +906,7 @@ mod tests {
                 else {
                     continue;
                 };
-                if let Some(lines) = read_lines() {
+                if let Some((lines, _)) = read_lines() {
                     recognise(&block.command, &lines, block.exit_code);
                 }
                 measured += 1;
