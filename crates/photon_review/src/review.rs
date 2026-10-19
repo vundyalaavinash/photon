@@ -931,10 +931,13 @@ impl ReviewItem {
             .viewed_steps(&detail.summary.key)
             .log_err()
             .unwrap_or_default();
-        let last_review = database
-            .last_review(&detail.summary.key)
-            .log_err()
-            .flatten();
+        // GitHub's record wins: it includes reviews submitted on github.com.
+        let last_review = detail.summary.last_review_commit.clone().or_else(|| {
+            database
+                .last_review(&detail.summary.key)
+                .log_err()
+                .flatten()
+        });
         let mut this = Self {
             project,
             detail,
@@ -1422,6 +1425,9 @@ impl ReviewItem {
         cx.spawn_in(window, async move |this, cx| {
             let detail = parse_detail(&key, &runner.run(request).await?)?;
             this.update_in(cx, |this, window, cx| {
+                if let Some(commit) = &detail.summary.last_review_commit {
+                    this.last_review = Some(commit.clone());
+                }
                 this.detail = detail;
                 this.add_reply_editors(window, cx);
                 this.show_comments(cx);
@@ -3284,6 +3290,32 @@ mod tests {
         restricted: bool,
         database: Option<ReviewDb>,
     ) -> (Entity<ReviewItem>, VisualTestContext, Arc<AtomicUsize>) {
+        let detail = parse_detail(&key(), DETAIL).expect("detail");
+        open_item_with_detail(
+            cx,
+            tree,
+            files,
+            graph,
+            call_hierarchy,
+            gate,
+            restricted,
+            database,
+            detail,
+        )
+        .await
+    }
+
+    async fn open_item_with_detail(
+        cx: &mut TestAppContext,
+        tree: serde_json::Value,
+        files: Vec<PrFile>,
+        graph: Graph,
+        call_hierarchy: bool,
+        gate: Option<Gate>,
+        restricted: bool,
+        database: Option<ReviewDb>,
+        detail: PrDetail,
+    ) -> (Entity<ReviewItem>, VisualTestContext, Arc<AtomicUsize>) {
         init_test(cx);
         let database = database.unwrap_or_else(|| test_database(cx));
         let fs = FakeFs::new(cx.executor());
@@ -3339,7 +3371,6 @@ mod tests {
             });
             loaded.push(task.await.expect("loaded file"));
         }
-        let detail = parse_detail(&key(), DETAIL).expect("detail");
         let window = cx.add_window(|window, cx| {
             ReviewItem::new(
                 project.clone(),
@@ -5383,8 +5414,14 @@ fn verify_password(user: &str, password: &str) -> bool {
 
     #[gpui::test]
     async fn changes_since_review_toggle_offered_only_when_pushed(cx: &mut TestAppContext) {
-        for (last_review, offered) in [(None, false), (Some("head"), false), (Some("older"), true)]
-        {
+        for (on_github, last_review, offered) in [
+            (None, None, false),
+            (None, Some("head"), false),
+            (None, Some("older"), true),
+            (Some("older"), None, true),
+            (Some("older"), Some("head"), true),
+            (Some("head"), Some("older"), false),
+        ] {
             let database = test_database(cx);
             database
                 .track(Tracked {
@@ -5401,7 +5438,9 @@ fn verify_password(user: &str, password: &str) -> bool {
                     .await
                     .expect("set last review");
             }
-            let (item, cx, _) = open_item_with(
+            let mut detail = parse_detail(&key(), DETAIL).expect("detail");
+            detail.summary.last_review_commit = on_github.map(str::to_string);
+            let (item, cx, _) = open_item_with_detail(
                 cx,
                 login_tree(),
                 vec![login_with_hunk()],
@@ -5410,12 +5449,13 @@ fn verify_password(user: &str, password: &str) -> bool {
                 None,
                 false,
                 Some(database),
+                detail,
             )
             .await;
             assert_eq!(
                 item.read_with(&cx, |item, _| item.changes_since_review_offered()),
                 offered,
-                "{last_review:?}"
+                "github {on_github:?}, database {last_review:?}"
             );
         }
     }
