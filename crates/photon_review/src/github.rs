@@ -578,11 +578,11 @@ fn side_name(side: Side) -> &'static str {
 
 /// Whether Submit sends this draft. Outdated drafts stay local until the user re-places them or
 /// posts them as general comments; a draft not yet re-anchored to this head would land on the
-/// wrong lines, so it waits too. A draft still marked `sending` may already be on GitHub, so it
-/// waits for the user to include it again.
+/// wrong lines, so it waits too. A draft that may already be on GitHub waits for the user to
+/// include it again.
 pub fn is_sendable(draft: &Draft, head_sha: &str) -> bool {
     !draft.body.trim().is_empty()
-        && !draft.sending
+        && draft.post_state == crate::PostState::Unposted
         && (draft.general || (!draft.outdated && draft.commit == head_sha))
 }
 
@@ -924,7 +924,7 @@ mod tests {
             body: body.into(),
             outdated: false,
             general: false,
-            sending: false,
+            post_state: crate::PostState::Unposted,
         }
     }
 
@@ -952,7 +952,7 @@ mod tests {
             general,
             draft("src/upload.rs", 41, 41, "  "),
             crate::Draft {
-                sending: true,
+                post_state: crate::PostState::Sending,
                 ..draft("src/upload.rs", 41, 41, "Maybe posted")
             },
         ];

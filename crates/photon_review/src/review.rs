@@ -36,14 +36,14 @@ use workspace::{
 use crate::{
     CallerMark, ChangedFunction, Checkout, ChecksState, ContextCache, ContextError, ContextExcerpt,
     Draft, FileAnalysis, FileDiff, FileKind, FileStatus, FunctionContext, GhError, GhRunner,
-    LoadedFile, MapFile, MapFunction, PrDetail, PrKey, PrSummary, Reanchor, RepoId, ReviewDb,
-    ReviewEvent, ReviewThread, Side, Step, Tracked, analyse_loaded_file, auth_status_request,
-    base_text, build_loaded_file, build_review_map, call_edges, caller_touched, candidate_repos,
-    classify_caller, classify_path, commentable_lines, context::buffer_path, context_excerpts,
-    deleted_lines, detail_request, fetch_url, find_clone, functions, gh_runner, git_diff,
-    is_sendable, landing_note, parse_auth_status, parse_detail, parse_mutation, parse_reply, place,
-    prepare_checkout, reanchor, reply_request, resolve_request, review_request, review_root,
-    viewed_request,
+    LoadedFile, MapFile, MapFunction, PostState, PrDetail, PrKey, PrSummary, Reanchor, RepoId,
+    ReviewDb, ReviewEvent, ReviewThread, Side, Step, Tracked, analyse_loaded_file,
+    auth_status_request, base_text, build_loaded_file, build_review_map, call_edges,
+    caller_touched, candidate_repos, classify_caller, classify_path, commentable_lines,
+    context::buffer_path, context_excerpts, deleted_lines, detail_request, fetch_url, find_clone,
+    functions, gh_runner, git_diff, is_sendable, landing_note, parse_auth_status, parse_detail,
+    parse_mutation, parse_reply, place, prepare_checkout, reanchor, reply_request, resolve_request,
+    review_request, review_root, viewed_request,
 };
 
 actions!(
@@ -62,8 +62,10 @@ const HUNK_CONTEXT_LINES: u32 = 3;
 const COMPOSER_MAX_LINES: u32 = 4;
 const TRUST_REASON: &str = "Trust this worktree to find callers";
 const UNCHANGED_BACKGROUND: u32 = 0x07090b;
-const MAYBE_POSTED: &str = "May already be posted: a submit was interrupted. Include it again or \
-     delete it.";
+const INTERRUPTED_NOTE: &str =
+    "May already be posted: a submit was interrupted. Include it again or delete it.";
+const EARLIER_VERSION_NOTE: &str = "An earlier version of this comment was posted. Include this \
+     version too, or delete it.";
 const IMPACT_LEGEND: &str = "Every caller in the repo, not just the diff. Red: the signature \
      changed and this caller wasn't updated. Amber: the body changed and this caller wasn't \
      touched, so check it.";
@@ -91,6 +93,8 @@ struct DraftSync {
     id: Option<i64>,
     in_flight: bool,
     error: Option<SharedString>,
+    /// Woken when the queue runs dry, so Submit can wait for its marks to land.
+    idle_waiters: Vec<futures::channel::oneshot::Sender<()>>,
 }
 
 /// An empty body is never stored, so emptying a draft removes its row until text comes back.
@@ -119,6 +123,9 @@ impl DraftSync {
             None => {}
         }
         self.in_flight = false;
+        for waiter in self.idle_waiters.drain(..) {
+            waiter.send(()).ok();
+        }
         None
     }
 }
@@ -523,7 +530,7 @@ fn draft_renderer(
     line: u32,
     body: SharedString,
     note: Option<SharedString>,
-    maybe_posted: bool,
+    posted_note: Option<&'static str>,
     composer: Option<Entity<Editor>>,
     sync: Arc<Mutex<DraftSync>>,
 ) -> RenderBlock {
@@ -554,12 +561,12 @@ fn draft_renderer(
                 note.clone()
                     .map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
             )
-            .when(maybe_posted, |this| {
+            .when_some(posted_note, |this, posted_note| {
                 this.child(
                     h_flex()
                         .gap_1()
                         .child(
-                            Label::new(MAYBE_POSTED)
+                            Label::new(posted_note)
                                 .size(LabelSize::XSmall)
                                 .color(Color::Warning),
                         )
@@ -920,24 +927,48 @@ impl ReviewItem {
     }
 
     /// Drafts with text that Submit leaves out because they are outdated or not yet re-anchored.
-    /// Drafts that may already be posted carry their own note.
     pub fn left_out_drafts(&self) -> usize {
         self.drafts
             .iter()
             .filter(|draft| {
                 !draft.body.trim().is_empty()
-                    && !draft.sending
+                    && draft.post_state == PostState::Unposted
                     && !is_sendable(draft, &self.checkout.head_sha)
             })
             .count()
     }
 
+    /// Why a draft may already be on GitHub. While a submit runs, its own drafts are marked, so
+    /// nothing is said until it ends.
+    pub fn posted_note(&self, draft: &Draft) -> Option<&'static str> {
+        if self.submitting {
+            return None;
+        }
+        match draft.post_state {
+            PostState::Unposted => None,
+            PostState::Sending => Some(INTERRUPTED_NOTE),
+            PostState::EarlierVersionPosted => Some(EARLIER_VERSION_NOTE),
+        }
+    }
+
     pub fn left_out_note(&self) -> Option<String> {
-        let count = self.left_out_drafts();
-        (count > 0).then(|| {
-            let plural = if count == 1 { "" } else { "s" };
-            format!("{count} draft{plural} not included (outdated or not yet re-placed)")
-        })
+        let mut parts = Vec::new();
+        let left_out = self.left_out_drafts();
+        if left_out > 0 {
+            let plural = if left_out == 1 { "" } else { "s" };
+            parts.push(format!(
+                "{left_out} draft{plural} not included (outdated or not yet re-placed)"
+            ));
+        }
+        let maybe_posted = self
+            .drafts
+            .iter()
+            .filter(|draft| self.posted_note(draft).is_some())
+            .count();
+        if maybe_posted > 0 {
+            parts.push(format!("{maybe_posted} may already be posted"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
     /// Makes a draft that may already be posted sendable again, at the user's word.
@@ -945,7 +976,7 @@ impl ReviewItem {
         let Some(index) = self.draft_index(local_id) else {
             return;
         };
-        self.drafts[index].sending = false;
+        self.drafts[index].post_state = PostState::Unposted;
         self.queue_save(local_id, cx);
         self.show_comments(cx);
         cx.notify();
@@ -1006,17 +1037,21 @@ impl ReviewItem {
             .filter(|(draft, _)| is_sendable(draft, &head_sha))
             .map(|(draft, view)| (view.local_id, view.sync.clone(), draft.body.clone()))
             .collect();
-        // Queued too, so a row whose first save is still running also lands marked.
-        for (local_id, _, _) in &sent {
+        // Marked through each draft's own queue, so the mark lands after any save in flight,
+        // a first insert included, and the request waits until every queue has run dry.
+        let mut marks = Vec::new();
+        for (local_id, sync, _) in &sent {
             if let Some(index) = self.draft_index(*local_id) {
-                self.drafts[index].sending = true;
+                self.drafts[index].post_state = PostState::Sending;
                 self.queue_save(*local_id, cx);
             }
+            let mut state = sync.lock();
+            if state.in_flight {
+                let (waiter, idle) = futures::channel::oneshot::channel();
+                state.idle_waiters.push(waiter);
+                marks.push(idle);
+            }
         }
-        let saved_ids: Vec<i64> = sent
-            .iter()
-            .filter_map(|(_, sync, _)| sync.lock().id)
-            .collect();
         self.submitting = true;
         self.submit_error = None;
         self.submit_note = None;
@@ -1024,9 +1059,19 @@ impl ReviewItem {
         let runner = gh_runner(cx);
         let database = self.database.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let posted = match database.set_drafts_sending(saved_ids, true).await {
-                Ok(()) => runner.run(request).await.map_err(anyhow::Error::from),
-                Err(error) => Err(error.context("Couldn't mark the drafts as sending")),
+            for idle in marks {
+                idle.await.ok();
+            }
+            let unmarked = sent.iter().any(|(_, sync, _)| {
+                let state = sync.lock();
+                state.error.is_some() || state.id.is_none()
+            });
+            let posted = if unmarked {
+                Err(anyhow!(
+                    "Couldn't save the drafts before posting, so nothing was sent."
+                ))
+            } else {
+                runner.run(request).await.map_err(anyhow::Error::from)
             };
             if let Err(error) = posted {
                 // A closed review leaves its rows marked: they may need a second look, but they
@@ -1036,7 +1081,7 @@ impl ReviewItem {
                     this.submit_error = Some(format!("{error:#}").into());
                     for (local_id, _, _) in &sent {
                         if let Some(index) = this.draft_index(*local_id) {
-                            this.drafts[index].sending = false;
+                            this.drafts[index].post_state = PostState::Unposted;
                             this.queue_save(*local_id, cx);
                         }
                     }
@@ -1054,12 +1099,14 @@ impl ReviewItem {
                         // Discarded while posting; its own delete is already queued.
                         continue;
                     };
-                    // A draft edited while posting keeps its newer text and stays marked as
-                    // possibly posted.
                     if this.drafts[index].body == *body {
                         this.drafts.remove(index);
                         this.draft_views.remove(index);
                         posted.push((*local_id, sync.clone()));
+                    } else {
+                        // Edited while posting: the earlier text is on GitHub, the newer stays.
+                        this.drafts[index].post_state = PostState::EarlierVersionPosted;
+                        this.queue_save(*local_id, cx);
                     }
                 }
                 if this.summary_editor.read(cx).text(cx) == summary {
@@ -1083,11 +1130,13 @@ impl ReviewItem {
                 }
             }
 
-            let mut problem = database
-                .set_last_review(key, head_sha)
-                .await
-                .err()
-                .map(|error| format!("{error:#}"));
+            let mut problem = match database.set_last_review(key, head_sha).await {
+                Ok(()) => None,
+                Err(error) => {
+                    log::error!("recording the last review failed: {error:#}");
+                    Some(format!("{error:#}"))
+                }
+            };
             if !review_open {
                 return Ok(());
             }
@@ -1535,7 +1584,7 @@ impl ReviewItem {
             body: String::new(),
             outdated: false,
             general: false,
-            sending: false,
+            post_state: crate::PostState::Unposted,
         };
         let local_id = self.push_draft(draft);
         self.open_composer(local_id, window, cx);
@@ -1716,14 +1765,13 @@ impl ReviewItem {
                 continue;
             };
             let note = self.draft_note(draft);
-            // During a submit every sent draft is marked; only a leftover mark means anything.
-            let maybe_posted = draft.sending && !self.submitting;
+            let posted_note = self.posted_note(draft);
             let body_rows = draft.body.lines().count().max(1) as u32;
             let height = match view.composer {
                 Some(_) => COMPOSER_MAX_LINES + 4,
                 None => 3 + body_rows,
             } + if note.is_some() { 2 } else { 0 }
-                + if maybe_posted { 2 } else { 0 };
+                + if posted_note.is_some() { 2 } else { 0 };
             blocks.push(BlockProperties {
                 placement: BlockPlacement::Below(anchor),
                 height: Some(height),
@@ -1734,7 +1782,7 @@ impl ReviewItem {
                     draft.end_line,
                     draft.body.clone().into(),
                     note.map(SharedString::from),
-                    maybe_posted,
+                    posted_note,
                     view.composer.clone(),
                     view.sync.clone(),
                 ),
@@ -2423,6 +2471,7 @@ impl ReviewItem {
                 )
                 .children(outdated.into_iter().map(|(draft, view)| {
                     let local_id = view.local_id;
+                    let posted_note = self.posted_note(draft);
                     v_flex()
                         .id(("photon-review-outdated", local_id))
                         .gap_1()
@@ -2450,23 +2499,40 @@ impl ReviewItem {
                                         this.replace_draft(local_id, cx)
                                     }),
                                 ))
-                                .map(|this| {
-                                    if draft.general {
-                                        this.child(
-                                            Label::new("posts as a general comment")
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
-                                        )
-                                    } else {
-                                        this.child(
-                                            Button::new("general", "Post as general comment")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.post_as_general(local_id, cx)
-                                                })),
-                                        )
-                                    }
-                                }),
+                                // A draft that may already be posted is included again
+                                // before anything else can send it.
+                                .map(|this| match posted_note {
+                                    Some(_) => this.child(
+                                        Button::new("include", "Include again").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.include_again(local_id, cx)
+                                            }),
+                                        ),
+                                    ),
+                                    None if draft.general => this.child(
+                                        Label::new("posts as a general comment")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                    None => this.child(
+                                        Button::new("general", "Post as general comment").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.post_as_general(local_id, cx)
+                                            }),
+                                        ),
+                                    ),
+                                })
+                                .child(Button::new("delete", "Delete").on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.cancel_draft(local_id, window, cx)
+                                    },
+                                ))),
                         )
+                        .children(posted_note.map(|note| {
+                            Label::new(note)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning)
+                        }))
                 }))
                 .into_any_element(),
         )
@@ -3657,7 +3723,7 @@ fn verify_password(user: &str, password: &str) -> bool {
             body: format!("about {anchor_text}"),
             outdated: false,
             general: false,
-            sending: false,
+            post_state: crate::PostState::Unposted,
         }
     }
 
@@ -4281,9 +4347,11 @@ fn verify_password(user: &str, password: &str) -> bool {
         fake.respond(
             move |request| {
                 is_review_post(request)
-                    && marked
-                        .drafts(&key())
-                        .is_ok_and(|drafts| drafts.iter().all(|draft| draft.sending))
+                    && marked.drafts(&key()).is_ok_and(|drafts| {
+                        drafts
+                            .iter()
+                            .all(|draft| draft.post_state == PostState::Sending)
+                    })
             },
             Ok("{}".into()),
         );
@@ -4530,7 +4598,7 @@ fn verify_password(user: &str, password: &str) -> bool {
     #[gpui::test]
     async fn sending_row_reopens_marked_and_is_not_sent(cx: &mut TestAppContext) {
         let maybe_posted = Draft {
-            sending: true,
+            post_state: crate::PostState::Sending,
             ..current_draft("src/login.rs", 3, "    audit(user);")
         };
         let (item, mut cx, database) = open_with_drafts(
@@ -4539,7 +4607,7 @@ fn verify_password(user: &str, password: &str) -> bool {
         )
         .await;
         item.read_with(&cx, |item, _| {
-            assert!(item.drafts()[0].sending);
+            assert_eq!(item.drafts()[0].post_state, PostState::Sending);
             assert_eq!(item.sendable_drafts(), 1);
             assert_eq!(item.left_out_drafts(), 0);
         });
@@ -4553,12 +4621,15 @@ fn verify_password(user: &str, password: &str) -> bool {
         assert_eq!(comments[0]["line"], 4);
         let stored = database.drafts(&key()).expect("drafts");
         assert_eq!(stored.len(), 1);
-        assert!(stored[0].sending);
+        assert_eq!(stored[0].post_state, PostState::Sending);
 
         item.update(&mut cx, |item, cx| item.include_again(0, cx));
         cx.run_until_parked();
         item.read_with(&cx, |item, _| assert_eq!(item.sendable_drafts(), 1));
-        assert!(!database.drafts(&key()).expect("drafts")[0].sending);
+        assert_eq!(
+            database.drafts(&key()).expect("drafts")[0].post_state,
+            PostState::Unposted
+        );
     }
 
     #[gpui::test]
@@ -4607,5 +4678,129 @@ fn verify_password(user: &str, password: &str) -> bool {
             assert!(item.drafts().is_empty());
             assert_eq!(item.summary_editor.read(cx).text(cx), "Typed after");
         });
+    }
+
+    #[gpui::test]
+    async fn sending_general_draft_can_be_included_or_deleted(cx: &mut TestAppContext) {
+        let stuck = Draft {
+            outdated: true,
+            general: true,
+            post_state: PostState::Sending,
+            ..stored_draft("src/login.rs", 2, "    gone();")
+        };
+        let (item, mut cx, database) = open_with_drafts(cx, vec![stuck.clone(), stuck]).await;
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(
+                gpui::AvailableSpace::Definite(px(1200.)),
+                gpui::AvailableSpace::Definite(px(800.)),
+            ),
+            |_, _| item.clone().into_any_element(),
+        );
+        item.read_with(&cx, |item, _| {
+            assert_eq!(item.posted_note(&item.drafts()[0]), Some(INTERRUPTED_NOTE));
+            assert_eq!(item.sendable_drafts(), 0);
+            assert_eq!(
+                item.left_out_note().as_deref(),
+                Some("2 may already be posted")
+            );
+        });
+
+        item.update(&mut cx, |item, cx| item.include_again(0, cx));
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            assert_eq!(item.posted_note(&item.drafts()[0]), None);
+            assert_eq!(item.sendable_drafts(), 1);
+            assert_eq!(
+                item.left_out_note().as_deref(),
+                Some("1 may already be posted")
+            );
+        });
+
+        item.update_in(&mut cx, |item, window, cx| item.cancel_draft(1, window, cx));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        let stored = database.drafts(&key()).expect("drafts");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].post_state, PostState::Unposted);
+    }
+
+    #[gpui::test]
+    async fn draft_inserted_during_submit_is_marked_before_post(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(cx, Vec::new()).await;
+        let fake = install_fake(&mut cx);
+        let marked = database.clone();
+        fake.respond(
+            move |request| {
+                is_review_post(request)
+                    && marked.drafts(&key()).is_ok_and(|drafts| {
+                        drafts.len() == 1 && drafts[0].post_state == PostState::Sending
+                    })
+            },
+            Ok("{}".into()),
+        );
+        fake.respond(is_detail, Ok(DETAIL.into()));
+        let task = item.update_in(&mut cx, |item, window, cx| {
+            let local_id = item.push_draft(current_draft("src/login.rs", 3, "    audit(user);"));
+            item.queue_save(local_id, cx);
+            item.submit(crate::ReviewEvent::Comment, window, cx)
+        });
+        cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("posted");
+        assert!(database.drafts(&key()).expect("drafts").is_empty());
+    }
+
+    #[gpui::test]
+    async fn draft_edited_during_submit_says_earlier_version_posted(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(
+            cx,
+            vec![current_draft("src/login.rs", 3, "    audit(user);")],
+        )
+        .await;
+        let fake = install_fake(&mut cx);
+        fake.respond(is_review_post, Ok("{}".into()));
+        fake.respond(is_detail, Ok(DETAIL.into()));
+        let task = item.update_in(&mut cx, |item, window, cx| {
+            let task = item.submit(crate::ReviewEvent::Comment, window, cx);
+            item.drafts[0].body = "Edited while posting".into();
+            item.queue_save(0, cx);
+            task
+        });
+        cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("posted");
+        item.read_with(&cx, |item, _| {
+            assert_eq!(
+                item.posted_note(&item.drafts()[0]),
+                Some(EARLIER_VERSION_NOTE)
+            );
+            assert_eq!(item.sendable_drafts(), 0);
+        });
+        let stored = database.drafts(&key()).expect("drafts");
+        assert_eq!(stored[0].body, "Edited while posting");
+        assert_eq!(stored[0].post_state, PostState::EarlierVersionPosted);
+    }
+
+    #[gpui::test]
+    async fn failed_mark_sends_nothing(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(cx, Vec::new()).await;
+        let fake = install_fake(&mut cx);
+        fake.respond(is_review_post, Ok("{}".into()));
+        crate::store::FAILING_SAVES.store(1, Ordering::SeqCst);
+        let task = item.update_in(&mut cx, |item, window, cx| {
+            let local_id = item.push_draft(current_draft("src/login.rs", 3, "    audit(user);"));
+            item.queue_save(local_id, cx);
+            item.submit(crate::ReviewEvent::Comment, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(task.now_or_never().expect("finished").is_err());
+        assert!(fake.requests().is_empty());
+        item.read_with(&cx, |item, _| {
+            assert!(item.submit_error.is_some());
+            assert_eq!(item.sendable_drafts(), 1);
+        });
+        let stored = database.drafts(&key()).expect("drafts");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].post_state, PostState::Unposted);
     }
 }

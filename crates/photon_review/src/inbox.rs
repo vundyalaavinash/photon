@@ -1203,7 +1203,7 @@ mod tests {
                 body: "Why?".into(),
                 outdated: false,
                 general: false,
-                sending: false,
+                post_state: crate::PostState::Unposted,
             })
             .await
             .expect("save");

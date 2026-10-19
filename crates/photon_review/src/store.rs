@@ -75,8 +75,37 @@ pub struct Draft {
     pub body: String,
     pub outdated: bool,
     pub general: bool,
-    /// Set while Submit posts the draft. A row still set after a crash may already be on GitHub.
-    pub sending: bool,
+    pub post_state: PostState,
+}
+
+/// Stored in the `sending` column as 0, 1 or 2.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PostState {
+    #[default]
+    Unposted,
+    /// Set while Submit posts the draft. Still set after a crash or a failure the review didn't
+    /// see, so the draft may already be on GitHub.
+    Sending,
+    /// Edited while its review was posting: the earlier text is on GitHub, this one isn't.
+    EarlierVersionPosted,
+}
+
+impl PostState {
+    fn from_column(value: i64) -> Self {
+        match value {
+            1 => PostState::Sending,
+            2 => PostState::EarlierVersionPosted,
+            _ => PostState::Unposted,
+        }
+    }
+
+    fn to_column(self) -> i64 {
+        match self {
+            PostState::Unposted => 0,
+            PostState::Sending => 1,
+            PostState::EarlierVersionPosted => 2,
+        }
+    }
 }
 
 /// Saves that fail before reaching the database, for testing the retry path.
@@ -86,7 +115,7 @@ pub(crate) static FAILING_SAVES: std::sync::atomic::AtomicUsize =
 
 type DraftRow = (
     (i64, String, String, i64, i64),
-    (String, String, String, bool, bool, bool),
+    (String, String, String, bool, bool, i64),
 );
 
 type TrackedRow = (String, String, String, i64, String, String, String);
@@ -207,7 +236,7 @@ impl ReviewDb {
                     body,
                     outdated,
                     general,
-                    sending,
+                    post_state: PostState::from_column(sending),
                 })
             },
         )
@@ -245,7 +274,7 @@ impl ReviewDb {
                 draft.body,
                 draft.outdated,
                 draft.general,
-                draft.sending,
+                draft.post_state.to_column(),
             ),
         );
         let key = draft.key;
@@ -279,18 +308,6 @@ impl ReviewDb {
             let mut delete = connection.exec_bound::<i64>("DELETE FROM drafts WHERE id = ?1")?;
             for id in ids {
                 delete(id)?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn set_drafts_sending(&self, ids: Vec<i64>, sending: bool) -> Result<()> {
-        self.write(move |connection| {
-            let mut update = connection
-                .exec_bound::<(bool, i64)>("UPDATE drafts SET sending = ?1 WHERE id = ?2")?;
-            for id in ids {
-                update((sending, id))?;
             }
             Ok(())
         })
@@ -392,7 +409,7 @@ mod tests {
             body: "Why?".into(),
             outdated: false,
             general: false,
-            sending: false,
+            post_state: crate::PostState::Unposted,
         }
     }
 
@@ -409,7 +426,7 @@ mod tests {
         second.side = Side::Left;
         second.outdated = true;
         second.general = true;
-        second.sending = true;
+        second.post_state = PostState::EarlierVersionPosted;
         second.id = Some(db.save_draft(second.clone()).await.unwrap());
         let mut other = draft(8, "src/a.rs", 1);
         other.id = Some(db.save_draft(other.clone()).await.unwrap());
@@ -431,14 +448,14 @@ mod tests {
             vec![first.clone(), second.clone()]
         );
 
-        db.set_drafts_sending(vec![first.id.unwrap()], true)
-            .await
-            .unwrap();
-        assert!(db.drafts(&key(7)).unwrap()[0].sending);
-        db.set_drafts_sending(vec![first.id.unwrap()], false)
-            .await
-            .unwrap();
-        assert!(!db.drafts(&key(7)).unwrap()[0].sending);
+        first.post_state = PostState::Sending;
+        db.save_draft(first.clone()).await.unwrap();
+        assert_eq!(
+            db.drafts(&key(7)).unwrap()[0].post_state,
+            PostState::Sending
+        );
+        first.post_state = PostState::Unposted;
+        db.save_draft(first.clone()).await.unwrap();
 
         db.delete_draft(second.id.unwrap()).await.unwrap();
         assert_eq!(db.drafts(&key(7)).unwrap(), vec![first.clone()]);
