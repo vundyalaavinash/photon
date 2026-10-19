@@ -171,6 +171,10 @@ pub struct TerminalView {
     // photon: the editor-style command line of a block terminal.
     block_input: Option<Entity<photon_terminal::BlockInput>>,
     block_input_shown: bool,
+    // photon: what finished and running blocks turned out to be (tests, git, servers); the
+    // block chrome reads it in later SP1b tasks.
+    #[allow(dead_code)]
+    smart_blocks: Option<(Entity<photon_terminal::SmartBlocks>, Subscription)>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -273,6 +277,7 @@ impl TerminalView {
 
         let scroll_handle = TerminalScrollHandle::new(terminal.read(cx));
         let block_input = Self::new_block_input(&terminal, workspace_handle.clone(), window, cx); // photon: block input box
+        let smart_blocks = Self::new_smart_blocks(&terminal, workspace_handle.clone(), window, cx); // photon: smart blocks
 
         let blink_manager = cx.new(|cx| {
             BlinkManager::new(
@@ -332,6 +337,7 @@ impl TerminalView {
             selected_block: None,
             block_input,
             block_input_shown: false,
+            smart_blocks,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }

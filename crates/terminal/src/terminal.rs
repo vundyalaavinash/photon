@@ -6699,6 +6699,64 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn output_lines_join_wrapped_rows(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(20.),
+                px(10.),
+                bounds(point(px(0.), px(0.)), size(px(30.), px(20. * 30.))),
+            ));
+            terminal.sync(window, cx);
+        });
+        feed_pty_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07cmd\r\n\x1b]633;E;cmd\x07\x1b]133;C\x07abcdefgh\r\nxy\r\n\r\n\x1b]133;D;0\x07",
+            cx,
+        );
+        terminal.read_with(cx, |terminal, _| {
+            let id = terminal
+                .blocks()
+                .expect("blocks")
+                .blocks()
+                .next()
+                .expect("block")
+                .id;
+            let lines = terminal.block_output_lines(id, 10, 1000).expect("lines");
+            let texts: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
+            assert_eq!(texts, ["abcdefgh", "xy"]);
+            assert_eq!(lines[1].absolute_line, lines[0].absolute_line + 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn output_lines_over_cap_is_none(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        feed_pty_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07cmd\r\n\x1b]633;E;cmd\x07\x1b]133;C\x07one\r\ntwo\r\nthree\r\n\x1b]133;D;0\x07",
+            cx,
+        );
+        terminal.read_with(cx, |terminal, _| {
+            let id = terminal
+                .blocks()
+                .expect("blocks")
+                .blocks()
+                .next()
+                .expect("block")
+                .id;
+            assert_eq!(
+                terminal
+                    .block_output_lines(id, 3, 1000)
+                    .map(|lines| lines.len()),
+                Some(3)
+            );
+            assert!(terminal.block_output_lines(id, 2, 1000).is_none());
+            assert!(terminal.block_output_lines(id, 10, 10).is_none());
+        });
+    }
+
+    #[gpui::test]
     async fn marks_from_a_program_inside_a_block_are_ignored(cx: &mut TestAppContext) {
         let (terminal, cx) = init_block_terminal(cx);
         // Photon's zsh tags its marks; an agent CLI running in the block prints its own.

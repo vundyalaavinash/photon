@@ -459,6 +459,23 @@ impl TerminalView {
         Some(cx.new(|cx| BlockInput::new(terminal, workspace, window, cx)))
     }
 
+    pub(crate) fn new_smart_blocks(
+        terminal: &Entity<Terminal>,
+        workspace: gpui::WeakEntity<workspace::Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<photon_terminal::SmartBlocks>, gpui::Subscription)> {
+        terminal.read(cx).blocks()?;
+        let terminal = terminal.clone();
+        let smart_blocks =
+            cx.new(|cx| photon_terminal::SmartBlocks::new(terminal, workspace, window, cx));
+        let subscription = cx.subscribe(
+            &smart_blocks,
+            |_, _, _: &photon_terminal::SmartBlocksEvent, cx| cx.notify(),
+        );
+        Some((smart_blocks, subscription))
+    }
+
     /// The input's slot below the grid, kept while blocks are drawn so the grid size does
     /// not change between commands.
     pub(crate) fn block_input_slot(&self, cx: &App) -> Option<impl IntoElement + use<>> {
