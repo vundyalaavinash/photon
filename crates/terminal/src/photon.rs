@@ -10,7 +10,7 @@ use crate::{
     Event, Terminal,
     alacritty::{
         AlacrittyTerm, absolute_lines_text, history_clears, is_alt_screen, oldest_absolute_line,
-        top_absolute_line,
+        top_absolute_line, used_lines,
     },
 };
 
@@ -47,6 +47,9 @@ pub(crate) struct TerminalBlocks {
     /// then on untagged marks come from a program inside a block (an agent CLI, another
     /// integration) and are ignored rather than read as the shell misbehaving.
     tagged_marks: bool,
+    /// The command that was running when the screen was cleared (`clear` itself, usually).
+    /// If it ends without printing anything after the clear, it leaves no block behind.
+    cleared_while_running: Option<BlockId>,
 }
 
 impl TerminalBlocks {
@@ -58,6 +61,7 @@ impl TerminalBlocks {
             oldest_line: 0,
             awaiting_shell: false,
             tagged_marks: false,
+            cleared_while_running: None,
         }
     }
 
@@ -68,7 +72,7 @@ impl TerminalBlocks {
         if is_alt_screen(term) {
             return;
         }
-        self.list.clear();
+        self.clear_list();
         self.sync_with_grid(term);
     }
 
@@ -80,7 +84,7 @@ impl TerminalBlocks {
         if mark_clears > self.history_clears {
             self.history_clears = mark_clears;
             self.oldest_line = 0;
-            self.list.clear();
+            self.clear_list();
         }
         if mark_clears < self.history_clears {
             0
@@ -148,13 +152,18 @@ impl TerminalBlocks {
         self.oldest_line = oldest_absolute_line(term).unwrap_or(self.oldest_line);
     }
 
+    fn clear_list(&mut self) {
+        self.cleared_while_running = self.list.running();
+        self.list.clear();
+    }
+
     /// Called after the grid may have changed under the block list.
     pub(crate) fn sync_with_grid(&mut self, term: &AlacrittyTerm) {
         let clears = history_clears(term);
         if clears != self.history_clears {
             self.history_clears = clears;
             self.oldest_line = 0;
-            self.list.clear();
+            self.clear_list();
         }
         // The oldest retained line only moves once history is full and evicting.
         if let Some(oldest) = oldest_absolute_line(term)
@@ -195,9 +204,19 @@ impl Terminal {
             return;
         };
         blocks.no_marks_check = None;
-        if let Some(event) = blocks.apply_shell_mark(params, absolute_line, history_clears) {
-            cx.emit(Event::BlocksChanged(event));
+        let Some(event) = blocks.apply_shell_mark(params, absolute_line, history_clears) else {
+            return;
+        };
+        if let Some(BlockEvent::Finished(id)) = event
+            && blocks.cleared_while_running.take() == Some(id)
+            && self
+                .block_text(id, BlockPart::Output)
+                .is_some_and(|text| text.trim().is_empty())
+            && let Some(blocks) = &mut self.blocks
+        {
+            blocks.list.remove(id);
         }
+        cx.emit(Event::BlocksChanged(event));
     }
 
     /// None when shell integration is off.
@@ -268,15 +287,13 @@ impl Terminal {
     /// grid that much lower keeps the newest output next to the input box, as Warp does.
     pub fn blank_rows_below_cursor(&self) -> usize {
         let term = self.term.lock();
-        if self.blocks.is_none()
-            || term.history_size() > 0
-            || term.grid().display_offset() > 0
-            || is_alt_screen(&term)
-        {
+        if self.blocks.is_none() || term.grid().display_offset() > 0 || is_alt_screen(&term) {
             return 0;
         }
-        let cursor_line = term.grid().cursor.point.line.0;
-        usize::try_from(term.screen_lines() as i32 - 1 - cursor_line).unwrap_or(0)
+        // Counted below the last row with text as well as the cursor, so nothing is pushed off
+        // screen. After `clear` the rows above are history, which scrolling still reaches.
+        let used_rows = used_lines(&term) - term.history_size();
+        term.screen_lines().saturating_sub(used_rows)
     }
 
     pub fn set_block_branch(&mut self, branch: Option<String>) {

@@ -6721,6 +6721,39 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn clear_leaves_an_empty_screen_at_the_bottom(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        let mut output = String::new();
+        for _ in 0..60 {
+            output.push_str("line\r\n");
+        }
+        output.push_str("\x1b]133;A;photon\x07\x1b]133;B;photon\x07clear\r\n\x1b]633;E;clear;photon\x07\x1b]133;C;photon\x07\x1b[H\x1b[2J\x1b[3J\r\n\x1b]133;D;0;photon\x07\x1b]133;A;photon\x07\r\n\r\n\x1b]133;B;photon\x07");
+        feed_pty_output(&terminal, output.as_bytes(), cx);
+        terminal.read_with(cx, |terminal, _| {
+            // The clear block printed nothing after clearing, so nothing is left to show.
+            assert_eq!(terminal.blocks().expect("blocks").blocks().count(), 0);
+            // The new prompt still goes to the bottom.
+            assert!(terminal.blank_rows_below_cursor() > 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn bottom_anchoring_never_hides_text_below_the_cursor(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_block_terminal(cx);
+        feed_pty_output(
+            &terminal,
+            b"\x1b]133;A;photon\x07top\r\n\r\n\r\nstatus line\x1b[3A",
+            cx,
+        );
+        terminal.read_with(cx, |terminal, _| {
+            let content = &terminal.last_content;
+            let rows = content.terminal_bounds.num_lines();
+            // "status line" is on row 3, below the cursor on row 0.
+            assert_eq!(terminal.blank_rows_below_cursor(), rows - 4);
+        });
+    }
+
+    #[gpui::test]
     async fn input_goes_to_pty_while_command_runs(cx: &mut TestAppContext) {
         let (terminal, cx) = init_block_terminal(cx);
         feed_pty_output(

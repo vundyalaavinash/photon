@@ -177,6 +177,17 @@ impl BlockList {
         self.blocks.iter().take(visible)
     }
 
+    pub fn remove(&mut self, id: BlockId) {
+        self.blocks.retain(|block| block.id != id);
+    }
+
+    /// The block whose command is still running, if any.
+    pub fn running(&self) -> Option<BlockId> {
+        (self.phase == Phase::Running)
+            .then(|| self.blocks.back().map(|block| block.id))
+            .flatten()
+    }
+
     pub fn block(&self, id: BlockId) -> Option<&Block> {
         self.blocks().find(|block| block.id == id)
     }
