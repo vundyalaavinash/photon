@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::{Result, bail};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
     Task, WeakEntity, Window, rems,
@@ -50,18 +51,24 @@ pub fn git_info(cwd: &Path, cx: &App) -> Task<Option<GitInfo>> {
 }
 
 async fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = new_command("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .await
-        .log_err()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    // Failing outside a repository is routine here, so it is not logged.
+    run_git(cwd, args, false).await.ok()
+}
+
+/// Read-only callers pass `optional_locks: false` so a background `git status` never holds
+/// the index lock while the user runs git; `add` and `restore` must write the index anyway.
+/// Fails with git's stderr.
+pub(crate) async fn run_git(cwd: &Path, args: &[&str], optional_locks: bool) -> Result<String> {
+    let mut command = new_command("git");
+    command.arg("-C").arg(cwd).args(args);
+    if !optional_locks {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    let output = command.output().await?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn shell_quote(text: &str) -> String {

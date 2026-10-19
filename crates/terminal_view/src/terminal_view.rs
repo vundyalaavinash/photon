@@ -1624,7 +1624,9 @@ impl Render for TerminalView {
                                 this.flex().flex_col().child(slot)
                             })
                             // photon: the selected smart block's toolbar, drawn over its header.
-                            .children(self.smart_block_overlay(cx)),
+                            .children(self.smart_block_overlay(cx))
+                            // photon: git status row buttons on the selected block.
+                            .children(self.smart_block_row_buttons(cx)),
                     )
                     .when(content_mode.is_scrollable(), |div| {
                         let colors = cx.theme().colors();
@@ -4870,5 +4872,142 @@ mod tests {
         assert_eq!(cursor(&mut cx), Some(1));
         cx.simulate_keystrokes("shift-f8");
         assert_eq!(cursor(&mut cx), Some(0));
+    }
+
+    #[gpui::test]
+    async fn row_buttons_follow_wrapped_lines(cx: &mut TestAppContext) {
+        use crate::photon_smart_blocks_view::{RowButton, RowContent};
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let long_line = "x".repeat(300);
+        feed_block_output(
+            &terminal,
+            format!(
+                "\x1b]133;A\x07\x1b]133;B\x07git status -s\r\n\x1b]633;E;git status -s\x07\x1b]133;C\x07{long_line}\r\n M a.txt\r\nA  b.txt\r\n?? c.txt\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07"
+            )
+            .as_bytes(),
+            &mut cx,
+        );
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-up");
+        terminal.update_in(&mut cx, |terminal, window, cx| terminal.sync(window, cx));
+        let columns = terminal.read_with(&cx, |terminal, _| {
+            terminal.last_content.terminal_bounds.num_columns()
+        });
+        assert!(columns < long_line.len(), "the first output line must wrap");
+        let rows = terminal_view.read_with(&cx, |view, cx| view.selected_status_rows(cx));
+        let screen_text = |row: usize, cx: &mut VisualTestContext| {
+            terminal.read_with(cx, |terminal, _| {
+                let display_offset = terminal.last_content.display_offset as i32;
+                terminal
+                    .last_content
+                    .cells
+                    .iter()
+                    .filter(|cell| cell.point.line + display_offset == row as i32)
+                    .map(|cell| cell.character())
+                    .collect::<String>()
+            })
+        };
+        let rows = rows
+            .into_iter()
+            .map(|(row, _, content)| (screen_text(row, &mut cx).trim().to_string(), content))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "M a.txt".to_string(),
+                    RowContent::Buttons(vec![
+                        RowButton::Stage,
+                        RowButton::Diff,
+                        RowButton::Discard
+                    ])
+                ),
+                (
+                    "A  b.txt".to_string(),
+                    RowContent::Buttons(vec![RowButton::Diff])
+                ),
+                (
+                    "?? c.txt".to_string(),
+                    RowContent::Buttons(vec![RowButton::Stage])
+                ),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn cmd_click_hash_opens_commit_view(cx: &mut TestAppContext) {
+        // The block's OSC 7 cwd makes the input box's branch chip run a real `git`.
+        cx.executor().allow_parking();
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let workspace = terminal_view.read_with(&cx, |view, _| view.workspace.clone());
+        let workspace = workspace.upgrade().expect("workspace");
+        cx.update(|_, cx| {
+            editor::init(cx);
+            git_ui::init(cx);
+        });
+        let fs = workspace
+            .read_with(&cx, |workspace, cx| {
+                workspace.project().read(cx).fs().clone()
+            })
+            .as_fake()
+            .clone();
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({ ".git": {}, "a.txt": "one" }),
+        )
+        .await;
+        workspace
+            .update(&mut cx, |workspace, cx| {
+                workspace.project().update(cx, |project, cx| {
+                    project.find_or_create_worktree("/project", true, cx)
+                })
+            })
+            .await
+            .expect("worktree");
+        cx.run_until_parked();
+        let hash = "0101010101010101010101010101010101010101";
+        feed_block_output(
+            &terminal,
+            format!(
+                "\x1b]7;file://host/project\x07\x1b]133;A\x07\x1b]133;B\x07git log\r\n\x1b]633;E;git log\x07\x1b]133;C\x07commit {hash}\r\nAuthor: A <a@b.c>\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07"
+            )
+            .as_bytes(),
+            &mut cx,
+        );
+        cx.run_until_parked();
+        terminal.update_in(&mut cx, |terminal, window, cx| terminal.sync(window, cx));
+        let (bounds, top_line, commit_line) = terminal.read_with(&cx, |terminal, _| {
+            let blocks = terminal.blocks().expect("blocks");
+            let block = blocks.blocks().last().expect("git log block");
+            (
+                terminal.last_content.terminal_bounds,
+                terminal.top_absolute_line(),
+                block.output_line.expect("output"),
+            )
+        });
+        let row = (commit_line - top_line) as f32 + 0.5;
+        // "commit " is 7 cells; click inside the hash.
+        let position =
+            bounds.bounds.origin + gpui::point(bounds.cell_width * 10.5, bounds.line_height * row);
+        cx.simulate_mouse_down(
+            position,
+            MouseButton::Left,
+            gpui::Modifiers::secondary_key(),
+        );
+        cx.simulate_mouse_up(
+            position,
+            MouseButton::Left,
+            gpui::Modifiers::secondary_key(),
+        );
+        cx.run_until_parked();
+        let opened = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<git_ui::commit_view::CommitView>())
+                .is_some()
+        });
+        assert!(opened, "cmd-click on the hash opens the commit view");
     }
 }

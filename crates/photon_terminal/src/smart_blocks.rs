@@ -1,15 +1,21 @@
+use std::path::PathBuf;
+
 use collections::HashMap;
+use git_ui::{commit_view::CommitView, project_diff::ProjectDiff};
 use gpui::{
-    AppContext as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, Window,
+    App, AppContext as _, Context, Entity, EventEmitter, PromptLevel, Subscription, Task,
+    WeakEntity, Window,
 };
 use photon_blocks::{
-    BlockEvent, BlockId, Insight, MAX_INSIGHT_BYTES, MAX_INSIGHT_LINES, RunDelta, compare_runs,
-    find_local_url, recognise,
+    BlockEvent, BlockId, Insight, MAX_INSIGHT_BYTES, MAX_INSIGHT_LINES, RunDelta, StatusFile,
+    compare_runs, find_local_url, recognise,
 };
 use settings::Settings as _;
 use terminal::{Event, Terminal, terminal_settings::TerminalSettings};
 use util::ResultExt as _;
-use workspace::Workspace;
+use workspace::{Toast, Workspace, notifications::NotificationId};
+
+use crate::chips::run_git;
 
 /// How many output lines of a running block are searched for a local URL.
 const URL_SCAN_LINE_LIMIT: usize = 2_000;
@@ -29,11 +35,19 @@ struct UrlScan {
     next_line: Option<i64>,
 }
 
+/// What a git action did to a `git status` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowMark {
+    Staged,
+    Discarded,
+}
+
 /// What finished and running command blocks turned out to be, computed off the UI thread.
 pub struct SmartBlocks {
     terminal: Entity<Terminal>,
-    _workspace: WeakEntity<Workspace>,
+    workspace: WeakEntity<Workspace>,
     insights: HashMap<BlockId, Insight>,
+    row_marks: HashMap<(BlockId, i64), RowMark>,
     deltas: HashMap<BlockId, RunDelta>,
     urls: HashMap<BlockId, String>,
     scans: HashMap<BlockId, UrlScan>,
@@ -53,8 +67,9 @@ impl SmartBlocks {
         let _terminal_subscription = cx.subscribe(&terminal, Self::handle_terminal_event);
         Self {
             terminal,
-            _workspace: workspace,
+            workspace,
             insights: HashMap::default(),
+            row_marks: HashMap::default(),
             deltas: HashMap::default(),
             urls: HashMap::default(),
             scans: HashMap::default(),
@@ -73,6 +88,186 @@ impl SmartBlocks {
 
     pub fn local_url(&self, id: BlockId) -> Option<&str> {
         self.urls.get(&id).map(String::as_str)
+    }
+
+    pub fn row_mark(&self, id: BlockId, absolute_line: i64) -> Option<RowMark> {
+        self.row_marks.get(&(id, absolute_line)).copied()
+    }
+
+    pub fn stage(&mut self, id: BlockId, absolute_line: i64, cx: &mut Context<Self>) {
+        let Some(file) = self.status_file(id, absolute_line) else {
+            return;
+        };
+        let path = file.path.clone();
+        self.run_git_action(
+            id,
+            vec![absolute_line],
+            ["add", "--", &path],
+            RowMark::Staged,
+            cx,
+        );
+    }
+
+    pub fn stage_all(&mut self, id: BlockId, cx: &mut Context<Self>) {
+        let Some(Insight::GitStatus { files }) = self.insights.get(&id) else {
+            return;
+        };
+        let lines = files.iter().map(|file| file.absolute_line).collect();
+        self.run_git_action(id, lines, ["add", "-A"], RowMark::Staged, cx);
+    }
+
+    /// Asks first: `git restore` throws the changes away for good.
+    pub fn discard(
+        &mut self,
+        id: BlockId,
+        absolute_line: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = self.status_file(id, absolute_line) else {
+            return;
+        };
+        let path = file.path.clone();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Discard changes to {path}?"),
+            None,
+            &["Discard", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.run_git_action(
+                    id,
+                    vec![absolute_line],
+                    ["restore", "--", &path],
+                    RowMark::Discarded,
+                    cx,
+                )
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    pub fn open_diff(&self, id: BlockId, absolute_line: i64, window: &mut Window, cx: &mut App) {
+        let (Some(cwd), Some(file)) = (self.block_cwd(id, cx), self.status_file(id, absolute_line))
+        else {
+            return;
+        };
+        let path = cwd.join(&file.path);
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(project_path) = workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .find_project_path(&path, cx)
+        else {
+            self.show_error(format!("{} is not in this project", path.display()), cx);
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            ProjectDiff::deploy_at_project_path(workspace, project_path, window, cx)
+        });
+    }
+
+    /// Opens `hash` in the innermost repository of the project that contains the block's cwd.
+    pub fn open_commit(&self, id: BlockId, hash: &str, window: &mut Window, cx: &mut App) {
+        let Some(cwd) = self.block_cwd(id, cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let repository = workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .repositories()
+            .values()
+            .filter(|repository| cwd.starts_with(&repository.read(cx).work_directory_abs_path))
+            .max_by_key(|repository| {
+                repository
+                    .read(cx)
+                    .work_directory_abs_path
+                    .components()
+                    .count()
+            })
+            .cloned();
+        let Some(repository) = repository else {
+            self.show_error(
+                format!("{} is not in a project repository", cwd.display()),
+                cx,
+            );
+            return;
+        };
+        CommitView::open(
+            hash.to_string(),
+            repository.downgrade(),
+            self.workspace.clone(),
+            None,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    fn status_file(&self, id: BlockId, absolute_line: i64) -> Option<&StatusFile> {
+        let Some(Insight::GitStatus { files }) = self.insights.get(&id) else {
+            return None;
+        };
+        files
+            .iter()
+            .find(|file| file.absolute_line == absolute_line)
+    }
+
+    fn block_cwd(&self, id: BlockId, cx: &App) -> Option<PathBuf> {
+        self.terminal.read(cx).blocks()?.block(id)?.cwd.clone()
+    }
+
+    fn run_git_action<const N: usize>(
+        &mut self,
+        id: BlockId,
+        lines: Vec<i64>,
+        args: [&str; N],
+        mark: RowMark,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cwd) = self.block_cwd(id, cx) else {
+            self.show_error("This block has no working directory".to_string(), cx);
+            return;
+        };
+        let args = args.map(str::to_string);
+        cx.spawn(async move |this, cx| {
+            let args = args.each_ref().map(String::as_str);
+            let result = run_git(&cwd, &args, true).await;
+            this.update(cx, |this, cx| match result {
+                Ok(_) => {
+                    for line in lines {
+                        this.row_marks.insert((id, line), mark);
+                    }
+                    cx.emit(SmartBlocksEvent::Changed);
+                }
+                Err(error) => this.show_error(error.to_string(), cx),
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn show_error(&self, message: String, cx: &mut App) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_toast(Toast::new(NotificationId::unique::<Self>(), message), cx)
+            })
+            .log_err();
     }
 
     fn handle_terminal_event(
@@ -106,6 +301,7 @@ impl SmartBlocks {
         self.urls.retain(|id, _| kept(id));
         self.scans.retain(|id, _| kept(id));
         self.tasks.retain(|id, _| kept(id));
+        self.row_marks.retain(|(id, _), _| kept(id));
         if self.insights.len() + self.urls.len() != before {
             cx.emit(SmartBlocksEvent::Changed);
         }
@@ -461,5 +657,252 @@ mod tests {
         );
         assert!(block_ids(&terminal, cx).is_empty());
         smart.read_with(cx, |smart, _| assert!(smart.insights.is_empty()));
+    }
+
+    mod git_actions {
+        use super::*;
+        use project::Project;
+        use std::path::Path;
+        use workspace::{AppState, MultiWorkspace, notifications::NotificationId};
+
+        async fn git(directory: &Path, args: &[&str]) {
+            let status = util::command::new_command("git")
+                .arg("-C")
+                .arg(directory)
+                .args(args)
+                .status()
+                .await
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+
+        async fn git_stdout(directory: &Path, args: &[&str]) -> String {
+            let output = util::command::new_command("git")
+                .arg("-C")
+                .arg(directory)
+                .args(args)
+                .output()
+                .await
+                .expect("run git");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        /// A repository with committed `a.txt` and `a b.txt`, both modified since.
+        async fn repository() -> Option<tempfile::TempDir> {
+            which::which("git").ok()?;
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path();
+            git(path, &["init", "-b", "main"]).await;
+            git(path, &["config", "user.name", "Test"]).await;
+            git(path, &["config", "user.email", "test@example.com"]).await;
+            std::fs::write(path.join("a.txt"), "one").expect("write");
+            std::fs::write(path.join("a b.txt"), "one").expect("write");
+            git(path, &["add", "."]).await;
+            git(path, &["commit", "-m", "init"]).await;
+            std::fs::write(path.join("a.txt"), "two").expect("write");
+            std::fs::write(path.join("a b.txt"), "two").expect("write");
+            Some(directory)
+        }
+
+        async fn setup_with_workspace(
+            cx: &mut TestAppContext,
+        ) -> (
+            Entity<Terminal>,
+            Entity<SmartBlocks>,
+            Entity<Workspace>,
+            VisualTestContext,
+        ) {
+            let app_state = cx.update(AppState::test);
+            cx.update(|cx| {
+                theme_settings::init(theme::LoadThemes::JustBase, cx);
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.terminal.get_or_insert_default().smart_blocks = Some(true);
+                    });
+                });
+            });
+            let project = Project::test(app_state.fs.clone(), [], cx).await;
+            let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+            let workspace = window
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+                .expect("workspace");
+            let terminal = cx.new(|cx| {
+                let mut terminal = terminal::TerminalBuilder::new_display_only(
+                    terminal::terminal_settings::CursorShape::default(),
+                    terminal::terminal_settings::AlternateScroll::On,
+                    None,
+                    0,
+                    cx.background_executor(),
+                    util::paths::PathStyle::local(),
+                )
+                .subscribe(cx);
+                terminal.enable_blocks_for_test(cx);
+                terminal
+            });
+            let smart_blocks = window
+                .update(cx, |_, window, cx| {
+                    cx.new(|cx| {
+                        SmartBlocks::new(terminal.clone(), workspace.downgrade(), window, cx)
+                    })
+                })
+                .expect("window");
+            let cx = VisualTestContext::from_window(window.into(), cx);
+            (terminal, smart_blocks, workspace, cx)
+        }
+
+        fn status_block(directory: &Path, output: &str) -> String {
+            format!(
+                "\x1b]7;file://host{}\x07\x1b]133;A\x07$ \x1b]133;B\x07git status -s\r\n\x1b]633;E;git status -s\x07\x1b]133;C\x07{output}\x1b]133;D;0\x07",
+                directory.display()
+            )
+        }
+
+        fn status_files(
+            smart: &Entity<SmartBlocks>,
+            id: BlockId,
+            cx: &mut VisualTestContext,
+        ) -> Vec<photon_blocks::StatusFile> {
+            smart.read_with(cx, |smart, _| match smart.insight(id) {
+                Some(Insight::GitStatus { files }) => files.clone(),
+                _ => Vec::new(),
+            })
+        }
+
+        /// Git runs as a real process, so wait for it in real time.
+        fn wait_until(
+            cx: &mut VisualTestContext,
+            mut done: impl FnMut(&mut VisualTestContext) -> bool,
+        ) {
+            for _ in 0..500 {
+                cx.run_until_parked();
+                if done(cx) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("timed out waiting for git");
+        }
+
+        #[gpui::test]
+        async fn stage_runs_git_add_and_marks_row(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let Some(directory) = repository().await else {
+                return;
+            };
+            let path = directory.path();
+            let (terminal, smart, _workspace, mut cx) = setup_with_workspace(cx).await;
+            feed(&terminal, &status_block(path, " M a.txt\r\n"), &mut cx);
+            let id = block_ids(&terminal, &mut cx)[0];
+            let files = status_files(&smart, id, &mut cx);
+            let line = files[0].absolute_line;
+            smart.update(&mut cx, |smart, cx| smart.stage(id, line, cx));
+            wait_until(&mut cx, |cx| {
+                smart.read_with(cx, |smart, _| smart.row_mark(id, line).is_some())
+            });
+            smart.read_with(&cx, |smart, _| {
+                assert!(matches!(smart.row_mark(id, line), Some(RowMark::Staged)));
+            });
+            assert_eq!(
+                git_stdout(path, &["diff", "--cached", "--name-only"]).await,
+                "a.txt\n"
+            );
+        }
+
+        #[gpui::test]
+        async fn stage_quotes_path(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let Some(directory) = repository().await else {
+                return;
+            };
+            let path = directory.path();
+            let (terminal, smart, _workspace, mut cx) = setup_with_workspace(cx).await;
+            feed(
+                &terminal,
+                &status_block(path, " M \"a b.txt\"\r\n"),
+                &mut cx,
+            );
+            let id = block_ids(&terminal, &mut cx)[0];
+            let files = status_files(&smart, id, &mut cx);
+            assert_eq!(files[0].path, "a b.txt");
+            let line = files[0].absolute_line;
+            smart.update(&mut cx, |smart, cx| smart.stage(id, line, cx));
+            wait_until(&mut cx, |cx| {
+                smart.read_with(cx, |smart, _| smart.row_mark(id, line).is_some())
+            });
+            assert_eq!(
+                git_stdout(path, &["diff", "--cached", "--name-only"]).await,
+                "a b.txt\n"
+            );
+        }
+
+        #[gpui::test]
+        async fn discard_requires_confirmation(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let Some(directory) = repository().await else {
+                return;
+            };
+            let path = directory.path();
+            let (terminal, smart, _workspace, mut cx) = setup_with_workspace(cx).await;
+            feed(&terminal, &status_block(path, " M a.txt\r\n"), &mut cx);
+            let id = block_ids(&terminal, &mut cx)[0];
+            let line = status_files(&smart, id, &mut cx)[0].absolute_line;
+
+            smart.update_in(&mut cx, |smart, window, cx| {
+                smart.discard(id, line, window, cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.pending_prompt().map(|(message, _)| message),
+                Some("Discard changes to a.txt?".to_string())
+            );
+            cx.simulate_prompt_answer("Cancel");
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            assert_eq!(
+                std::fs::read_to_string(path.join("a.txt")).expect("read"),
+                "two"
+            );
+            smart.read_with(&cx, |smart, _| assert!(smart.row_mark(id, line).is_none()));
+
+            smart.update_in(&mut cx, |smart, window, cx| {
+                smart.discard(id, line, window, cx)
+            });
+            cx.run_until_parked();
+            cx.simulate_prompt_answer("Discard");
+            wait_until(&mut cx, |cx| {
+                smart.read_with(cx, |smart, _| smart.row_mark(id, line).is_some())
+            });
+            smart.read_with(&cx, |smart, _| {
+                assert!(matches!(smart.row_mark(id, line), Some(RowMark::Discarded)));
+            });
+            assert_eq!(
+                std::fs::read_to_string(path.join("a.txt")).expect("read"),
+                "one"
+            );
+        }
+
+        #[gpui::test]
+        async fn git_failure_shows_toast(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let Some(directory) = repository().await else {
+                return;
+            };
+            let path = directory.path();
+            let (terminal, smart, workspace, mut cx) = setup_with_workspace(cx).await;
+            feed(
+                &terminal,
+                &status_block(path, " M missing.txt\r\n"),
+                &mut cx,
+            );
+            let id = block_ids(&terminal, &mut cx)[0];
+            let line = status_files(&smart, id, &mut cx)[0].absolute_line;
+            smart.update(&mut cx, |smart, cx| smart.stage(id, line, cx));
+            let toast = NotificationId::unique::<SmartBlocks>();
+            wait_until(&mut cx, |cx| {
+                workspace.read_with(cx, |workspace, _| workspace.has_notification(&toast))
+            });
+            smart.read_with(&cx, |smart, _| assert!(smart.row_mark(id, line).is_none()));
+        }
     }
 }

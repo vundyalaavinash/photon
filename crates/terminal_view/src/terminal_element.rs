@@ -963,6 +963,16 @@ impl TerminalElement {
 
                 let view = terminal_view.read(cx);
                 let scroll_top = view.scroll_top;
+                // photon: cmd-click on a `git log` hash opens the commit instead of a hyperlink.
+                if e.modifiers.secondary() {
+                    let mut position = e.position;
+                    position.y += scroll_top.max(Pixels::ZERO);
+                    if terminal_view
+                        .update(cx, |view, cx| view.open_commit_at(position, window, cx))
+                    {
+                        return;
+                    }
+                }
                 terminal.update(cx, |terminal, cx| {
                     let mut adjusted_event = e.clone();
                     if scroll_top > Pixels::ZERO {

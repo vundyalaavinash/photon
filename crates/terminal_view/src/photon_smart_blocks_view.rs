@@ -1,10 +1,11 @@
 use gpui::{
-    Action, Anchor, AnyElement, Div, Hsla, SharedString, Stateful, actions, anchored, point, rgb,
+    Action, Anchor, AnyElement, Div, Hsla, Pixels, Point, SharedString, Stateful, actions,
+    anchored, point, rgb,
 };
 use photon_blocks::{
-    Block, BlockId, Insight, RunDelta, SourceLocation, rerun_failed_command, url_label,
+    Block, BlockId, FileState, Insight, RunDelta, SourceLocation, rerun_failed_command, url_label,
 };
-use photon_terminal::SmartBlocks;
+use photon_terminal::{RowMark, SmartBlocks};
 use settings::Settings as _;
 use terminal::PathLikeTarget;
 use terminal::terminal_settings::TerminalSettings;
@@ -90,6 +91,45 @@ impl ToolbarButton {
             Self::Stop => Box::new(StopBlock),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowButton {
+    Stage,
+    Diff,
+    Discard,
+}
+
+impl RowButton {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stage => "stage",
+            Self::Diff => "diff",
+            Self::Discard => "discard",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RowContent {
+    Buttons(Vec<RowButton>),
+    Mark(RowMark),
+}
+
+/// A short-status row like `MM a.txt` is both staged and unstaged, so it gets both sets.
+fn row_buttons(states: impl Iterator<Item = FileState>) -> Vec<RowButton> {
+    let states: Vec<FileState> = states.collect();
+    let unstaged = states.contains(&FileState::Unstaged);
+    let stage = unstaged || states.contains(&FileState::Untracked);
+    let diff = unstaged || states.contains(&FileState::Staged);
+    [
+        stage.then_some(RowButton::Stage),
+        diff.then_some(RowButton::Diff),
+        unstaged.then_some(RowButton::Discard),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// `local_url` is passed only while the block runs.
@@ -227,6 +267,19 @@ pub(crate) fn register_smart_block_actions(
         .on_action(cx.listener(|this, _: &PreviousBlockError, window, cx| {
             this.open_block_error(ErrorStep::Previous, window, cx)
         }))
+        .on_action(cx.listener(|this, _: &StageAllChanges, _, cx| {
+            if this.enabled_smart_blocks(cx).is_none() {
+                return;
+            }
+            if let (Some((smart_blocks, _)), Some(selected)) =
+                (&this.smart_blocks, this.selected_block)
+            {
+                smart_blocks.update(cx, |smart_blocks, cx| smart_blocks.stage_all(selected, cx));
+            }
+        }))
+        .on_action(|_: &OpenInGitPanel, window, cx| {
+            window.dispatch_action(Box::new(zed_actions::git_panel::ToggleFocus), cx)
+        })
 }
 
 pub(crate) fn smart_block_menu_items(
@@ -335,6 +388,177 @@ impl TerminalView {
         self.enabled_smart_blocks(cx)?
             .delta(self.selected_block?)
             .and_then(delta_text)
+    }
+
+    /// The selected `git status` block's file rows on screen, as (screen row, absolute line,
+    /// what to draw at the row's right end).
+    pub(crate) fn selected_status_rows(&self, cx: &App) -> Vec<(usize, i64, RowContent)> {
+        let (Some(smart_blocks), Some(selected)) =
+            (self.enabled_smart_blocks(cx), self.selected_block)
+        else {
+            return Vec::new();
+        };
+        let Some(Insight::GitStatus { files }) = smart_blocks.insight(selected) else {
+            return Vec::new();
+        };
+        let terminal = self.terminal.read(cx);
+        if active_blocks(terminal).is_none() {
+            return Vec::new();
+        }
+        let top_line = terminal.top_absolute_line();
+        let screen_rows = terminal.last_content.terminal_bounds.num_lines();
+        let mut rows: Vec<(usize, i64, RowContent)> = Vec::new();
+        for file in files {
+            let Some(row) = usize::try_from(file.absolute_line - top_line)
+                .ok()
+                .filter(|row| *row < screen_rows)
+            else {
+                continue;
+            };
+            if rows
+                .last()
+                .is_some_and(|(_, line, _)| *line == file.absolute_line)
+            {
+                continue;
+            }
+            let content = match smart_blocks.row_mark(selected, file.absolute_line) {
+                Some(mark) => RowContent::Mark(mark),
+                None => RowContent::Buttons(row_buttons(
+                    files
+                        .iter()
+                        .filter(|other| other.absolute_line == file.absolute_line)
+                        .map(|other| other.state),
+                )),
+            };
+            rows.push((row, file.absolute_line, content));
+        }
+        rows
+    }
+
+    /// Stage / diff / discard buttons at the right end of the selected `git status` block's
+    /// file rows.
+    pub(crate) fn smart_block_row_buttons(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (Some(smart_blocks), Some(selected)) = (
+            self.smart_blocks.as_ref().map(|(entity, _)| entity.clone()),
+            self.selected_block,
+        ) else {
+            return Vec::new();
+        };
+        let dimensions = self.terminal.read(cx).last_content.terminal_bounds;
+        let line_height = dimensions.line_height();
+        self.selected_status_rows(cx)
+            .into_iter()
+            .map(|(row, absolute_line, content)| {
+                let position = point(
+                    dimensions.bounds.origin.x + dimensions.width() - dimensions.cell_width(),
+                    dimensions.bounds.origin.y + line_height * row as f32,
+                );
+                let row_element = h_flex()
+                    .id(SharedString::from(format!(
+                        "smart-block-row-{absolute_line}"
+                    )))
+                    // The grid underneath must not also see clicks on a button.
+                    .occlude()
+                    .h(line_height)
+                    .gap_1();
+                let row_element = match content {
+                    RowContent::Mark(mark) => row_element.child(
+                        Label::new(match mark {
+                            RowMark::Staged => "staged",
+                            RowMark::Discarded => "discarded",
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+                    RowContent::Buttons(buttons) => {
+                        row_element.children(buttons.into_iter().map(|button| {
+                            let smart_blocks = smart_blocks.clone();
+                            Button::new(
+                                SharedString::from(format!(
+                                    "smart-block-row-{absolute_line}-{button:?}"
+                                )),
+                                button.label(),
+                            )
+                            .style(ButtonStyle::OutlinedCustom(rgb(BUTTON_BORDER).into()))
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .on_click(move |_, window, cx| {
+                                smart_blocks.update(cx, |smart_blocks, cx| match button {
+                                    RowButton::Stage => {
+                                        smart_blocks.stage(selected, absolute_line, cx)
+                                    }
+                                    RowButton::Diff => {
+                                        smart_blocks.open_diff(selected, absolute_line, window, cx)
+                                    }
+                                    RowButton::Discard => {
+                                        smart_blocks.discard(selected, absolute_line, window, cx)
+                                    }
+                                })
+                            })
+                        }))
+                    }
+                };
+                anchored()
+                    .anchor(Anchor::TopRight)
+                    .position(position)
+                    .child(row_element)
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// The commit hash of a `git log` block under `position` (window coordinates, scroll
+    /// already applied).
+    pub(crate) fn commit_hash_at(
+        &self,
+        position: Point<Pixels>,
+        cx: &App,
+    ) -> Option<(BlockId, String)> {
+        let smart_blocks = self.enabled_smart_blocks(cx)?;
+        let terminal = self.terminal.read(cx);
+        let blocks = active_blocks(terminal)?;
+        let bounds = terminal.last_content.terminal_bounds;
+        let offset = position - bounds.bounds.origin;
+        if offset.x < Pixels::ZERO || offset.y < Pixels::ZERO {
+            return None;
+        }
+        let row = (offset.y / bounds.line_height()).floor() as i64;
+        let column = (offset.x / bounds.cell_width()).floor() as i64;
+        let line = terminal.top_absolute_line() + row;
+        let columns = bounds.num_columns() as i64;
+        blocks.blocks().find_map(|block| {
+            let Some(Insight::GitLog { commits }) = smart_blocks.insight(block.id) else {
+                return None;
+            };
+            commits.iter().find_map(|commit| {
+                // Hash columns count characters of the logical line, which wraps every
+                // `columns` cells.
+                let index = (line - commit.absolute_line) * columns + column;
+                let hit = line >= commit.absolute_line
+                    && usize::try_from(index).is_ok_and(|index| commit.columns.contains(&index));
+                hit.then(|| (block.id, commit.hash.clone()))
+            })
+        })
+    }
+
+    /// Returns whether a commit was opened, so the click does nothing else.
+    pub(crate) fn open_commit_at(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((id, hash)) = self.commit_hash_at(position, cx) else {
+            return false;
+        };
+        let Some(smart_blocks) = self.smart_blocks.as_ref().map(|(entity, _)| entity.clone())
+        else {
+            return false;
+        };
+        smart_blocks.update(cx, |smart_blocks, cx| {
+            smart_blocks.open_commit(id, &hash, window, cx)
+        });
+        true
     }
 
     /// The selected block's buttons, right-aligned on its metadata row (Photon's prompt) or its
@@ -473,6 +697,19 @@ mod tests {
             Some("3 new failures · 0 fixed")
         );
         assert_eq!(delta_text(&delta(0, 0)), None);
+    }
+
+    #[test]
+    fn row_buttons_per_state() {
+        use FileState::*;
+        use RowButton::*;
+        assert_eq!(row_buttons([Staged].into_iter()), [Diff]);
+        assert_eq!(row_buttons([Unstaged].into_iter()), [Stage, Diff, Discard]);
+        assert_eq!(row_buttons([Untracked].into_iter()), [Stage]);
+        assert_eq!(
+            row_buttons([Staged, Unstaged].into_iter()),
+            [Stage, Diff, Discard]
+        );
     }
 
     #[test]

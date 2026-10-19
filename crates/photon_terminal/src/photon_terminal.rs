@@ -13,4 +13,4 @@ pub use completion::{Completion, ZshCompleter, history_suggestion, path_completi
 pub use history::{
     ClearHistory, HistoryEntry, HistoryStore, SearchHistory, default_histfile, parse_zsh_histfile,
 };
-pub use smart_blocks::{SmartBlocks, SmartBlocksEvent};
+pub use smart_blocks::{RowMark, SmartBlocks, SmartBlocksEvent};
