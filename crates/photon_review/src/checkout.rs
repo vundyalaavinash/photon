@@ -328,7 +328,8 @@ pub(crate) async fn force_remove_worktree(checkout_repo: &Path, worktree: &Path)
 }
 
 #[cfg(test)]
-static COMMAND_LOG: parking_lot::Mutex<Vec<Vec<String>>> = parking_lot::Mutex::new(Vec::new());
+pub(crate) static COMMAND_LOG: parking_lot::Mutex<Vec<Vec<String>>> =
+    parking_lot::Mutex::new(Vec::new());
 
 pub(crate) async fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(git_raw(dir, args).await?.trim().to_string())

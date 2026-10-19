@@ -4325,6 +4325,7 @@ mod tests {
         assert!(terminal_view.read_with(&cx, |view, cx| view.visible_block_input(cx).is_some()));
     }
 
+    // photon: covers the PR review "Run locally" prefill, which must never run the command.
     #[gpui::test]
     async fn prefill_block_input_sets_text_without_running(cx: &mut TestAppContext) {
         let (terminal, terminal_view, mut cx) = init_block_view(cx).await;

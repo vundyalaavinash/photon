@@ -738,6 +738,31 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn startup_makes_no_gh_or_git_network_calls(cx: &mut TestAppContext) {
+        let fake = FakeGh::new();
+        init_test(cx, &fake);
+        let (_workspace, panel, mut cx) = add_panel(cx).await;
+        // Dock restoration activates the panel at startup without a user action.
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.set_active(true, window, cx)
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(600));
+        cx.run_until_parked();
+        assert!(fake.requests().is_empty());
+        let network_commands: Vec<_> = crate::checkout::COMMAND_LOG
+            .lock()
+            .iter()
+            .filter(|argv| {
+                argv.iter()
+                    .any(|arg| matches!(arg.as_str(), "clone" | "fetch" | "worktree" | "checkout"))
+            })
+            .cloned()
+            .collect();
+        assert!(network_commands.is_empty(), "{network_commands:?}");
+    }
+
+    #[gpui::test]
     async fn opening_panel_loads_groups(cx: &mut TestAppContext) {
         let fake = FakeGh::new();
         init_test(cx, &fake);
