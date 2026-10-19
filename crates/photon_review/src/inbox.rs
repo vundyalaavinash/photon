@@ -1,4 +1,10 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use parking_lot::Mutex;
 
 use anyhow::Result;
 use futures::future::join_all;
@@ -14,9 +20,9 @@ use workspace::{
 };
 
 use crate::{
-    ChecksState, GhError, GhRunner, Inbox, InboxGroup, PrSummary, ReviewDb, SinceReview, Tracked,
-    auth_status_request,
-    checkout::{force_remove_worktree, review_root},
+    ChecksState, GhError, GhRunner, Inbox, InboxGroup, PrKey, PrSummary, ReviewDb, SinceReview,
+    Tracked, auth_status_request,
+    checkout::{ensure_safe_segment, force_remove_worktree, review_root, worktree_path},
     cleanup_checkout, gh_runner, inbox_request, parse_auth_status, parse_inbox,
 };
 
@@ -170,6 +176,7 @@ pub struct InboxPanel {
     focus_handle: FocusHandle,
     state: InboxState,
     refreshing: bool,
+    in_flight_cleanups: InFlightCleanups,
     // Dock restoration calls `set_active(true)` at startup; nothing may load until the user acts.
     user_activated: bool,
     load_task: Task<()>,
@@ -187,6 +194,7 @@ impl InboxPanel {
                     focus_handle: cx.focus_handle(),
                     state: InboxState::Idle,
                     refreshing: false,
+                    in_flight_cleanups: Arc::default(),
                     user_activated: false,
                     load_task: Task::ready(()),
                 })
@@ -203,6 +211,7 @@ impl InboxPanel {
         let database = ReviewDb::global(cx);
         self.user_activated = true;
         self.refreshing = true;
+        let in_flight = self.in_flight_cleanups.clone();
         if matches!(self.state, InboxState::Idle) {
             self.state = InboxState::Loading;
         }
@@ -214,7 +223,7 @@ impl InboxPanel {
                 })
                 .await;
             // Detached so a newer refresh never cancels a half-finished cleanup.
-            cx.background_spawn(cleanup_closed(closed, database, review_root()))
+            cx.background_spawn(cleanup_closed(closed, database, review_root(), in_flight))
                 .detach();
             this.update(cx, |this, cx| {
                 this.state = state;
@@ -292,34 +301,66 @@ async fn load_inbox(runner: Arc<dyn GhRunner>, database: ReviewDb) -> (InboxStat
     (InboxState::Loaded(results), closed)
 }
 
-async fn cleanup_closed(closed: Vec<Tracked>, database: ReviewDb, review_root: PathBuf) {
+type InFlightCleanups = Arc<Mutex<HashSet<PrKey>>>;
+
+async fn cleanup_closed(
+    closed: Vec<Tracked>,
+    database: ReviewDb,
+    review_root: PathBuf,
+    in_flight: InFlightCleanups,
+) {
     for pull_request in closed {
-        let Tracked {
-            key,
-            repo_dir,
-            worktree,
-            ..
-        } = pull_request;
-        let mut cleaned = cleanup_checkout(&repo_dir, &key, &worktree).await;
-        if cleaned.is_err() && worktree.exists() {
-            // Only Photon's own worktree is forced or deleted; never `worktree prune`, which
-            // would touch the user's other worktrees.
-            let removed = match force_remove_worktree(&repo_dir, &worktree).await {
-                Ok(()) => Ok(()),
-                Err(error) if worktree.starts_with(&review_root) => {
-                    Err::<(), _>(error).log_err();
-                    std::fs::remove_dir_all(&worktree).map_err(anyhow::Error::from)
-                }
-                Err(error) => Err(error),
-            };
-            cleaned = match removed {
-                Ok(()) => cleanup_checkout(&repo_dir, &key, &worktree).await,
-                Err(error) => Err(error),
-            };
+        let key = pull_request.key.clone();
+        if !in_flight.lock().insert(key.clone()) {
+            continue;
         }
-        if cleaned.log_err().is_some() {
-            database.untrack(key).await.log_err();
-        }
+        cleanup_one(pull_request, &database, &review_root).await;
+        in_flight.lock().remove(&key);
+    }
+}
+
+async fn cleanup_one(pull_request: Tracked, database: &ReviewDb, review_root: &Path) {
+    let Tracked {
+        key,
+        repo_dir,
+        worktree,
+        ..
+    } = pull_request;
+    // Only the exact path Photon would have created may be removed; a stored path is untrusted
+    // because it could point at the user's own worktree or, via `..`, anywhere on disk.
+    let is_photon_worktree = ensure_safe_segment("host", &key.host).is_ok()
+        && ensure_safe_segment("owner", &key.owner).is_ok()
+        && ensure_safe_segment("repo", &key.repo).is_ok()
+        && worktree == worktree_path(review_root, &key);
+    if !is_photon_worktree {
+        Err::<(), _>(anyhow::anyhow!(
+            "not removing {}: not Photon's worktree for {}/{}#{}",
+            worktree.display(),
+            key.owner,
+            key.repo,
+            key.number
+        ))
+        .log_err();
+        database.untrack(key).await.log_err();
+        return;
+    }
+    let mut cleaned = cleanup_checkout(&repo_dir, &key, &worktree).await;
+    if cleaned.is_err() && worktree.exists() {
+        // Never `worktree prune`: it would touch the user's other worktrees.
+        let removed = match force_remove_worktree(&repo_dir, &worktree).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Err::<(), _>(error).log_err();
+                std::fs::remove_dir_all(&worktree).map_err(anyhow::Error::from)
+            }
+        };
+        cleaned = match removed {
+            Ok(()) => cleanup_checkout(&repo_dir, &key, &worktree).await,
+            Err(error) => Err(error),
+        };
+    }
+    if cleaned.log_err().is_some() {
+        database.untrack(key).await.log_err();
     }
 }
 
@@ -375,8 +416,6 @@ impl Panel for InboxPanel {
             if self.user_activated {
                 self.refresh(cx);
             }
-        } else {
-            self.user_activated = true;
         }
     }
 }
@@ -536,7 +575,7 @@ mod tests {
     use workspace::{MultiWorkspace, Workspace};
 
     use super::*;
-    use crate::{FakeGh, PrKey, Tracked, set_gh_runner};
+    use crate::{FakeGh, set_gh_runner};
 
     const AUTH_ONE_HOST: &str =
         r#"{"hosts":{"github.com":[{"state":"success","active":true,"login":"alice"}]}}"#;
@@ -872,21 +911,55 @@ mod tests {
         panel.read_with(&cx, |panel, _| assert!(!panel.refreshing));
     }
 
+    fn damaged_key(repo: &str, number: u64) -> PrKey {
+        PrKey {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            repo: repo.into(),
+            number,
+        }
+    }
+
+    async fn track_and_clean(
+        cx: &mut TestAppContext,
+        entries: Vec<(PrKey, PathBuf)>,
+        repo_dir: &Path,
+        root: &Path,
+    ) -> ReviewDb {
+        let fake = FakeGh::new();
+        init_test(cx, &fake);
+        let database = cx.update(|cx| ReviewDb::global(cx));
+        let mut closed = Vec::new();
+        for (key, worktree) in entries {
+            let tracked = Tracked {
+                key,
+                node_id: "PR_cleanup".into(),
+                repo_dir: repo_dir.to_path_buf(),
+                worktree,
+            };
+            database.track(tracked.clone()).await.expect("track");
+            closed.push(tracked);
+        }
+        cleanup_closed(closed, database.clone(), root.to_path_buf(), Arc::default()).await;
+        database
+    }
+
     #[gpui::test]
     async fn cleanup_force_removes_damaged_worktree(cx: &mut TestAppContext) {
         use crate::checkout::git;
         cx.executor().allow_parking();
         let repo = tempfile::tempdir().expect("tempdir");
-        let worktree = repo.path().join("pr-worktree");
-        let identity = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        let root = tempfile::tempdir().expect("tempdir");
+        let key = damaged_key("damaged", 9);
+        let worktree = worktree_path(root.path(), &key);
         git(repo.path(), &["init", "-q"]).await.expect("init");
         git(
             repo.path(),
             &[
-                identity[0],
-                identity[1],
-                identity[2],
-                identity[3],
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
                 "commit",
                 "-q",
                 "--allow-empty",
@@ -910,33 +983,14 @@ mod tests {
         .expect("worktree add");
         std::fs::remove_file(worktree.join(".git")).expect("damage worktree");
         std::fs::write(worktree.join("leftover.txt"), "x").expect("leftover");
-        assert!(worktree.exists());
 
-        let fake = FakeGh::new();
-        init_test(cx, &fake);
-        let database = cx.update(|cx| ReviewDb::global(cx));
-        let key = PrKey {
-            host: "github.com".into(),
-            owner: "acme".into(),
-            repo: "damaged".into(),
-            number: 9,
-        };
-        database
-            .track(Tracked {
-                key: key.clone(),
-                node_id: "PR_damaged".into(),
-                repo_dir: repo.path().to_path_buf(),
-                worktree: worktree.clone(),
-            })
-            .await
-            .expect("track");
-        let closed = database
-            .tracked()
-            .expect("tracked")
-            .into_iter()
-            .filter(|tracked| tracked.key == key)
-            .collect();
-        cleanup_closed(closed, database.clone(), repo.path().to_path_buf()).await;
+        let database = track_and_clean(
+            cx,
+            vec![(key.clone(), worktree.clone())],
+            repo.path(),
+            root.path(),
+        )
+        .await;
         assert!(!worktree.exists());
         assert!(
             database
@@ -944,6 +998,66 @@ mod tests {
                 .expect("tracked")
                 .iter()
                 .all(|tracked| tracked.key != key)
+        );
+    }
+
+    #[gpui::test]
+    async fn cleanup_never_touches_paths_outside_the_photon_worktree(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        let clone = root.join("clones/github.com/acme/safety");
+        for dir in [&root, &outside, &clone] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+            std::fs::write(dir.join("keep.txt"), "x").expect("write");
+        }
+        let entries = vec![
+            (damaged_key("safety", 10), root.join("..").join("outside")),
+            (damaged_key("safety", 11), root.clone()),
+            (damaged_key("safety", 12), clone.clone()),
+            (
+                damaged_key("safety", 13),
+                worktree_path(&root, &damaged_key("safety", 14)),
+            ),
+        ];
+        let keys: Vec<PrKey> = entries.iter().map(|(key, _)| key.clone()).collect();
+        let database = track_and_clean(cx, entries, base.path(), &root).await;
+        for dir in [&root, &outside, &clone] {
+            assert!(dir.join("keep.txt").exists(), "{dir:?} was touched");
+        }
+        let remaining = database.tracked().expect("tracked");
+        assert!(remaining.iter().all(|tracked| !keys.contains(&tracked.key)));
+    }
+
+    #[gpui::test]
+    async fn cleanup_skips_keys_already_in_flight(cx: &mut TestAppContext) {
+        let fake = FakeGh::new();
+        init_test(cx, &fake);
+        let database = cx.update(|cx| ReviewDb::global(cx));
+        let key = damaged_key("inflight", 20);
+        let tracked = Tracked {
+            key: key.clone(),
+            node_id: "PR_inflight".into(),
+            repo_dir: PathBuf::from("/nonexistent"),
+            worktree: PathBuf::from("/nonexistent/wt"),
+        };
+        database.track(tracked.clone()).await.expect("track");
+        let in_flight: InFlightCleanups = Arc::default();
+        in_flight.lock().insert(key.clone());
+        cleanup_closed(
+            vec![tracked],
+            database.clone(),
+            PathBuf::from("/nonexistent"),
+            in_flight,
+        )
+        .await;
+        assert!(
+            database
+                .tracked()
+                .expect("tracked")
+                .iter()
+                .any(|tracked| tracked.key == key)
         );
     }
 

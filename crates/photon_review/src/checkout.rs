@@ -157,7 +157,7 @@ pub struct Checkout {
     pub merge_base: String,
 }
 
-fn ensure_safe_segment(label: &str, segment: &str) -> Result<()> {
+pub(crate) fn ensure_safe_segment(label: &str, segment: &str) -> Result<()> {
     if segment.is_empty()
         || segment == "."
         || segment == ".."
@@ -301,6 +301,7 @@ pub async fn prepare_checkout(
 }
 
 /// Fails, leaving the worktree and refs in place, when the worktree has local changes.
+/// Closed-PR cleanup then force-removes Photon's own worktree, discarding local edits there.
 pub async fn cleanup_checkout(checkout_repo: &Path, key: &PrKey, worktree: &Path) -> Result<()> {
     if worktree.exists() {
         safe_git(
