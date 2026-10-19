@@ -578,9 +578,11 @@ fn side_name(side: Side) -> &'static str {
 
 /// Whether Submit sends this draft. Outdated drafts stay local until the user re-places them or
 /// posts them as general comments; a draft not yet re-anchored to this head would land on the
-/// wrong lines, so it waits too.
+/// wrong lines, so it waits too. A draft still marked `sending` may already be on GitHub, so it
+/// waits for the user to include it again.
 pub fn is_sendable(draft: &Draft, head_sha: &str) -> bool {
     !draft.body.trim().is_empty()
+        && !draft.sending
         && (draft.general || (!draft.outdated && draft.commit == head_sha))
 }
 
@@ -922,6 +924,7 @@ mod tests {
             body: body.into(),
             outdated: false,
             general: false,
+            sending: false,
         }
     }
 
@@ -948,6 +951,10 @@ mod tests {
             outdated,
             general,
             draft("src/upload.rs", 41, 41, "  "),
+            crate::Draft {
+                sending: true,
+                ..draft("src/upload.rs", 41, 41, "Maybe posted")
+            },
         ];
         let request = review_request(
             &key(),
@@ -989,6 +996,7 @@ mod tests {
         assert!(review_body.contains("Audit this"));
         assert!(review_body.contains("Still true"));
         assert!(!review_body.contains("Stale"));
+        assert!(!body.to_string().contains("Maybe posted"));
         assert_eq!(ReviewEvent::Comment.as_str(), "COMMENT");
         assert_eq!(ReviewEvent::Approve.as_str(), "APPROVE");
     }

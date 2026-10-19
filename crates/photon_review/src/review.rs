@@ -62,6 +62,8 @@ const HUNK_CONTEXT_LINES: u32 = 3;
 const COMPOSER_MAX_LINES: u32 = 4;
 const TRUST_REASON: &str = "Trust this worktree to find callers";
 const UNCHANGED_BACKGROUND: u32 = 0x07090b;
+const MAYBE_POSTED: &str = "May already be posted: a submit was interrupted. Include it again or \
+     delete it.";
 const IMPACT_LEGEND: &str = "Every caller in the repo, not just the diff. Red: the signature \
      changed and this caller wasn't updated. Amber: the body changed and this caller wasn't \
      touched, so check it.";
@@ -171,6 +173,9 @@ pub struct ReviewItem {
     submit_error: Option<SharedString>,
     thread_errors: HashMap<String, SharedString>,
     file_errors: HashMap<String, SharedString>,
+    submit_note: Option<SharedString>,
+    resolving: HashSet<String>,
+    marking_viewed: HashSet<String>,
     _reanchor_task: Task<()>,
     _lsp_handles: Vec<OpenLspBufferHandle>,
     _subscriptions: Vec<Subscription>,
@@ -518,11 +523,13 @@ fn draft_renderer(
     line: u32,
     body: SharedString,
     note: Option<SharedString>,
+    maybe_posted: bool,
     composer: Option<Entity<Editor>>,
     sync: Arc<Mutex<DraftSync>>,
 ) -> RenderBlock {
     Arc::new(move |block: &mut BlockContext| {
         let error = sync.lock().error.clone();
+        let include_item = item.clone();
         let add_item = item.clone();
         let cancel_item = item.clone();
         let retry_item = item.clone();
@@ -547,6 +554,26 @@ fn draft_renderer(
                 note.clone()
                     .map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
             )
+            .when(maybe_posted, |this| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Label::new(MAYBE_POSTED)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                        .child(
+                            Button::new("include", "Include again")
+                                .label_size(LabelSize::XSmall)
+                                .on_click(move |_, _, cx| {
+                                    include_item
+                                        .update(cx, |item, cx| item.include_again(local_id, cx))
+                                        .log_err();
+                                }),
+                        ),
+                )
+            })
             .children(error.map(|error| {
                 h_flex()
                     .gap_1()
@@ -614,6 +641,7 @@ fn thread_renderer(
     thread: ReviewThread,
     reply: Option<Entity<Editor>>,
     error: Option<SharedString>,
+    resolve_pending: bool,
 ) -> RenderBlock {
     Arc::new(move |block: &mut BlockContext| {
         let id = SharedString::from(format!("photon-review-thread-{}", thread.id));
@@ -646,6 +674,7 @@ fn thread_renderer(
                     }))
                     .child(
                         Button::new("resolve", if resolved { "Unresolve" } else { "Resolve" })
+                            .disabled(resolve_pending)
                             .on_click(move |_, _, cx| {
                                 resolve_item
                                     .update(cx, |item, cx| {
@@ -658,6 +687,75 @@ fn thread_renderer(
             )
             .into_any_element()
     })
+}
+
+/// Returns false when a writer is already draining this draft's queue; it will pick up the
+/// pending write.
+fn claim_sync(sync: &Mutex<DraftSync>) -> bool {
+    !std::mem::replace(&mut sync.lock().in_flight, true)
+}
+
+/// Runs a draft's queued writes in order. It works whether or not the review is still open, so a
+/// delete queued after the review closes still follows any save in flight.
+async fn drain_sync(
+    this: WeakEntity<ReviewItem>,
+    local_id: usize,
+    sync: Arc<Mutex<DraftSync>>,
+    database: ReviewDb,
+    cx: &mut AsyncApp,
+) {
+    loop {
+        let job = sync.lock().next_job();
+        match job {
+            None => return,
+            Some(SyncJob::Delete(id)) => match database.delete_draft(id).await {
+                Ok(()) => {
+                    this.update(cx, |this, _| {
+                        if let Some(index) = this.draft_index(local_id) {
+                            this.drafts[index].id = None;
+                        }
+                    })
+                    .ok();
+                }
+                Err(error) => {
+                    log::error!("deleting a review draft failed: {error:#}");
+                    let mut state = sync.lock();
+                    if state.id.is_none() {
+                        state.id = Some(id);
+                    }
+                    state.error = Some(format!("Couldn't save this draft: {error:#}").into());
+                }
+            },
+            Some(SyncJob::Save(draft)) => {
+                let result = database.save_draft(draft).await;
+                let saved_id = {
+                    let mut state = sync.lock();
+                    match result {
+                        Ok(id) => {
+                            state.id = Some(id);
+                            state.error = None;
+                            Some(id)
+                        }
+                        Err(error) => {
+                            log::error!("saving a review draft failed: {error:#}");
+                            state.error =
+                                Some(format!("Couldn't save this draft: {error:#}").into());
+                            None
+                        }
+                    }
+                };
+                // The review may be closed by now; the write itself already happened.
+                this.update(cx, |this, cx| {
+                    if let (Some(id), Some(index)) = (saved_id, this.draft_index(local_id)) {
+                        this.drafts[index].id = Some(id);
+                    }
+                    // Draft cards read the save error when the editor redraws them.
+                    this.editor.update(cx, |_, cx| cx.notify());
+                })
+                .ok();
+            }
+        }
+    }
 }
 
 impl ReviewItem {
@@ -777,6 +875,9 @@ impl ReviewItem {
             submit_error: None,
             thread_errors: HashMap::new(),
             file_errors: HashMap::new(),
+            submit_note: None,
+            resolving: HashSet::new(),
+            marking_viewed: HashSet::new(),
             _reanchor_task: Task::ready(()),
             _lsp_handles: lsp_handles,
             _subscriptions: subscriptions,
@@ -818,14 +919,36 @@ impl ReviewItem {
             .count()
     }
 
-    /// Drafts with text that Submit leaves out: outdated ones, or ones not yet re-anchored.
+    /// Drafts with text that Submit leaves out because they are outdated or not yet re-anchored.
+    /// Drafts that may already be posted carry their own note.
     pub fn left_out_drafts(&self) -> usize {
         self.drafts
             .iter()
             .filter(|draft| {
-                !draft.body.trim().is_empty() && !is_sendable(draft, &self.checkout.head_sha)
+                !draft.body.trim().is_empty()
+                    && !draft.sending
+                    && !is_sendable(draft, &self.checkout.head_sha)
             })
             .count()
+    }
+
+    pub fn left_out_note(&self) -> Option<String> {
+        let count = self.left_out_drafts();
+        (count > 0).then(|| {
+            let plural = if count == 1 { "" } else { "s" };
+            format!("{count} draft{plural} not included (outdated or not yet re-placed)")
+        })
+    }
+
+    /// Makes a draft that may already be posted sendable again, at the user's word.
+    pub fn include_again(&mut self, local_id: usize, cx: &mut Context<Self>) {
+        let Some(index) = self.draft_index(local_id) else {
+            return;
+        };
+        self.drafts[index].sending = false;
+        self.queue_save(local_id, cx);
+        self.show_comments(cx);
+        cx.notify();
     }
 
     pub fn can_comment(&self, cx: &App) -> bool {
@@ -851,8 +974,9 @@ impl ReviewItem {
             .collect()
     }
 
-    /// Posts every sendable draft as one GitHub review. A failure keeps every draft and shows
-    /// GitHub's message until the next submit.
+    /// Posts every sendable draft as one GitHub review. The sent drafts are marked `sending` in
+    /// the database first, so after a crash they come back as "may already be posted" rather than
+    /// sendable. A failure keeps every draft and shows GitHub's message until the next submit.
     pub fn submit(
         &mut self,
         event: ReviewEvent,
@@ -875,52 +999,114 @@ impl ReviewItem {
             &self.commentable,
             &|path| languages.get(path).cloned(),
         );
-        let sent: Vec<(usize, Option<i64>, String)> = self
+        let sent: Vec<(usize, Arc<Mutex<DraftSync>>, String)> = self
             .drafts
             .iter()
             .zip(&self.draft_views)
             .filter(|(draft, _)| is_sendable(draft, &head_sha))
-            .map(|(draft, view)| (view.local_id, draft.id, draft.body.clone()))
+            .map(|(draft, view)| (view.local_id, view.sync.clone(), draft.body.clone()))
+            .collect();
+        // Queued too, so a row whose first save is still running also lands marked.
+        for (local_id, _, _) in &sent {
+            if let Some(index) = self.draft_index(*local_id) {
+                self.drafts[index].sending = true;
+                self.queue_save(*local_id, cx);
+            }
+        }
+        let saved_ids: Vec<i64> = sent
+            .iter()
+            .filter_map(|(_, sync, _)| sync.lock().id)
             .collect();
         self.submitting = true;
         self.submit_error = None;
+        self.submit_note = None;
         cx.notify();
         let runner = gh_runner(cx);
         let database = self.database.clone();
         cx.spawn_in(window, async move |this, cx| {
-            if let Err(error) = runner.run(request).await {
+            let posted = match database.set_drafts_sending(saved_ids, true).await {
+                Ok(()) => runner.run(request).await.map_err(anyhow::Error::from),
+                Err(error) => Err(error.context("Couldn't mark the drafts as sending")),
+            };
+            if let Err(error) = posted {
+                // A closed review leaves its rows marked: they may need a second look, but they
+                // are never lost or sent twice.
                 this.update(cx, |this, cx| {
                     this.submitting = false;
-                    this.submit_error = Some(error.to_string().into());
+                    this.submit_error = Some(format!("{error:#}").into());
+                    for (local_id, _, _) in &sent {
+                        if let Some(index) = this.draft_index(*local_id) {
+                            this.drafts[index].sending = false;
+                            this.queue_save(*local_id, cx);
+                        }
+                    }
                     cx.notify();
                 })
                 .log_err();
-                return Err(error.into());
+                return Err(error);
             }
-            let updated = this.update_in(cx, |this, window, cx| {
+
+            let finished = this.update_in(cx, |this, window, cx| {
                 this.submitting = false;
-                for (local_id, _, body) in &sent {
-                    // A draft edited while the review was posting keeps its newer text.
-                    let unchanged = this
-                        .draft_index(*local_id)
-                        .is_some_and(|index| this.drafts[index].body == *body);
-                    if unchanged {
-                        this.discard_draft(*local_id, cx);
+                let mut posted = Vec::new();
+                for (local_id, sync, body) in &sent {
+                    let Some(index) = this.draft_index(*local_id) else {
+                        // Discarded while posting; its own delete is already queued.
+                        continue;
+                    };
+                    // A draft edited while posting keeps its newer text and stays marked as
+                    // possibly posted.
+                    if this.drafts[index].body == *body {
+                        this.drafts.remove(index);
+                        this.draft_views.remove(index);
+                        posted.push((*local_id, sync.clone()));
                     }
                 }
-                this.summary_editor
-                    .update(cx, |editor, cx| editor.set_text("", window, cx));
+                if this.summary_editor.read(cx).text(cx) == summary {
+                    this.summary_editor
+                        .update(cx, |editor, cx| editor.set_text("", window, cx));
+                }
+                this.show_comments(cx);
                 cx.notify();
+                posted
             });
-            if updated.is_err() {
-                // The review closed while posting: delete the sent rows so they aren't sent again.
-                let ids = sent.iter().filter_map(|(_, id, _)| *id).collect();
-                database.delete_drafts(ids).await?;
+            let review_open = finished.is_ok();
+            let posted = finished.unwrap_or_else(|_| {
+                sent.iter()
+                    .map(|(local_id, sync, _)| (*local_id, sync.clone()))
+                    .collect()
+            });
+            for (local_id, sync) in posted {
+                sync.lock().pending = Some(PendingWrite::DeleteRow);
+                if claim_sync(&sync) {
+                    drain_sync(this.clone(), local_id, sync, database.clone(), cx).await;
+                }
             }
-            database.set_last_review(key, head_sha).await.log_err();
-            let refresh = this.update_in(cx, |this, window, cx| this.refresh_detail(window, cx))?;
-            // The review is posted; a failed refresh only delays showing its threads.
-            refresh.await.log_err();
+
+            let mut problem = database
+                .set_last_review(key, head_sha)
+                .await
+                .err()
+                .map(|error| format!("{error:#}"));
+            if !review_open {
+                return Ok(());
+            }
+            match this.update_in(cx, |this, window, cx| this.refresh_detail(window, cx)) {
+                Ok(refresh) => {
+                    if let Err(error) = refresh.await {
+                        problem.get_or_insert(format!("{error:#}"));
+                    }
+                }
+                Err(_) => return Ok(()),
+            }
+            if let Some(problem) = problem {
+                this.update(cx, |this, cx| {
+                    this.submit_note =
+                        Some(format!("Review posted. Couldn't refresh: {problem}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
             Ok(())
         })
     }
@@ -1009,13 +1195,17 @@ impl ReviewItem {
         })
     }
 
-    /// Flips the thread at once, as GitHub does, and flips it back if `gh` fails.
+    /// Flips the thread at once, as GitHub does, and flips it back if `gh` fails. A click while
+    /// the thread's last request is pending sends nothing.
     pub fn set_thread_resolved(
         &mut self,
         thread_id: &str,
         resolved: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.resolving.contains(thread_id) {
+            return Task::ready(Ok(()));
+        }
         let Some(thread) = self
             .detail
             .threads
@@ -1025,6 +1215,7 @@ impl ReviewItem {
             return Task::ready(Err(anyhow!("Unknown review thread {thread_id}.")));
         };
         thread.is_resolved = resolved;
+        self.resolving.insert(thread_id.to_string());
         self.thread_errors.remove(thread_id);
         self.show_comments(cx);
         cx.notify();
@@ -1036,34 +1227,41 @@ impl ReviewItem {
                 Ok(output) => parse_mutation(&output),
                 Err(error) => Err(error.into()),
             };
-            if let Err(error) = &result {
-                this.update(cx, |this, cx| {
+            this.update(cx, |this, cx| {
+                this.resolving.remove(&thread_id);
+                if let Err(error) = &result {
+                    // A refresh may have brought GitHub's own state in the meantime.
                     if let Some(thread) = this
                         .detail
                         .threads
                         .iter_mut()
-                        .find(|thread| thread.id == thread_id)
+                        .find(|thread| thread.id == thread_id && thread.is_resolved == resolved)
                     {
                         thread.is_resolved = !resolved;
                     }
                     this.thread_errors
                         .insert(thread_id.clone(), format!("{error:#}").into());
-                    this.show_comments(cx);
-                    cx.notify();
-                })?;
-            }
+                }
+                this.show_comments(cx);
+                cx.notify();
+            })?;
             result
         })
     }
 
-    /// Syncs GitHub's Viewed checkbox for a file: flips at once and flips back if `gh` fails.
+    /// Syncs GitHub's Viewed checkbox for a file: flips at once and flips back if `gh` fails. A
+    /// click while the file's last request is pending sends nothing.
     pub fn set_file_viewed(
         &mut self,
         path: &str,
         viewed: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.marking_viewed.contains(path) {
+            return Task::ready(Ok(()));
+        }
         self.set_local_file_viewed(path, viewed);
+        self.marking_viewed.insert(path.to_string());
         self.file_errors.remove(path);
         cx.notify();
         let request = viewed_request(
@@ -1079,14 +1277,17 @@ impl ReviewItem {
                 Ok(output) => parse_mutation(&output),
                 Err(error) => Err(error.into()),
             };
-            if let Err(error) = &result {
-                this.update(cx, |this, cx| {
-                    this.set_local_file_viewed(&path, !viewed);
+            this.update(cx, |this, cx| {
+                this.marking_viewed.remove(&path);
+                if let Err(error) = &result {
+                    if this.file_viewed(&path) == viewed {
+                        this.set_local_file_viewed(&path, !viewed);
+                    }
                     this.file_errors
                         .insert(path.clone(), format!("{error:#}").into());
-                    cx.notify();
-                })?;
-            }
+                }
+                cx.notify();
+            })?;
             result
         })
     }
@@ -1205,68 +1406,13 @@ impl ReviewItem {
     }
 
     fn start_sync(&self, local_id: usize, sync: Arc<Mutex<DraftSync>>, cx: &mut Context<Self>) {
-        if std::mem::replace(&mut sync.lock().in_flight, true) {
+        if !claim_sync(&sync) {
             return;
         }
         let database = self.database.clone();
         // Detached so closing the review never cancels the write of what the user typed.
-        cx.spawn(async move |this, cx| {
-            loop {
-                let job = sync.lock().next_job();
-                match job {
-                    None => return,
-                    Some(SyncJob::Delete(id)) => match database.delete_draft(id).await {
-                        Ok(()) => {
-                            this.update(cx, |this, _| {
-                                if let Some(index) = this.draft_index(local_id) {
-                                    this.drafts[index].id = None;
-                                }
-                            })
-                            .ok();
-                        }
-                        Err(error) => {
-                            log::error!("deleting a review draft failed: {error:#}");
-                            let mut state = sync.lock();
-                            if state.id.is_none() {
-                                state.id = Some(id);
-                            }
-                            state.error =
-                                Some(format!("Couldn't save this draft: {error:#}").into());
-                        }
-                    },
-                    Some(SyncJob::Save(draft)) => {
-                        let result = database.save_draft(draft).await;
-                        let saved_id = {
-                            let mut state = sync.lock();
-                            match result {
-                                Ok(id) => {
-                                    state.id = Some(id);
-                                    state.error = None;
-                                    Some(id)
-                                }
-                                Err(error) => {
-                                    log::error!("saving a review draft failed: {error:#}");
-                                    state.error =
-                                        Some(format!("Couldn't save this draft: {error:#}").into());
-                                    None
-                                }
-                            }
-                        };
-                        // The review may be closed by now; the write itself already happened.
-                        this.update(cx, |this, cx| {
-                            if let (Some(id), Some(index)) = (saved_id, this.draft_index(local_id))
-                            {
-                                this.drafts[index].id = Some(id);
-                            }
-                            // Draft cards read the save error when the editor redraws them.
-                            this.editor.update(cx, |_, cx| cx.notify());
-                        })
-                        .ok();
-                    }
-                }
-            }
-        })
-        .detach();
+        cx.spawn(async move |this, cx| drain_sync(this, local_id, sync, database, cx).await)
+            .detach();
     }
 
     fn discard_draft(&mut self, local_id: usize, cx: &mut Context<Self>) {
@@ -1389,6 +1535,7 @@ impl ReviewItem {
             body: String::new(),
             outdated: false,
             general: false,
+            sending: false,
         };
         let local_id = self.push_draft(draft);
         self.open_composer(local_id, window, cx);
@@ -1569,11 +1716,14 @@ impl ReviewItem {
                 continue;
             };
             let note = self.draft_note(draft);
+            // During a submit every sent draft is marked; only a leftover mark means anything.
+            let maybe_posted = draft.sending && !self.submitting;
             let body_rows = draft.body.lines().count().max(1) as u32;
             let height = match view.composer {
                 Some(_) => COMPOSER_MAX_LINES + 4,
                 None => 3 + body_rows,
-            } + if note.is_some() { 2 } else { 0 };
+            } + if note.is_some() { 2 } else { 0 }
+                + if maybe_posted { 2 } else { 0 };
             blocks.push(BlockProperties {
                 placement: BlockPlacement::Below(anchor),
                 height: Some(height),
@@ -1584,6 +1734,7 @@ impl ReviewItem {
                     draft.end_line,
                     draft.body.clone().into(),
                     note.map(SharedString::from),
+                    maybe_posted,
                     view.composer.clone(),
                     view.sync.clone(),
                 ),
@@ -1604,6 +1755,7 @@ impl ReviewItem {
                 .map(|comment| 1 + comment.body.lines().count().max(1))
                 .sum();
             let error = self.thread_errors.get(&thread.id).cloned();
+            let pending = self.resolving.contains(&thread.id);
             blocks.push(BlockProperties {
                 placement: BlockPlacement::Below(anchor),
                 height: Some(body_rows as u32 + 3 + u32::from(error.is_some())),
@@ -1613,6 +1765,7 @@ impl ReviewItem {
                     thread.clone(),
                     self.reply_editors.get(&thread.id).cloned(),
                     error,
+                    pending,
                 ),
                 priority: 0,
             });
@@ -2188,6 +2341,7 @@ impl ReviewItem {
                                 )
                                 .label(format!("{path} viewed"))
                                 .label_size(LabelSize::Small)
+                                .disabled(self.marking_viewed.contains(path))
                                 .on_click(cx.listener(
                                     move |this, state: &ToggleState, _, cx| {
                                         this.set_file_viewed(
@@ -2383,7 +2537,7 @@ impl ReviewItem {
                 this.submit(event, window, cx).detach_and_log_err(cx)
             })
         };
-        let left_out = self.left_out_drafts();
+        let left_out = self.left_out_note();
         let legend_highlights: Vec<_> = [
             highlight("Red", Color::Error),
             highlight("Amber", Color::Warning),
@@ -2455,13 +2609,16 @@ impl ReviewItem {
                                     .on_click(submit(ReviewEvent::RequestChanges)),
                             ),
                     )
-                    .when(left_out > 0, |this| {
-                        this.child(
-                            Label::new(format!("{left_out} outdated drafts not included"))
-                                .size(LabelSize::Small)
-                                .color(Color::Warning),
-                        )
-                    })
+                    .children(left_out.map(|note| {
+                        Label::new(note)
+                            .size(LabelSize::Small)
+                            .color(Color::Warning)
+                    }))
+                    .children(
+                        self.submit_note.clone().map(|note| {
+                            Label::new(note).size(LabelSize::Small).color(Color::Muted)
+                        }),
+                    )
                     .children(
                         self.submit_error.clone().map(|error| {
                             Label::new(error).size(LabelSize::Small).color(Color::Error)
@@ -3500,6 +3657,7 @@ fn verify_password(user: &str, password: &str) -> bool {
             body: format!("about {anchor_text}"),
             outdated: false,
             general: false,
+            sending: false,
         }
     }
 
@@ -4118,7 +4276,17 @@ fn verify_password(user: &str, password: &str) -> bool {
             .await
             .expect("track");
         let fake = install_fake(&mut cx);
-        fake.respond(is_review_post, Ok("{}".into()));
+        // GitHub only answers if every sent row was marked before the request went out.
+        let marked = database.clone();
+        fake.respond(
+            move |request| {
+                is_review_post(request)
+                    && marked
+                        .drafts(&key())
+                        .is_ok_and(|drafts| drafts.iter().all(|draft| draft.sending))
+            },
+            Ok("{}".into()),
+        );
         fake.respond(is_detail, Ok(DETAIL.into()));
         item.update_in(&mut cx, |item, window, cx| {
             item.summary_editor
@@ -4154,6 +4322,10 @@ fn verify_password(user: &str, password: &str) -> bool {
         let (item, mut cx, database) = open_with_drafts(cx, vec![outdated.clone()]).await;
         item.read_with(&cx, |item, cx| {
             assert_eq!(item.left_out_drafts(), 1);
+            assert_eq!(
+                item.left_out_note().as_deref(),
+                Some("1 draft not included (outdated or not yet re-placed)")
+            );
             assert!(!item.can_comment(cx));
         });
         let fake = install_fake(&mut cx);
@@ -4330,5 +4502,110 @@ fn verify_password(user: &str, password: &str) -> bool {
                 .contains(&step)
         );
         assert_eq!(database.drafts(&key()).expect("drafts").len(), 4);
+    }
+
+    #[gpui::test]
+    async fn review_closed_mid_submit_leaves_no_row(cx: &mut TestAppContext) {
+        let (item, mut cx, database) = open_with_drafts(cx, Vec::new()).await;
+        let fake = install_fake(&mut cx);
+        fake.respond(is_review_post, Ok("{}".into()));
+        fake.respond(is_detail, Ok(DETAIL.into()));
+        // The draft's first save hasn't run when Submit is clicked, so it has no row id yet.
+        let task = item.update_in(&mut cx, |item, window, cx| {
+            let local_id = item.push_draft(current_draft("src/login.rs", 3, "    audit(user);"));
+            item.queue_save(local_id, cx);
+            item.submit(crate::ReviewEvent::Comment, window, cx)
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(item);
+        cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("posted");
+        assert_eq!(
+            fake.requests().iter().filter(|r| is_review_post(r)).count(),
+            1
+        );
+        assert!(database.drafts(&key()).expect("drafts").is_empty());
+    }
+
+    #[gpui::test]
+    async fn sending_row_reopens_marked_and_is_not_sent(cx: &mut TestAppContext) {
+        let maybe_posted = Draft {
+            sending: true,
+            ..current_draft("src/login.rs", 3, "    audit(user);")
+        };
+        let (item, mut cx, database) = open_with_drafts(
+            cx,
+            vec![maybe_posted, current_draft("src/login.rs", 5, "}")],
+        )
+        .await;
+        item.read_with(&cx, |item, _| {
+            assert!(item.drafts()[0].sending);
+            assert_eq!(item.sendable_drafts(), 1);
+            assert_eq!(item.left_out_drafts(), 0);
+        });
+        let fake = install_fake(&mut cx);
+        fake.respond(is_review_post, Ok("{}".into()));
+        fake.respond(is_detail, Ok(DETAIL.into()));
+        submit(&item, crate::ReviewEvent::Comment, &mut cx).expect("submitted");
+        let posts: Vec<_> = fake.requests().into_iter().filter(is_review_post).collect();
+        let comments = request_json(&posts[0])["comments"].clone();
+        assert_eq!(comments.as_array().expect("comments").len(), 1);
+        assert_eq!(comments[0]["line"], 4);
+        let stored = database.drafts(&key()).expect("drafts");
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].sending);
+
+        item.update(&mut cx, |item, cx| item.include_again(0, cx));
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| assert_eq!(item.sendable_drafts(), 1));
+        assert!(!database.drafts(&key()).expect("drafts")[0].sending);
+    }
+
+    #[gpui::test]
+    async fn second_click_while_pending_sends_nothing(cx: &mut TestAppContext) {
+        let (item, mut cx, _) = open_with_drafts(cx, Vec::new()).await;
+        let fake = install_fake(&mut cx);
+        let ok = || Ok(r#"{"data":{"x":{}}}"#.to_string());
+        fake.respond(|_| true, ok());
+        fake.respond(|_| true, ok());
+        item.update(&mut cx, |item, cx| {
+            item.set_thread_resolved("PRRT_1", true, cx).detach();
+            item.set_thread_resolved("PRRT_1", false, cx).detach();
+            item.set_file_viewed("src/retry.rs", true, cx).detach();
+            item.set_file_viewed("src/retry.rs", false, cx).detach();
+        });
+        cx.run_until_parked();
+        assert_eq!(fake.requests().len(), 2);
+        item.read_with(&cx, |item, _| {
+            assert!(item.detail.threads[0].is_resolved);
+            assert!(item.file_viewed("src/retry.rs"));
+            assert!(item.resolving.is_empty() && item.marking_viewed.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn failed_refresh_after_post_shows_note(cx: &mut TestAppContext) {
+        let (item, mut cx, _) = open_with_drafts(cx, submit_drafts()).await;
+        let fake = install_fake(&mut cx);
+        fake.respond(is_review_post, Ok("{}".into()));
+        let task = item.update_in(&mut cx, |item, window, cx| {
+            item.summary_editor
+                .update(cx, |editor, cx| editor.set_text("Sent", window, cx));
+            let task = item.submit(crate::ReviewEvent::Comment, window, cx);
+            item.summary_editor
+                .update(cx, |editor, cx| editor.set_text("Typed after", window, cx));
+            task
+        });
+        cx.run_until_parked();
+        task.now_or_never().expect("finished").expect("posted");
+        item.read_with(&cx, |item, cx| {
+            assert_eq!(
+                item.submit_note.as_deref(),
+                Some("Review posted. Couldn't refresh: FakeGh: unexpected request")
+            );
+            assert!(item.submit_error.is_none());
+            assert!(item.drafts().is_empty());
+            assert_eq!(item.summary_editor.read(cx).text(cx), "Typed after");
+        });
     }
 }

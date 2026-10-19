@@ -211,6 +211,7 @@ mod tests {
             body: "Why?".into(),
             outdated: false,
             general: false,
+            sending: false,
         }
     }
 

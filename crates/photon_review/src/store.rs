@@ -47,6 +47,7 @@ impl Domain for ReviewDb {
             step_key TEXT NOT NULL,
             PRIMARY KEY(host, owner, repo, number, step_key)
         ) STRICT;",
+        "ALTER TABLE drafts ADD COLUMN sending INTEGER NOT NULL DEFAULT 0;",
     ];
 }
 
@@ -74,6 +75,8 @@ pub struct Draft {
     pub body: String,
     pub outdated: bool,
     pub general: bool,
+    /// Set while Submit posts the draft. A row still set after a crash may already be on GitHub.
+    pub sending: bool,
 }
 
 /// Saves that fail before reaching the database, for testing the retry path.
@@ -83,7 +86,7 @@ pub(crate) static FAILING_SAVES: std::sync::atomic::AtomicUsize =
 
 type DraftRow = (
     (i64, String, String, i64, i64),
-    (String, String, String, bool, bool),
+    (String, String, String, bool, bool, bool),
 );
 
 type TrackedRow = (String, String, String, i64, String, String, String);
@@ -174,7 +177,7 @@ impl ReviewDb {
         let number = i64::try_from(key.number)?;
         self.select_bound::<(String, String, String, i64), DraftRow>(
             "SELECT id, path, side, start_line, end_line,
-                    commit_sha, anchor_text, body, outdated, general
+                    commit_sha, anchor_text, body, outdated, general, sending
              FROM drafts WHERE host = ?1 AND owner = ?2 AND repo = ?3 AND number = ?4
              ORDER BY id",
         )?((
@@ -187,7 +190,7 @@ impl ReviewDb {
         .map(
             |(
                 (id, path, side, start_line, end_line),
-                (commit, anchor_text, body, outdated, general),
+                (commit, anchor_text, body, outdated, general, sending),
             )| {
                 Ok(Draft {
                     id: Some(id),
@@ -204,6 +207,7 @@ impl ReviewDb {
                     body,
                     outdated,
                     general,
+                    sending,
                 })
             },
         )
@@ -241,6 +245,7 @@ impl ReviewDb {
                 draft.body,
                 draft.outdated,
                 draft.general,
+                draft.sending,
             ),
         );
         let key = draft.key;
@@ -248,15 +253,16 @@ impl ReviewDb {
             Some(id) => {
                 connection.exec_bound::<(_, i64)>(
                     "UPDATE drafts SET path = ?1, side = ?2, start_line = ?3, end_line = ?4,
-                        commit_sha = ?5, anchor_text = ?6, body = ?7, outdated = ?8, general = ?9
-                     WHERE id = ?10",
+                        commit_sha = ?5, anchor_text = ?6, body = ?7, outdated = ?8, general = ?9,
+                        sending = ?10
+                     WHERE id = ?11",
                 )?((fields, id))?;
                 Ok(id)
             }
             None => connection.select_row_bound::<_, i64>(
                 "INSERT INTO drafts(host, owner, repo, number, path, side, start_line,
-                        end_line, commit_sha, anchor_text, body, outdated, general)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                        end_line, commit_sha, anchor_text, body, outdated, general, sending)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                      RETURNING id",
             )?(((key.host, key.owner, key.repo, number), fields))?
             .context("insert returned no id"),
@@ -273,6 +279,18 @@ impl ReviewDb {
             let mut delete = connection.exec_bound::<i64>("DELETE FROM drafts WHERE id = ?1")?;
             for id in ids {
                 delete(id)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_drafts_sending(&self, ids: Vec<i64>, sending: bool) -> Result<()> {
+        self.write(move |connection| {
+            let mut update = connection
+                .exec_bound::<(bool, i64)>("UPDATE drafts SET sending = ?1 WHERE id = ?2")?;
+            for id in ids {
+                update((sending, id))?;
             }
             Ok(())
         })
@@ -374,6 +392,7 @@ mod tests {
             body: "Why?".into(),
             outdated: false,
             general: false,
+            sending: false,
         }
     }
 
@@ -390,6 +409,7 @@ mod tests {
         second.side = Side::Left;
         second.outdated = true;
         second.general = true;
+        second.sending = true;
         second.id = Some(db.save_draft(second.clone()).await.unwrap());
         let mut other = draft(8, "src/a.rs", 1);
         other.id = Some(db.save_draft(other.clone()).await.unwrap());
@@ -410,6 +430,15 @@ mod tests {
             db.drafts(&key(7)).unwrap(),
             vec![first.clone(), second.clone()]
         );
+
+        db.set_drafts_sending(vec![first.id.unwrap()], true)
+            .await
+            .unwrap();
+        assert!(db.drafts(&key(7)).unwrap()[0].sending);
+        db.set_drafts_sending(vec![first.id.unwrap()], false)
+            .await
+            .unwrap();
+        assert!(!db.drafts(&key(7)).unwrap()[0].sending);
 
         db.delete_draft(second.id.unwrap()).await.unwrap();
         assert_eq!(db.drafts(&key(7)).unwrap(), vec![first.clone()]);
