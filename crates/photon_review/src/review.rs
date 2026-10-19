@@ -13,24 +13,29 @@ use editor::{
 };
 use futures::future::{join_all, try_join_all};
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    HighlightStyle, Render, SharedString, StyledText, Subscription, Task, WeakEntity, Window,
-    actions, rgb,
+    Action as _, AnyWindowHandle, App, AsyncApp, AsyncWindowContext, Context, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, Global, HighlightStyle, Render, SharedString, StyledText,
+    Subscription, Task, WeakEntity, Window, actions, rgb,
 };
 use language::{Buffer, Capability, Point};
 use multi_buffer::build_excerpt_ranges;
-use project::{Project, lsp_store::OpenLspBufferHandle};
+use parking_lot::Mutex;
+use project::{
+    Project,
+    lsp_store::OpenLspBufferHandle,
+    trusted_worktrees::{TrustedWorktrees, TrustedWorktreesEvent},
+};
 use ui::prelude::*;
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
-    AppState, Item, OpenMode, OpenOptions, Toast, Workspace, notifications::NotificationId,
-    open_paths,
+    AppState, Item, OpenMode, OpenOptions, Toast, ToggleWorktreeSecurity, Workspace,
+    notifications::NotificationId, open_paths,
 };
 
 use crate::{
     CallerMark, ChangedFunction, Checkout, ChecksState, ContextCache, ContextError, ContextExcerpt,
     FileAnalysis, FileDiff, FileKind, FileStatus, FunctionContext, GhError, GhRunner, LoadedFile,
-    MapFile, MapFunction, PrDetail, PrSummary, RepoId, ReviewDb, Step, Tracked,
+    MapFile, MapFunction, PrDetail, PrKey, PrSummary, RepoId, ReviewDb, Step, Tracked,
     analyse_loaded_file, auth_status_request, base_text, build_loaded_file, build_review_map,
     call_edges, caller_touched, candidate_repos, classify_caller, classify_path,
     context::buffer_path, context_excerpts, detail_request, fetch_url, find_clone, functions,
@@ -48,6 +53,7 @@ actions!(
 );
 
 const HUNK_CONTEXT_LINES: u32 = 3;
+const TRUST_REASON: &str = "Trust this worktree to find callers";
 const UNCHANGED_BACKGROUND: u32 = 0x07090b;
 const IMPACT_LEGEND: &str = "Every caller in the repo, not just the diff. Red: the signature \
      changed and this caller wasn't updated. Amber: the body changed and this caller wasn't \
@@ -101,19 +107,46 @@ pub(crate) struct PreparedReview {
     pub files: Vec<(FileDiff, Option<String>)>,
 }
 
-/// Errors are shown as a toast in the window the user clicked from.
+#[derive(Default)]
+struct OpeningReviews(Arc<Mutex<HashSet<PrKey>>>);
+
+impl Global for OpeningReviews {}
+
+/// Frees the pull request for another `open_review` when its open finishes or is dropped.
+struct OpeningGuard {
+    opening: Arc<Mutex<HashSet<PrKey>>>,
+    key: PrKey,
+}
+
+impl Drop for OpeningGuard {
+    fn drop(&mut self) {
+        self.opening.lock().remove(&self.key);
+    }
+}
+
+/// Errors are shown as a toast in the window the user clicked from. A second call for a pull
+/// request that is still opening does nothing.
 pub fn open_review(
     summary: PrSummary,
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<()>> {
+    let opening = cx.default_global::<OpeningReviews>().0.clone();
+    if !opening.lock().insert(summary.key.clone()) {
+        return Task::ready(Ok(()));
+    }
+    let guard = OpeningGuard {
+        opening,
+        key: summary.key.clone(),
+    };
     let app_state = workspace.app_state().clone();
     let runner = gh_runner(cx);
     let database = ReviewDb::global(cx);
     let candidates = candidate_repos(cx);
     cx.spawn_in(window, async move |workspace, cx| {
         let result = open_in_new_window(summary, app_state, runner, database, candidates, cx).await;
+        drop(guard);
         if let Err(error) = &result {
             let message = format!("{error:#}");
             workspace
@@ -129,6 +162,25 @@ pub fn open_review(
     })
 }
 
+fn find_open_review(
+    app_state: &AppState,
+    key: &PrKey,
+    cx: &App,
+) -> Option<(AnyWindowHandle, Entity<Workspace>, Entity<ReviewItem>)> {
+    app_state
+        .workspace_store
+        .read(cx)
+        .workspaces_with_windows()
+        .find_map(|(window, workspace)| {
+            let workspace = workspace.upgrade()?;
+            let item = workspace
+                .read(cx)
+                .items_of_type::<ReviewItem>(cx)
+                .find(|item| item.read(cx).detail.summary.key == *key)?;
+            Some((window, workspace, item))
+        })
+}
+
 async fn open_in_new_window(
     summary: PrSummary,
     app_state: Arc<AppState>,
@@ -137,6 +189,19 @@ async fn open_in_new_window(
     candidates: Task<Vec<PathBuf>>,
     cx: &mut AsyncWindowContext,
 ) -> Result<()> {
+    let open = cx.update(|_, cx| find_open_review(&app_state, &summary.key, cx))?;
+    if let Some((window, workspace, item)) = open
+        && item.read_with(cx, |item, _| item.checkout.head_sha == summary.head_sha)
+    {
+        window.update(cx, |_, window, cx| {
+            window.activate_window();
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&item, true, true, window, cx)
+            })
+        })?;
+        return Ok(());
+    }
+
     let candidates = candidates.await;
     let url = fetch_url(&repo_id(&summary));
     let prepared = cx
@@ -144,15 +209,10 @@ async fn open_in_new_window(
             prepare_review(&summary, url, review_root(), candidates, runner, database).await
         })
         .await?;
-    let PreparedReview {
-        checkout,
-        detail,
-        files,
-    } = prepared;
     let opened = cx
         .update(|_, cx| {
             open_paths(
-                std::slice::from_ref(&checkout.worktree),
+                std::slice::from_ref(&prepared.checkout.worktree),
                 app_state,
                 OpenOptions {
                     open_mode: OpenMode::NewWindow,
@@ -162,10 +222,24 @@ async fn open_in_new_window(
             )
         })?
         .await?;
-    let project = opened
-        .workspace
-        .read_with(cx, |workspace, _| workspace.project().clone());
-    let loads = cx.update(|_, cx| {
+    place_review(opened.workspace, opened.window.into(), prepared, cx).await
+}
+
+/// Adds the review to the workspace's active pane, or replaces an open review of the same pull
+/// request in place, since that one describes an older head.
+async fn place_review(
+    workspace: Entity<Workspace>,
+    window: AnyWindowHandle,
+    prepared: PreparedReview,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let PreparedReview {
+        checkout,
+        detail,
+        files,
+    } = prepared;
+    let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+    let loads = cx.update(|cx| {
         files
             .into_iter()
             .map(|(diff, base)| {
@@ -173,20 +247,30 @@ async fn open_in_new_window(
                 build_loaded_file(&project, abs_path, base, diff, cx)
             })
             .collect::<Vec<_>>()
-    })?;
+    });
     let files = try_join_all(loads).await?;
-    let key = detail.summary.key.clone();
-    opened.window.update(cx, |_, window, cx| {
-        opened.workspace.update(cx, |workspace, cx| {
+    window.update(cx, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            let key = detail.summary.key.clone();
             let existing = workspace
                 .items_of_type::<ReviewItem>(cx)
                 .find(|item| item.read(cx).detail.summary.key == key);
-            if let Some(existing) = existing {
-                workspace.activate_item(&existing, true, true, window, cx);
-                return;
-            }
             let item = cx.new(|cx| ReviewItem::new(project, detail, checkout, files, window, cx));
-            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            let pane = existing.as_ref().and_then(|existing| {
+                workspace
+                    .panes()
+                    .iter()
+                    .find(|pane| pane.read(cx).index_for_item(existing).is_some())
+                    .cloned()
+            });
+            match (existing, pane) {
+                (Some(existing), Some(pane)) => pane.update(cx, |pane, cx| {
+                    let index = pane.index_for_item(&existing);
+                    pane.remove_item(existing.entity_id(), false, false, window, cx);
+                    pane.add_item(Box::new(item), true, true, index, window, cx);
+                }),
+                _ => workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx),
+            }
         })
     })?;
     Ok(())
@@ -200,8 +284,8 @@ fn repo_id(summary: &PrSummary) -> RepoId {
     }
 }
 
-/// Everything `open_review` does before it opens a window: the checkout, the detail and the
-/// diff. The user's clone only gains Photon's refs and worktree entry (see `prepare_checkout`).
+/// Everything `open_review` does before it opens a window: the login check, the checkout, the
+/// detail and the diff. The user's clone only gains Photon's refs and worktree entry (see `prepare_checkout`).
 pub(crate) async fn prepare_review(
     summary: &PrSummary,
     fetch_url: String,
@@ -211,6 +295,15 @@ pub(crate) async fn prepare_review(
     database: ReviewDb,
 ) -> Result<PreparedReview> {
     let key = &summary.key;
+    let hosts = parse_auth_status(&runner.run(auth_status_request()).await?)?;
+    let login = hosts
+        .into_iter()
+        .find(|auth| auth.host.eq_ignore_ascii_case(&key.host))
+        .and_then(|auth| auth.login)
+        .ok_or_else(|| GhError::LoggedOut {
+            host: Some(key.host.clone()),
+        })?;
+
     let clone = find_clone(candidates, &repo_id(summary)).await;
     let checkout = prepare_checkout(key, &summary.base_ref, &fetch_url, clone, &root).await?;
     database
@@ -221,15 +314,6 @@ pub(crate) async fn prepare_review(
             worktree: checkout.worktree.clone(),
         })
         .await?;
-
-    let hosts = parse_auth_status(&runner.run(auth_status_request()).await?)?;
-    let login = hosts
-        .into_iter()
-        .find(|auth| auth.host.eq_ignore_ascii_case(&key.host))
-        .and_then(|auth| auth.login)
-        .ok_or_else(|| GhError::LoggedOut {
-            host: Some(key.host.clone()),
-        })?;
     let detail = parse_detail(key, &runner.run(detail_request(key, &login)).await?)?;
 
     let diffs = git_diff(&checkout.worktree, &checkout.merge_base, &checkout.head_sha).await?;
@@ -329,7 +413,7 @@ impl ReviewItem {
         cx: &mut Context<Self>,
     ) -> Self {
         let multibuffer = cx.new(|cx| {
-            let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+            let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
             multibuffer.set_all_diff_hunks_expanded(cx);
             multibuffer
         });
@@ -352,11 +436,28 @@ impl ReviewItem {
                 functions::changed_rows(&diff.read(cx).snapshot(cx), &buffer.read(cx).snapshot());
             changed_rows.insert(file.diff.path.clone(), rows);
         }
-        let subscription = cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| {
+        let mut subscriptions = vec![cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| {
             if matches!(event, EditorEvent::SelectionsChanged { .. }) {
                 this.update_impact(cx);
             }
-        });
+        })];
+        if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
+            subscriptions.push(cx.subscribe(
+                &trusted_worktrees,
+                |this, _, event: &TrustedWorktreesEvent, cx| {
+                    let TrustedWorktreesEvent::Trusted(worktree_store, _) = event else {
+                        return;
+                    };
+                    let waiting =
+                        this.context_state == ContextState::Unavailable(TRUST_REASON.into());
+                    if waiting
+                        && *worktree_store == this.project.read(cx).worktree_store().downgrade()
+                    {
+                        this._context_task = this.load_context(cx);
+                    }
+                },
+            ));
+        }
         let mut this = Self {
             project,
             detail,
@@ -380,7 +481,7 @@ impl ReviewItem {
             impact_function: None,
             impact: Vec::new(),
             _lsp_handles: lsp_handles,
-            _subscriptions: vec![subscription],
+            _subscriptions: subscriptions,
             _context_task: Task::ready(()),
         };
         this.rebuild_map(&[], cx);
@@ -428,6 +529,8 @@ impl ReviewItem {
     }
 
     fn load_context(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        self.context_state = ContextState::Finding;
+        cx.notify();
         let analyses: Vec<_> = self
             .files
             .iter()
@@ -438,15 +541,42 @@ impl ReviewItem {
             let Some(fetches) = this
                 .update(cx, |this, cx| {
                     this.set_analyses(analyses, cx);
-                    this.fetch_contexts(cx)
+                    // Language servers don't start in a restricted worktree, and a PR's code is
+                    // never trusted automatically, so the fetches (and their 30 s cap) wait for
+                    // the user to trust it.
+                    if this.worktree_restricted(cx) {
+                        this.context_state = ContextState::Unavailable(TRUST_REASON.into());
+                        cx.notify();
+                        return None;
+                    }
+                    Some(this.fetch_contexts(cx))
                 })
                 .log_err()
+                .flatten()
             else {
                 return;
             };
             let results = join_all(fetches).await;
             this.update(cx, |this, cx| this.set_contexts(results, cx))
                 .log_err();
+        })
+    }
+
+    fn worktree_restricted(&self, cx: &mut Context<Self>) -> bool {
+        let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) else {
+            return false;
+        };
+        let worktree_store = self.project.read(cx).worktree_store();
+        let worktree_ids: Vec<_> = self
+            .project
+            .read(cx)
+            .worktrees(cx)
+            .map(|worktree| worktree.read(cx).id())
+            .collect();
+        trusted_worktrees.update(cx, |trusted_worktrees, cx| {
+            worktree_ids
+                .into_iter()
+                .any(|id| !trusted_worktrees.can_trust(&worktree_store, id, cx))
         })
     }
 
@@ -958,7 +1088,16 @@ impl ReviewItem {
                         Label::new(reason.clone())
                             .size(LabelSize::Small)
                             .color(Color::Muted),
-                    ),
+                    )
+                    .when(reason.as_ref() == TRUST_REASON, |this| {
+                        this.child(
+                            Button::new("photon-review-trust", "Trust worktree…")
+                                .style(ButtonStyle::Filled)
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(ToggleWorktreeSecurity.boxed_clone(), cx)
+                                }),
+                        )
+                    }),
             ),
         };
         v_flex()
@@ -1104,12 +1243,15 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use language::FakeLspAdapter;
     use project::Project;
+    use project::trusted_worktrees::PathTrust;
     use serde_json::json;
     use settings::SettingsStore;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use util::path;
+    use workspace::MultiWorkspace;
 
     const DETAIL: &str = include_str!("../test_fixtures/detail.json");
     const AUTH: &str =
@@ -1193,10 +1335,17 @@ mod tests {
 
     type Gate = futures::future::Shared<futures::channel::oneshot::Receiver<()>>;
 
-    fn answer_call_hierarchy(server: &mut lsp::FakeLanguageServer, graph: &Arc<Graph>, gate: Gate) {
+    fn answer_call_hierarchy(
+        server: &mut lsp::FakeLanguageServer,
+        graph: &Arc<Graph>,
+        gate: Gate,
+        prepares: &Arc<AtomicUsize>,
+    ) {
         server.set_request_handler::<lsp::request::CallHierarchyPrepare, _, _>({
             let graph = graph.clone();
+            let prepares = prepares.clone();
             move |params, _| {
+                prepares.fetch_add(1, Ordering::SeqCst);
                 let position = params.text_document_position_params;
                 let item = graph
                     .functions
@@ -1290,10 +1439,32 @@ mod tests {
         call_hierarchy: bool,
         gate: Option<Gate>,
     ) -> (Entity<ReviewItem>, VisualTestContext) {
+        let (item, cx, _) =
+            open_item_with(cx, tree, files, graph, call_hierarchy, gate, false).await;
+        (item, cx)
+    }
+
+    /// `restricted` opens the project with worktree trust enforced and the worktree untrusted.
+    /// Also returns the number of call-hierarchy prepare requests the server received.
+    async fn open_item_with(
+        cx: &mut TestAppContext,
+        tree: serde_json::Value,
+        files: Vec<PrFile>,
+        graph: Graph,
+        call_hierarchy: bool,
+        gate: Option<Gate>,
+        restricted: bool,
+    ) -> (Entity<ReviewItem>, VisualTestContext, Arc<AtomicUsize>) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/repo"), tree).await;
-        let project = Project::test(fs, [path!("/repo").as_ref()], cx).await;
+        let project = if restricted {
+            cx.update(|cx| project::trusted_worktrees::init(Default::default(), cx));
+            Project::test_with_worktree_trust(fs, [path!("/repo").as_ref()], cx).await
+        } else {
+            Project::test(fs, [path!("/repo").as_ref()], cx).await
+        };
+        let prepares = Arc::new(AtomicUsize::new(0));
         let registry = project.read_with(cx, |project, _| project.languages().clone());
         registry.add(language::rust_lang());
         let graph = Arc::new(graph);
@@ -1310,8 +1481,9 @@ mod tests {
                         .then_some(lsp::CallHierarchyServerCapability::Simple(true)),
                     ..lsp::ServerCapabilities::default()
                 },
-                initializer: Some(Box::new(move |server| {
-                    answer_call_hierarchy(server, &graph, gate.clone())
+                initializer: Some(Box::new({
+                    let prepares = prepares.clone();
+                    move |server| answer_call_hierarchy(server, &graph, gate.clone(), &prepares)
                 })),
                 ..FakeLspAdapter::default()
             },
@@ -1343,7 +1515,7 @@ mod tests {
         let item = window.root(cx).expect("item");
         let cx = VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
-        (item, cx)
+        (item, cx, prepares)
     }
 
     /// Lets the language server start and every call-hierarchy retry run.
@@ -1703,79 +1875,129 @@ fn verify_password(user: &str, password: &str) -> bool {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    struct GitFixture {
+        _temp: tempfile::TempDir,
+        base: PathBuf,
+        upstream: PathBuf,
+        seed: PathBuf,
+        user: PathBuf,
+        upstream_url: String,
+        pr_sha: String,
+    }
+
+    impl GitFixture {
+        /// An upstream with `main` and PR #482, and a user clone whose remote names
+        /// github.com/acme/web and whose work tree has an uncommitted edit.
+        fn new() -> Option<Self> {
+            if Command::new("git").arg("--version").output().is_err() {
+                return None;
+            }
+            let temp = tempfile::tempdir().expect("tempdir");
+            let base = temp.path().canonicalize().expect("canonical");
+            let upstream = base.join("upstream.git");
+            let seed = base.join("seed");
+            let user = base.join("user");
+            std::fs::create_dir_all(&seed).expect("seed dir");
+            run(
+                &base,
+                &["init", "-q", "--bare", "-b", "main", "upstream.git"],
+            );
+            run(&seed, &["init", "-q", "-b", "main"]);
+            std::fs::write(seed.join("a.rs"), "fn a() {}\n").expect("write");
+            run(&seed, &["add", "."]);
+            run(&seed, &["commit", "-q", "-m", "base"]);
+            run(&seed, &["checkout", "-q", "-b", "pr"]);
+            let upstream_url = format!("file://{}", upstream.display());
+            run(&base, &["clone", "-q", &upstream_url, "user"]);
+            let mut fixture = Self {
+                _temp: temp,
+                base,
+                upstream,
+                seed,
+                user,
+                upstream_url,
+                pr_sha: String::new(),
+            };
+            fixture.push_pr_head("fn a() {\n    1;\n}\n");
+            run(&fixture.user, &["fetch", "-q", "origin"]);
+            run(
+                &fixture.user,
+                &["remote", "set-url", "origin", "git@github.com:acme/web.git"],
+            );
+            std::fs::write(fixture.user.join("a.rs"), "dirty\n").expect("write");
+            Some(fixture)
+        }
+
+        fn push_pr_head(&mut self, contents: &str) {
+            std::fs::write(self.seed.join("a.rs"), contents).expect("write");
+            run(&self.seed, &["commit", "-q", "-am", "pr"]);
+            self.pr_sha = run(&self.seed, &["rev-parse", "HEAD"]);
+            run(
+                &self.seed,
+                &["push", "-q", "-f", &self.upstream_url, "main", "pr"],
+            );
+            run(
+                &self.upstream,
+                &["update-ref", "refs/pull/482/head", &self.pr_sha],
+            );
+        }
+
+        async fn prepare(&self, fake: &Arc<FakeGh>, database: &ReviewDb) -> Result<PreparedReview> {
+            fake.respond(|request| request.args[0] == "auth", Ok(AUTH.into()));
+            fake.respond(
+                |request| {
+                    request
+                        .stdin
+                        .as_deref()
+                        .is_some_and(|stdin| stdin.contains("pullRequest"))
+                },
+                Ok(DETAIL.into()),
+            );
+            let summary = parse_detail(&key(), DETAIL).expect("detail").summary;
+            prepare_review(
+                &summary,
+                self.upstream_url.clone(),
+                self.base.join("root"),
+                vec![self.user.clone()],
+                fake.clone(),
+                database.clone(),
+            )
+            .await
+        }
+    }
+
     #[gpui::test]
     async fn open_review_leaves_user_clone_untouched(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        if Command::new("git").arg("--version").output().is_err() {
+        let Some(fixture) = GitFixture::new() else {
             return;
-        }
-        let temp = tempfile::tempdir().expect("tempdir");
-        let base = temp.path().canonicalize().expect("canonical");
-        let upstream = base.join("upstream.git");
-        let seed = base.join("seed");
-        let user = base.join("user");
-        std::fs::create_dir_all(&seed).expect("seed dir");
-        run(
-            &base,
-            &["init", "-q", "--bare", "-b", "main", "upstream.git"],
-        );
-        run(&seed, &["init", "-q", "-b", "main"]);
-        std::fs::write(seed.join("a.rs"), "fn a() {}\n").expect("write");
-        run(&seed, &["add", "."]);
-        run(&seed, &["commit", "-q", "-m", "base"]);
-        run(&seed, &["checkout", "-q", "-b", "pr"]);
-        std::fs::write(seed.join("a.rs"), "fn a() {\n    1;\n}\n").expect("write");
-        run(&seed, &["commit", "-q", "-am", "pr"]);
-        let pr_sha = run(&seed, &["rev-parse", "HEAD"]);
-        let upstream_url = format!("file://{}", upstream.display());
-        run(&seed, &["push", "-q", &upstream_url, "main", "pr"]);
-        run(&upstream, &["update-ref", "refs/pull/482/head", &pr_sha]);
-        run(&base, &["clone", "-q", &upstream_url, "user"]);
-        run(
-            &user,
-            &["remote", "set-url", "origin", "git@github.com:acme/web.git"],
-        );
-        std::fs::write(user.join("a.rs"), "dirty\n").expect("write");
+        };
+        let user = &fixture.user;
         let user_state = || {
             vec![
-                run(&user, &["symbolic-ref", "HEAD"]),
-                run(&user, &["status", "--porcelain=v1", "-uall"]),
-                run(&user, &["stash", "list"]),
+                run(user, &["symbolic-ref", "HEAD"]),
+                run(user, &["status", "--porcelain=v1", "-uall"]),
+                run(user, &["stash", "list"]),
                 format!("{:?}", std::fs::read(user.join("a.rs")).ok()),
             ]
         };
         let before = user_state();
 
         let fake = FakeGh::new();
-        fake.respond(|request| request.args[0] == "auth", Ok(AUTH.into()));
-        fake.respond(
-            |request| {
-                request
-                    .stdin
-                    .as_deref()
-                    .is_some_and(|stdin| stdin.contains("pullRequest"))
-            },
-            Ok(DETAIL.into()),
-        );
         let database = cx.foreground_executor().block_test(ReviewDb::open_test_db(
             "open_review_leaves_user_clone_untouched",
         ));
-        let summary = parse_detail(&key(), DETAIL).expect("detail").summary;
-        let prepared = prepare_review(
-            &summary,
-            upstream_url,
-            base.join("root"),
-            vec![user.clone()],
-            fake.clone(),
-            database.clone(),
-        )
-        .await
-        .expect("prepared");
+        let prepared = fixture.prepare(&fake, &database).await.expect("prepared");
 
         assert_eq!(user_state(), before);
-        assert_eq!(prepared.checkout.head_sha, pr_sha);
+        assert_eq!(prepared.checkout.head_sha, fixture.pr_sha);
         assert_eq!(prepared.checkout.repo_dir, user.join(".git"));
-        assert!(prepared.checkout.worktree.starts_with(base.join("root")));
+        assert!(
+            prepared
+                .checkout
+                .worktree
+                .starts_with(fixture.base.join("root"))
+        );
         assert_eq!(prepared.detail.summary.key, key());
         let paths: Vec<_> = prepared
             .files
@@ -1786,5 +2008,139 @@ fn verify_password(user: &str, password: &str) -> bool {
         let tracked = database.tracked().expect("tracked");
         assert_eq!(tracked.len(), 1);
         assert_eq!(tracked[0].worktree, prepared.checkout.worktree);
+    }
+
+    #[gpui::test]
+    async fn logged_out_fails_before_checkout(cx: &mut TestAppContext) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        let fake = FakeGh::new();
+        fake.respond(
+            |request| request.args[0] == "auth",
+            Ok(include_str!("../test_fixtures/auth_status_logged_out.json").into()),
+        );
+        let database = cx
+            .foreground_executor()
+            .block_test(ReviewDb::open_test_db("logged_out_fails_before_checkout"));
+        let summary = parse_detail(&key(), DETAIL).expect("detail").summary;
+        let error = prepare_review(
+            &summary,
+            "file:///nowhere".into(),
+            root.clone(),
+            Vec::new(),
+            fake.clone(),
+            database.clone(),
+        )
+        .await
+        .err()
+        .expect("logged out");
+        assert!(error.to_string().contains("Not logged in"), "{error:#}");
+        assert_eq!(fake.requests().len(), 1);
+        assert!(!root.exists());
+        assert!(database.tracked().expect("tracked").is_empty());
+    }
+
+    #[gpui::test]
+    async fn reopening_after_new_head_replaces_the_review(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let Some(mut fixture) = GitFixture::new() else {
+            return;
+        };
+        init_test(cx);
+        let fake = FakeGh::new();
+        let database = cx.foreground_executor().block_test(ReviewDb::open_test_db(
+            "reopening_after_new_head_replaces_the_review",
+        ));
+        let prepared = fixture.prepare(&fake, &database).await.expect("first");
+        let worktree = prepared.checkout.worktree.clone();
+        let fs = fs::RealFs::new(None, cx.executor());
+        let project = Project::test(fs, [worktree.as_path()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        place_review(
+            workspace.clone(),
+            window.into(),
+            prepared,
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("placed");
+
+        let first_head = fixture.pr_sha.clone();
+        fixture.push_pr_head("fn a() {\n    2;\n}\n");
+        assert_ne!(fixture.pr_sha, first_head);
+        let prepared = fixture.prepare(&fake, &database).await.expect("second");
+        assert_eq!(prepared.checkout.head_sha, fixture.pr_sha);
+        place_review(
+            workspace.clone(),
+            window.into(),
+            prepared,
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("replaced");
+
+        let items = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ReviewItem>(cx)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(items.len(), 1);
+        let (head, text) = items[0].read_with(cx, |item, cx| {
+            (
+                item.checkout.head_sha.clone(),
+                item.editor().read(cx).text(cx),
+            )
+        });
+        assert_eq!(head, fixture.pr_sha);
+        assert!(text.contains("    2;"), "{text}");
+        assert!(!text.contains("    1;"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn untrusted_worktree_waits_for_trust(cx: &mut TestAppContext) {
+        let (item, mut cx, prepares) = open_item_with(
+            cx,
+            login_tree(),
+            vec![modified("src/login.rs", LOGIN_BASE)],
+            login_graph(),
+            true,
+            None,
+            true,
+        )
+        .await;
+        settle(&mut cx);
+        item.read_with(&cx, |item, _| {
+            assert_eq!(
+                item.context_state(),
+                &ContextState::Unavailable(TRUST_REASON.into())
+            )
+        });
+        assert_eq!(prepares.load(Ordering::SeqCst), 0);
+        assert!(text(&item, &mut cx).contains("let user = user.trim();"));
+
+        cx.update(|_, cx| {
+            let project = item.read(cx).project.clone();
+            let worktree_store = project.read(cx).worktree_store();
+            let worktree_ids: Vec<_> = project
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| PathTrust::Worktree(worktree.read(cx).id()))
+                .collect();
+            TrustedWorktrees::try_get_global(cx)
+                .expect("trust store")
+                .update(cx, |trusted, cx| {
+                    trusted.trust(&worktree_store, worktree_ids.into_iter().collect(), cx)
+                });
+        });
+        settle(&mut cx);
+        item.read_with(&cx, |item, _| {
+            assert_eq!(item.context_state(), &ContextState::Ready)
+        });
+        assert!(prepares.load(Ordering::SeqCst) > 0);
+        assert!(text(&item, &mut cx).contains("user == password"));
     }
 }

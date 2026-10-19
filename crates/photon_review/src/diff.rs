@@ -301,6 +301,11 @@ pub fn build_loaded_file(
     };
     cx.spawn(async move |cx| {
         let buffer = buffer_task.await?;
+        // The project may still hold this buffer from a review of an older head; read the text
+        // the checkout just wrote rather than waiting for the file watcher.
+        if diff.status != FileStatus::Deleted {
+            buffer.update(cx, |buffer, cx| buffer.reload(cx)).await?;
+        }
         let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
         let buffer_diff = cx.new(|cx| {
             BufferDiff::new(
