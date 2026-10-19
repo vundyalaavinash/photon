@@ -81,6 +81,7 @@ pub enum Insight {
 }
 
 pub const MAX_INSIGHT_LINES: usize = 20_000;
+const MAX_TABLE_HEADER_CHARS: usize = 1_000;
 pub const MAX_INSIGHT_BYTES: usize = 5 * 1024 * 1024;
 
 pub fn recognise(command: &str, lines: &[OutputLine], _exit_code: Option<i32>) -> Option<Insight> {
@@ -644,6 +645,11 @@ fn unquote_git_path(path: &str) -> String {
             }
             b'n' => decoded.push(b'\n'),
             b't' => decoded.push(b'\t'),
+            b'a' => decoded.push(0x07),
+            b'b' => decoded.push(0x08),
+            b'f' => decoded.push(0x0c),
+            b'v' => decoded.push(0x0b),
+            b'r' => decoded.push(0x0d),
             other => decoded.push(other),
         }
     }
@@ -756,6 +762,9 @@ fn recognise_table(lines: &[OutputLine]) -> Option<Insight> {
         return None;
     }
     let header = &rows[0];
+    if header.len() > MAX_TABLE_HEADER_CHARS {
+        return None;
+    }
     let is_space_at = |row: &Vec<char>, index: usize| row.get(index).is_none_or(|c| *c == ' ');
     let mut starts = vec![0];
     starts.extend((1..header.len().saturating_sub(1)).filter_map(|index| {
@@ -791,6 +800,9 @@ fn recognise_table(lines: &[OutputLine]) -> Option<Insight> {
         .map(cells)
         .filter(|row| row.iter().any(|cell| !cell.is_empty()))
         .collect();
+    if rows.len() < 2 {
+        return None;
+    }
     // Prose lines can share a space column by chance; real table rows rarely leave most cells empty.
     if rows
         .iter()
@@ -802,7 +814,15 @@ fn recognise_table(lines: &[OutputLine]) -> Option<Insight> {
 }
 
 pub fn find_local_url(line: &str) -> Option<String> {
-    let captures = LOCAL_URL.captures(line)?;
+    let captures = LOCAL_URL.captures_iter(line).find(|captures| {
+        let Some(matched) = captures.get(0) else {
+            return false;
+        };
+        let after_host = captures.get(2).or(captures.get(1)).map_or(0, |m| m.end());
+        after_host != matched.end()
+            || !line[after_host..]
+                .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    })?;
     let matched = captures.get(0)?;
     let host = captures.get(1)?;
     if matches!(host.as_str(), "0.0.0.0" | "[::]") {
@@ -1446,6 +1466,29 @@ mod tests {
         assert_eq!(find_local_url("https://example.com"), None);
         assert_eq!(url_label("http://localhost:5173/"), "localhost:5173");
         assert_eq!(url_label("http://localhost:3000/a/b"), "localhost:3000");
+    }
+
+    #[test]
+    fn local_url_needs_a_host_boundary() {
+        assert_eq!(find_local_url("http://localhost.example.com/"), None);
+        assert_eq!(find_local_url("http://127.0.0.10:80"), None);
+        assert_eq!(
+            find_local_url("see http://localhost, ok"),
+            Some("http://localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn blank_rows_do_not_make_a_table() {
+        assert_eq!(insight("ls", "NAME  AGE\n\nweb   3d\n"), None);
+        let long_header = format!("{} B\nx y\nz w\n", "A".repeat(1_100));
+        assert_eq!(insight("ls", &long_header), None);
+    }
+
+    #[test]
+    fn git_paths_decode_control_escapes() {
+        let rows = status_rows("git status -s", "?? \"a\\tb\\r.txt\"\n");
+        assert_eq!(rows[0].1, "a\tb\r.txt");
     }
 
     #[test]
