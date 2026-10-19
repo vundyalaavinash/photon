@@ -19,7 +19,7 @@ SP1a gave Photon Warp's block terminal. SP1b makes a block *understand what its 
      - build errors: rustc/cargo (`error[...]` + `--> file:line:col`), `tsc` (`file(line,col): error`), and gcc/clang style (`file:line:col: error:`).
    - Recognition goes by **output format**, so wrappers like `npm test` and `make test` work. The command line is used only to build the re-run command. When the re-run command can't be built safely, that action is hidden.
 2. **Git blocks you can act on (C).**
-   - **`git status`, long and short formats.** Each changed file's row gets buttons at its right edge, shown on hover or when the block is selected:
+   - **`git status`, long and short formats.** Each changed file's row gets buttons at its right edge, shown while the block is selected:
      - **stage**, which runs `git add -- <path>`;
      - **diff**, which opens Zed's diff view for that file;
      - **discard**, for tracked files only. It asks to confirm in a modal, then runs `git restore -- <path>`.
@@ -35,8 +35,8 @@ SP1a gave Photon Warp's block terminal. SP1b makes a block *understand what its 
      Clicking the notification focuses that terminal and selects the block.
 4. **Tables & JSON (E).**
    - **JSON.** When a finished block's output (trimmed) parses as JSON, the **Open as JSON** action opens it in a new untitled editor buffer with the JSON language, so Zed's folding and syntax highlighting apply.
-   - **Tables.** When the output is column-aligned (`kubectl get`, `docker ps`, `ps aux`, `ls -l`-like), the **Open as table** action opens it in Zed's existing sortable, filterable table viewer (`crates/tabular_data_preview`) beside the terminal. **Copy as CSV** copies it as CSV.
-     - "Column-aligned" means a header plus ≥2 rows, where ≥2 columns separated by 2+ spaces line up on every row. The last column may contain spaces.
+   - **Tables.** When the output is column-aligned (`kubectl get`, `docker ps`, `ps aux`), the **Open as table** action opens it in Zed's existing sortable, filterable table viewer (`crates/tabular_data_preview`) beside the terminal. **Copy as CSV** copies it as CSV.
+     - "Column-aligned" means a header line plus ≥2 rows whose columns are separated by character positions that are blank on every line, giving ≥2 columns. The last column may contain spaces.
 5. **Everything is reachable without the mouse.** Every block action is also in the block's right-click menu and the command palette while a block is selected. Re-run failed, Open errors and Next/previous error get keybindings (Claude's call; the builder picks the keys, avoiding SP1a's).
 
 ## Non-goals (SP1b)
@@ -64,8 +64,8 @@ SP1a gave Photon Warp's block terminal. SP1b makes a block *understand what its 
 - **Recognisers are pure functions** in a new module of `crates/photon_blocks`: `fn recognise(command: &str, output: &str, exit_code: Option<i32>) -> Option<Insight>`. `Insight` is an enum with these variants:
   - `Tests {passed, failed, failures: Vec<Failure{name, location}>, rerun_failed: Option<String>}`
   - `Build {errors: Vec<Location>}`
-  - `GitStatus {files: Vec<FileRow{output_row, path, state}>}`
-  - `GitLog {hashes: Vec<(output_row, Range<col>, hash)>}`
+  - `GitStatus {files}`, each with its line, path and staged/unstaged/untracked state
+  - `GitLog {hashes}`, each with its line and column range, opened by cmd-click (SP1a's convention for links)
   - `Json`
   - `Table {columns, rows}`
 
@@ -76,7 +76,7 @@ SP1a gave Photon Warp's block terminal. SP1b makes a block *understand what its 
 - **Where results live:** an `insight` field next to each block in `TerminalBlocks` (SP1a's `crates/terminal/src/photon.rs`), dropped with the block.
 - **Rendering:** the existing block chrome (`crates/terminal_view/src/photon_blocks_view.rs`) draws:
   - the summary chip in the header row;
-  - a Warp-style action toolbar at the header's right edge, on hover or selection, replacing the metadata while visible;
+  - a Warp-style action toolbar at the header's right edge while the block is selected (a plain click selects, as in SP1a), replacing the metadata while visible. Claude's call: selection rather than hover, so overlay hitboxes never sit over the grid while you drag-select text;
   - per-row buttons for git status rows.
 
   No grid rows are added or hidden.
