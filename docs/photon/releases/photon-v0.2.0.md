@@ -7,11 +7,13 @@ The first Photon release: a fast, low-memory, terminal-first editor built on Zed
   - cmd-alt-c copies the output;
   - cmd-alt-shift-c copies both;
   - cmd-shift-r runs it again.
+- **Warp-style layout.** Output starts at the bottom right above the input, and each block has Warp's spacing and its folder and time line.
 - **Warp-style input** pinned to the bottom of the terminal. It's a real text box with mouse selection, undo and multi-line editing (shift-enter). ↑ walks your history.
 - **Folder and branch chips.** Click one to jump to a recent folder or switch git branch.
 - **Search and completion.** ctrl-R searches your history across projects, and Tab completes using your own zsh setup.
 - **Find and open.** cmd-F searches within a block. cmd-click a `path:line` in the output to open it beside the terminal; ctrl-cmd-t switches between the terminal and the editor.
 - **Full-screen programs work as usual.** That includes vim, htop, less, ssh, sudo and REPLs.
+- **Agent CLIs keep blocks working.** Devin, Claude Code and similar tools run as one block. Side panels opening, window resizes and `clear` keep blocks aligned.
 - **Escape hatch.** `"terminal": { "blocks": false }` brings back the classic terminal.
 
 ## Sub-project 0: lean baseline
