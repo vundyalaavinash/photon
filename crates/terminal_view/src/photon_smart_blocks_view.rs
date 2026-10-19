@@ -277,6 +277,22 @@ pub(crate) fn register_smart_block_actions(
                 smart_blocks.update(cx, |smart_blocks, cx| smart_blocks.stage_all(selected, cx));
             }
         }))
+        .on_action(cx.listener(|this, _: &OpenBlockUrl, _, cx| {
+            if let (Some(smart_blocks), Some(selected)) =
+                (this.enabled_smart_blocks(cx), this.selected_block)
+                && let Some(url) = smart_blocks.local_url(selected)
+            {
+                cx.open_url(url);
+            }
+        }))
+        .on_action(cx.listener(|this, _: &StopBlock, _, cx| {
+            let terminal = this.terminal.read(cx);
+            let running = active_blocks(terminal).and_then(|blocks| blocks.running());
+            if !this.read_only && running.is_some() && running == this.selected_block {
+                this.terminal
+                    .update(cx, |terminal, _| terminal.input(b"\x03".as_slice()));
+            }
+        }))
         .on_action(|_: &OpenInGitPanel, window, cx| {
             window.dispatch_action(Box::new(zed_actions::git_panel::ToggleFocus), cx)
         })
@@ -310,6 +326,17 @@ impl TerminalView {
             .and_then(|blocks| blocks.block(selected))
             .map(|block| block_toolbar(block, smart_blocks))
             .unwrap_or_default()
+    }
+
+    /// Brings the window and this terminal forward and selects the block a notification is about.
+    pub(crate) fn focus_block(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        window.activate_window();
+        self.focus_handle.focus(window, cx);
+        if active_blocks(self.terminal.read(cx)).is_some_and(|blocks| blocks.block(id).is_some()) {
+            self.selected_block = Some(id);
+            cx.emit(workspace::searchable::SearchEvent::MatchesInvalidated);
+            cx.notify();
+        }
     }
 
     fn rerun_failed_tests(&mut self, _: &RerunFailedTests, _: &mut Window, cx: &mut Context<Self>) {

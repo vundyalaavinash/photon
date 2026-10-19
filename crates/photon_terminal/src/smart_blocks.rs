@@ -1,16 +1,16 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context as _, Result};
 
 use collections::HashMap;
 use git_ui::{commit_view::CommitView, project_diff::ProjectDiff};
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, PromptLevel, Subscription, Task,
-    WeakEntity, Window,
+    App, AppContext as _, Context, Entity, EventEmitter, Global, PromptLevel, Subscription,
+    SystemNotification, SystemNotificationResponse, Task, WeakEntity, Window,
 };
 use photon_blocks::{
-    BlockEvent, BlockId, Insight, MAX_INSIGHT_BYTES, MAX_INSIGHT_LINES, RunDelta, StatusFile,
-    compare_runs, find_local_url, recognise,
+    BlockEvent, BlockId, Insight, MAX_INSIGHT_BYTES, MAX_INSIGHT_LINES, OutputLine, RunDelta,
+    StatusFile, compare_runs, find_local_url, format_duration, is_error_line, recognise,
 };
 use settings::Settings as _;
 use terminal::{Event, Terminal, terminal_settings::TerminalSettings};
@@ -22,8 +22,46 @@ use crate::chips::run_git;
 /// How many output lines of a running block are searched for a local URL.
 const URL_SCAN_LINE_LIMIT: usize = 2_000;
 
+/// At most one dev-server error notification per block in this time.
+const ERROR_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(60);
+const NOTIFICATION_TAG_PREFIX: &str = "photon-block-";
+const NOTIFIED_COMMAND_CHARS: usize = 60;
+const NOTIFIED_ERROR_CHARS: usize = 120;
+
 pub enum SmartBlocksEvent {
     Changed,
+    /// The user activated a notification about this block.
+    FocusBlock(BlockId),
+}
+
+/// The platform keeps a single notification response handler, so every `SmartBlocks` shares one
+/// that hands the response to the entity whose terminal posted the notification.
+#[derive(Default)]
+struct NotificationRouter {
+    listeners: Vec<WeakEntity<SmartBlocks>>,
+}
+
+impl Global for NotificationRouter {}
+
+fn route_notification_response(response: SystemNotificationResponse, cx: &mut App) {
+    let Some((terminal_id, block_id)) = response
+        .tag
+        .strip_prefix(NOTIFICATION_TAG_PREFIX)
+        .and_then(|rest| rest.split_once('-'))
+        .and_then(|(terminal, block)| Some((terminal.parse::<u64>().ok()?, block.parse().ok()?)))
+    else {
+        return;
+    };
+    let listeners = cx.global::<NotificationRouter>().listeners.clone();
+    for listener in listeners {
+        listener
+            .update(cx, |smart_blocks, cx| {
+                if smart_blocks.terminal.entity_id().as_u64() == terminal_id {
+                    cx.emit(SmartBlocksEvent::FocusBlock(BlockId(block_id)));
+                }
+            })
+            .ok();
+    }
 }
 
 #[derive(Default)]
@@ -73,7 +111,12 @@ pub struct SmartBlocks {
     urls: HashMap<BlockId, String>,
     scans: HashMap<BlockId, UrlScan>,
     tasks: HashMap<BlockId, Task<()>>,
+    window_active: bool,
+    error_scans: HashMap<BlockId, UrlScan>,
+    /// A block has an entry from its error notification until the interval has passed.
+    error_cooldowns: HashMap<BlockId, Task<()>>,
     _terminal_subscription: Subscription,
+    _activation_subscription: Subscription,
 }
 
 impl EventEmitter<SmartBlocksEvent> for SmartBlocks {}
@@ -82,10 +125,19 @@ impl SmartBlocks {
     pub fn new(
         terminal: Entity<Terminal>,
         workspace: WeakEntity<Workspace>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let _terminal_subscription = cx.subscribe(&terminal, Self::handle_terminal_event);
+        let _activation_subscription = cx.observe_window_activation(window, |this, window, _| {
+            this.window_active = window.is_window_active();
+        });
+        if !cx.has_global::<NotificationRouter>() {
+            cx.set_global(NotificationRouter::default());
+            cx.on_system_notification_response(route_notification_response);
+        }
+        let this = cx.weak_entity();
+        cx.global_mut::<NotificationRouter>().listeners.push(this);
         Self {
             terminal,
             workspace,
@@ -95,7 +147,11 @@ impl SmartBlocks {
             urls: HashMap::default(),
             scans: HashMap::default(),
             tasks: HashMap::default(),
+            window_active: window.is_window_active(),
+            error_scans: HashMap::default(),
+            error_cooldowns: HashMap::default(),
             _terminal_subscription,
+            _activation_subscription,
         }
     }
 
@@ -337,11 +393,17 @@ impl SmartBlocks {
         match event {
             Event::BlocksChanged(change) => {
                 self.forget_removed_blocks(cx);
-                if let (true, Some(BlockEvent::Finished(id))) = (enabled, change) {
-                    self.recognise_block(*id, cx);
+                if let Some(BlockEvent::Finished(id)) = change {
+                    self.notify_finished(*id, cx);
+                    if enabled {
+                        self.recognise_block(*id, cx);
+                    }
                 }
             }
-            Event::Wakeup if enabled => self.scan_running_block_for_url(cx),
+            Event::Wakeup if enabled => {
+                self.scan_running_block_for_url(cx);
+                self.scan_running_server_for_errors(cx);
+            }
             _ => {}
         }
     }
@@ -357,6 +419,8 @@ impl SmartBlocks {
         self.deltas.retain(|id, _| kept(id));
         self.urls.retain(|id, _| kept(id));
         self.scans.retain(|id, _| kept(id));
+        self.error_scans.retain(|id, _| kept(id));
+        self.error_cooldowns.retain(|id, _| kept(id));
         self.tasks.retain(|id, _| kept(id));
         self.row_marks.retain(|(id, _), _| kept(id));
         if self.insights.len() + self.urls.len() != before {
@@ -428,44 +492,145 @@ impl SmartBlocks {
     }
 
     fn scan_running_block_for_url(&mut self, cx: &mut Context<Self>) {
-        let terminal = self.terminal.read(cx);
-        let Some(id) = terminal.blocks().and_then(|blocks| blocks.running()) else {
+        let Some(id) = self
+            .terminal
+            .read(cx)
+            .blocks()
+            .and_then(|blocks| blocks.running())
+        else {
             return;
         };
         if self.urls.contains_key(&id) {
             return;
         }
-        let Some(output_line) = terminal
-            .blocks()
-            .and_then(|blocks| blocks.block(id))
-            .and_then(|block| block.output_line)
-        else {
-            return;
-        };
         let scan = self.scans.entry(id).or_default();
-        if scan.output_line != output_line {
-            scan.output_line = output_line;
-            scan.next_line = None;
-        }
-        let remaining = URL_SCAN_LINE_LIMIT.saturating_sub(scan.lines);
-        if remaining == 0 {
-            return;
-        }
-        let Some(lines) =
-            terminal.block_new_output_lines(id, scan.next_line, remaining, MAX_INSIGHT_BYTES)
-        else {
+        let Some(lines) = read_new_lines(self.terminal.read(cx), id, scan) else {
             return;
         };
-        let Some(last) = lines.last() else {
-            return;
-        };
-        scan.lines += lines.len();
-        scan.next_line = Some(last.absolute_line + 1);
         if let Some(url) = lines.iter().find_map(|line| find_local_url(&line.text)) {
             self.urls.insert(id, url);
             cx.emit(SmartBlocksEvent::Changed);
         }
     }
+
+    fn scan_running_server_for_errors(&mut self, cx: &mut Context<Self>) {
+        if self.window_active {
+            return;
+        }
+        let Some(id) = self
+            .terminal
+            .read(cx)
+            .blocks()
+            .and_then(|blocks| blocks.running())
+        else {
+            return;
+        };
+        if !self.urls.contains_key(&id) {
+            return;
+        }
+        let scan = self.error_scans.entry(id).or_default();
+        let Some(lines) = read_new_lines(self.terminal.read(cx), id, scan) else {
+            return;
+        };
+        if self.error_cooldowns.contains_key(&id) {
+            return;
+        }
+        let Some(error_line) = lines.iter().find(|line| is_error_line(&line.text)) else {
+            return;
+        };
+        let Some(command) = self
+            .terminal
+            .read(cx)
+            .blocks()
+            .and_then(|blocks| blocks.block(id))
+            .map(|block| block.command.clone())
+        else {
+            return;
+        };
+        cx.show_system_notification(SystemNotification {
+            tag: self.notification_tag(id),
+            title: format!("Error in {command}").into(),
+            body: error_line
+                .text
+                .trim()
+                .chars()
+                .take(NOTIFIED_ERROR_CHARS)
+                .collect::<String>()
+                .into(),
+            actions: Vec::new(),
+        });
+        let cooldown = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(ERROR_NOTIFICATION_INTERVAL)
+                .await;
+            this.update(cx, |this, _| this.error_cooldowns.remove(&id))
+                .log_err();
+        });
+        self.error_cooldowns.insert(id, cooldown);
+    }
+
+    fn notify_finished(&mut self, id: BlockId, cx: &mut Context<Self>) {
+        let threshold = TerminalSettings::get_global(cx).notify_after_seconds;
+        if threshold == 0 || self.window_active {
+            return;
+        }
+        let Some(block) = self
+            .terminal
+            .read(cx)
+            .blocks()
+            .and_then(|blocks| blocks.block(id))
+        else {
+            return;
+        };
+        let (Some(duration), Some(exit_code)) = (block.duration, block.exit_code) else {
+            return;
+        };
+        if duration < Duration::from_secs(threshold) {
+            return;
+        }
+        let mark = if exit_code == 0 { "✓" } else { "✗" };
+        let command = if block.command.chars().count() > NOTIFIED_COMMAND_CHARS {
+            let cut: String = block.command.chars().take(NOTIFIED_COMMAND_CHARS).collect();
+            format!("{cut}…")
+        } else {
+            block.command.clone()
+        };
+        let notification = SystemNotification {
+            tag: self.notification_tag(id),
+            title: format!("{mark} {command}").into(),
+            body: format!("{} · exit {exit_code}", format_duration(duration)).into(),
+            actions: Vec::new(),
+        };
+        cx.show_system_notification(notification);
+    }
+
+    fn notification_tag(&self, id: BlockId) -> gpui::SharedString {
+        format!(
+            "{NOTIFICATION_TAG_PREFIX}{}-{}",
+            self.terminal.entity_id().as_u64(),
+            id.0
+        )
+        .into()
+    }
+}
+
+/// Reads the complete lines of a running block that `scan` has not seen yet, within its budget.
+fn read_new_lines(terminal: &Terminal, id: BlockId, scan: &mut UrlScan) -> Option<Vec<OutputLine>> {
+    let output_line = terminal.blocks()?.block(id)?.output_line?;
+    if scan.output_line != output_line {
+        scan.output_line = output_line;
+        scan.next_line = None;
+    }
+    let remaining = URL_SCAN_LINE_LIMIT.saturating_sub(scan.lines);
+    if remaining == 0 {
+        return None;
+    }
+    let lines =
+        terminal.block_new_output_lines(id, scan.next_line, remaining, MAX_INSIGHT_BYTES)?;
+    let last = lines.last()?;
+    scan.lines += lines.len();
+    scan.next_line = Some(last.absolute_line + 1);
+    Some(lines)
 }
 
 #[cfg(test)]
@@ -497,6 +662,7 @@ mod tests {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
+            cx.set_app_identity("photon", "Photon");
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.terminal.get_or_insert_default().smart_blocks = Some(smart_blocks);
@@ -517,6 +683,7 @@ mod tests {
             terminal
         });
         let cx = cx.add_empty_window();
+        cx.deactivate_window();
         let smart_blocks = cx.update(|window, cx| {
             cx.new(|cx| SmartBlocks::new(terminal.clone(), WeakEntity::new_invalid(), window, cx))
         });
@@ -714,6 +881,153 @@ mod tests {
         );
         assert!(block_ids(&terminal, cx).is_empty());
         smart.read_with(cx, |smart, _| assert!(smart.insights.is_empty()));
+    }
+
+    mod notifications {
+        use super::*;
+        use std::time::Duration;
+
+        fn notify_after(seconds: u64, cx: &mut VisualTestContext) {
+            cx.update(|_, cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings
+                            .terminal
+                            .get_or_insert_default()
+                            .notify_after_seconds = Some(seconds);
+                    });
+                });
+            });
+        }
+
+        fn run_for_over_a_second(
+            terminal: &Entity<Terminal>,
+            cx: &mut VisualTestContext,
+        ) -> BlockId {
+            feed(terminal, &format!("{CWD}{START_SERVER}"), cx);
+            // Block durations are measured with the real clock.
+            std::thread::sleep(Duration::from_millis(1100));
+            feed(terminal, "\x1b]133;D;0\x07", cx);
+            block_ids(terminal, cx)[0]
+        }
+
+        #[gpui::test]
+        async fn long_command_notifies_when_inactive(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, true);
+            notify_after(1, cx);
+            let id = run_for_over_a_second(&terminal, cx);
+            let shown = cx.shown_system_notifications();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].title, "✓ serve");
+            assert!(shown[0].body.ends_with(" · exit 0"), "{}", shown[0].body);
+            assert_eq!(
+                shown[0].tag,
+                format!("photon-block-{}-{}", terminal.entity_id().as_u64(), id.0)
+            );
+        }
+
+        #[gpui::test]
+        async fn failed_command_title_is_cut_at_sixty_characters(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, true);
+            notify_after(1, cx);
+            let long = "x".repeat(70);
+            feed(
+                &terminal,
+                &format!(
+                    "{CWD}\x1b]133;A\x07$ \x1b]133;B\x07{long}\r\n\x1b]633;E;{long}\x07\x1b]133;C\x07"
+                ),
+                cx,
+            );
+            std::thread::sleep(Duration::from_millis(1100));
+            feed(&terminal, "\x1b]133;D;2\x07", cx);
+            let shown = cx.shown_system_notifications();
+            assert_eq!(shown[0].title, format!("✗ {}…", "x".repeat(60)));
+            assert!(shown[0].body.ends_with(" · exit 2"));
+        }
+
+        #[gpui::test]
+        async fn short_or_active_does_not_notify(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, true);
+            notify_after(1, cx);
+            feed(&terminal, &command("ls", ""), cx);
+            assert!(cx.shown_system_notifications().is_empty());
+
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            cx.update(|window, _| assert!(window.is_window_active()));
+            feed(&terminal, prompt(), cx);
+            run_for_over_a_second(&terminal, cx);
+            assert!(cx.shown_system_notifications().is_empty());
+        }
+
+        #[gpui::test]
+        async fn notify_setting_zero_disables(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, true);
+            notify_after(0, cx);
+            run_for_over_a_second(&terminal, cx);
+            assert!(cx.shown_system_notifications().is_empty());
+        }
+
+        #[gpui::test]
+        async fn server_error_notifies_once_per_minute(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, true);
+            feed(
+                &terminal,
+                &format!("{CWD}{START_SERVER}Local: http://localhost:3000\r\n"),
+                cx,
+            );
+            assert!(cx.shown_system_notifications().is_empty());
+            feed(&terminal, "  error: boom\r\n", cx);
+            let shown = cx.shown_system_notifications();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].title, "Error in serve");
+            assert_eq!(shown[0].body, "error: boom");
+
+            feed(&terminal, "error: again\r\n", cx);
+            assert_eq!(cx.shown_system_notifications().len(), 1);
+
+            cx.executor().advance_clock(Duration::from_secs(61));
+            cx.run_until_parked();
+            feed(&terminal, "error: later\r\n", cx);
+            let shown = cx.shown_system_notifications();
+            assert_eq!(shown.len(), 2);
+            assert_eq!(shown[1].body, "error: later");
+        }
+
+        #[gpui::test]
+        async fn server_error_while_active_is_silent(cx: &mut TestAppContext) {
+            let (terminal, _smart, cx) = setup(cx, true);
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            feed(
+                &terminal,
+                &format!("{CWD}{START_SERVER}Local: http://localhost:3000\r\nerror: boom\r\n"),
+                cx,
+            );
+            assert!(cx.shown_system_notifications().is_empty());
+        }
+
+        #[gpui::test]
+        async fn response_asks_the_view_to_focus_the_block(cx: &mut TestAppContext) {
+            let (terminal, smart, cx) = setup(cx, true);
+            let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let _subscription = cx.update(|_, cx| {
+                let events = events.clone();
+                cx.subscribe(&smart, move |_, event: &SmartBlocksEvent, _| {
+                    if let SmartBlocksEvent::FocusBlock(id) = event {
+                        events.borrow_mut().push(*id);
+                    }
+                })
+            });
+            feed(&terminal, &command("ls", ""), cx);
+            let id = block_ids(&terminal, cx)[0];
+            cx.simulate_system_notification_response(gpui::SystemNotificationResponse {
+                tag: format!("photon-block-{}-{}", terminal.entity_id().as_u64(), id.0).into(),
+                action_id: None,
+            });
+            cx.run_until_parked();
+            assert_eq!(*events.borrow(), [id]);
+        }
     }
 
     mod git_actions {

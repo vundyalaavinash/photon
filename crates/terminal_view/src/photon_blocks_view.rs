@@ -1,11 +1,13 @@
-use std::{ops::Range, time::Duration};
+use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, Focusable as _, FontWeight, Hsla, KeyDownEvent,
     Pixels, Point, SharedString, Stateful, Task, TextRun, TextStyle, Window, actions, fill, point,
     px, rgb, rgba, size,
 };
-use photon_blocks::{Block, BlockId, BlockList, Phase, VisibleBlock, visible_blocks};
+use photon_blocks::{
+    Block, BlockId, BlockList, Phase, VisibleBlock, format_duration, visible_blocks,
+};
 use photon_terminal::{BlockInput, SmartBlocks};
 use terminal::{BlockPart, InputTarget, Modes, Terminal, TerminalBounds};
 use ui::{ContextMenu, prelude::*};
@@ -45,17 +47,6 @@ const METADATA: u32 = 0x8E8E8E;
 const EDGE_WIDTH: Pixels = px(3.);
 const CHIP_BACKGROUND_OPACITY: f32 = 0.15;
 const CHIP_CORNER_RADIUS: Pixels = px(3.);
-
-pub fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds >= 3600 {
-        format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
-    } else if seconds >= 60 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{:.1}s", duration.as_secs_f64())
-    }
-}
 
 /// Full-screen apps and terminals that fell back look exactly like classic terminals.
 pub(crate) fn active_blocks(terminal: &Terminal) -> Option<&BlockList> {
@@ -552,9 +543,15 @@ impl TerminalView {
         let terminal = terminal.clone();
         let smart_blocks =
             cx.new(|cx| photon_terminal::SmartBlocks::new(terminal, workspace, window, cx));
-        let subscription = cx.subscribe(
+        let subscription = cx.subscribe_in(
             &smart_blocks,
-            |_, _, _: &photon_terminal::SmartBlocksEvent, cx| cx.notify(),
+            window,
+            |this, _, event: &photon_terminal::SmartBlocksEvent, window, cx| match event {
+                photon_terminal::SmartBlocksEvent::Changed => cx.notify(),
+                photon_terminal::SmartBlocksEvent::FocusBlock(id) => {
+                    this.focus_block(*id, window, cx)
+                }
+            },
         );
         Some((smart_blocks, subscription))
     }

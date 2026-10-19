@@ -4751,7 +4751,7 @@ mod tests {
 
     #[test]
     fn block_duration_format() {
-        let format = |millis| photon_blocks_view::format_duration(Duration::from_millis(millis));
+        let format = |millis| photon_blocks::format_duration(Duration::from_millis(millis));
         assert_eq!(format(400), "0.4s");
         assert_eq!(format(12_800), "12.8s");
         assert_eq!(format(252_000), "4m 12s");
@@ -4786,6 +4786,51 @@ mod tests {
             take_pty_writes(&terminal, &mut cx).concat(),
             format!("\x15\x1b[200~{expected}\x1b[201~\r").into_bytes()
         );
+    }
+
+    #[gpui::test]
+    async fn dev_server_chip_and_stop_sends_ctrl_c(cx: &mut TestAppContext) {
+        use crate::photon_smart_blocks_view::StopBlock;
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(
+            &terminal,
+            b"serve\r\n\x1b]633;E;serve\x07\x1b]133;C\x07Local: http://localhost:5173/\r\n",
+            &mut cx,
+        );
+        let ids = block_ids(&terminal, &mut cx);
+        let running = *ids.last().expect("running block");
+        terminal_view.read_with(&cx, |view, cx| {
+            let smart_blocks = view.enabled_smart_blocks(cx).expect("smart blocks");
+            assert_eq!(
+                smart_blocks.local_url(running),
+                Some("http://localhost:5173/")
+            );
+        });
+
+        cx.simulate_keystrokes("cmd-up");
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(selected(&terminal_view, &mut cx), Some(ids[ids.len() - 2]));
+        take_pty_writes(&terminal, &mut cx);
+        cx.dispatch_action(StopBlock);
+        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
+
+        cx.simulate_keystrokes("cmd-down");
+        assert_eq!(selected(&terminal_view, &mut cx), Some(running));
+        cx.dispatch_action(StopBlock);
+        assert_eq!(take_pty_writes(&terminal, &mut cx).concat(), [3]);
+    }
+
+    #[gpui::test]
+    async fn notification_response_selects_and_focuses_block(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        let id = block_ids(&terminal, &mut cx)[0];
+        assert_eq!(selected(&terminal_view, &mut cx), None);
+        cx.simulate_system_notification_response(gpui::SystemNotificationResponse {
+            tag: format!("photon-block-{}-{}", terminal.entity_id().as_u64(), id.0).into(),
+            action_id: None,
+        });
+        cx.run_until_parked();
+        assert_eq!(selected(&terminal_view, &mut cx), Some(id));
     }
 
     #[gpui::test]
