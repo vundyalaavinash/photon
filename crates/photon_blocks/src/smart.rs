@@ -370,7 +370,9 @@ fn recognise_go(lines: &[OutputLine]) -> Option<TestRun> {
     })
 }
 
-const UNSAFE_CHARACTERS: &[char] = &['|', ';', '&', '<', '>', '$', '`', '(', ')', '\n', '\'', '"'];
+const UNSAFE_CHARACTERS: &[char] = &[
+    '|', ';', '&', '<', '>', '$', '`', '(', ')', '\n', '\'', '"', '#', '\\',
+];
 
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -381,6 +383,25 @@ fn has_sequence(tokens: &[&str], sequence: &[&str]) -> bool {
         .windows(sequence.len())
         .any(|window| window == sequence)
 }
+
+fn known_flags<'a>(tokens: &[&'a str], booleans: &[&str]) -> Option<Vec<&'a str>> {
+    let mut kept = Vec::new();
+    for token in tokens
+        .iter()
+        .copied()
+        .filter(|token| token.starts_with('-'))
+    {
+        if booleans.contains(&token) || token.contains('=') {
+            kept.push(token);
+        } else {
+            return None;
+        }
+    }
+    Some(kept)
+}
+
+const PYTEST_FLAGS: &[&str] = &["-v", "-vv", "-q", "-x", "-s", "-l", "--lf", "--ff"];
+const GO_FLAGS: &[&str] = &["-v", "-race", "-short", "-failfast", "-cover", "-json"];
 
 fn flags<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
     tokens
@@ -424,9 +445,11 @@ pub fn rerun_failed_command(command: &str, run: &TestRun) -> Option<String> {
         }
         TestTool::Nextest => {
             if !has_sequence(before_separator, &["cargo", "nextest", "run"])
-                || tokens
-                    .iter()
-                    .any(|token| token.starts_with("-E") || token.starts_with("--filterset"))
+                || tokens.iter().any(|token| {
+                    token.starts_with("-E")
+                        || token.starts_with("--filterset")
+                        || token.starts_with("--filter-expr")
+                })
             {
                 return None;
             }
@@ -447,7 +470,11 @@ pub fn rerun_failed_command(command: &str, run: &TestRun) -> Option<String> {
                 .position(|token| *token == "pytest" || token.ends_with("/pytest"))?;
             let mut parts: Vec<String> =
                 tokens[..=position].iter().map(|t| t.to_string()).collect();
-            parts.extend(flags(&tokens[position + 1..]).into_iter().map(String::from));
+            parts.extend(
+                known_flags(&tokens[position + 1..], PYTEST_FLAGS)?
+                    .into_iter()
+                    .map(String::from),
+            );
             parts.extend(quoted_names());
             Some(parts.join(" "))
         }
@@ -458,14 +485,14 @@ pub fn rerun_failed_command(command: &str, run: &TestRun) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("|");
             let filter = format!("-t {}", shell_quote(&pattern));
-            if tokens
+            if matches!(tokens.first(), Some(&("npm" | "pnpm" | "yarn" | "bun"))) {
+                let dashes = if separator.is_some() { "" } else { "-- " };
+                Some(format!("{command} {dashes}{filter}"))
+            } else if tokens
                 .iter()
                 .any(|token| *token == "jest" || *token == "vitest")
             {
                 Some(format!("{command} {filter}"))
-            } else if matches!(tokens.first(), Some(&("npm" | "pnpm" | "yarn" | "bun"))) {
-                let dashes = if separator.is_some() { "" } else { "-- " };
-                Some(format!("{command} {dashes}{filter}"))
             } else {
                 None
             }
@@ -488,7 +515,7 @@ pub fn rerun_failed_command(command: &str, run: &TestRun) -> Option<String> {
                 .join("|");
             let mut parts: Vec<String> = vec!["go test".into()];
             parts.extend(
-                flags(tokens.get(2..).unwrap_or_default())
+                known_flags(tokens.get(2..).unwrap_or_default(), GO_FLAGS)?
                     .into_iter()
                     .map(String::from),
             );
@@ -736,7 +763,7 @@ mod tests {
         let run = self::run(TestTool::Jest, &["sum > a.b", "x › y"]);
         assert_eq!(
             rerun_failed_command("pnpm vitest run", &run).as_deref(),
-            Some("pnpm vitest run -t 'sum a\\.b|x y'")
+            Some("pnpm vitest run -- -t 'sum a\\.b|x y'")
         );
         assert_eq!(rerun_failed_command("make check", &run), None);
     }
@@ -802,5 +829,62 @@ mod tests {
                 fixed: vec!["a".to_string(), "b".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn rerun_refuses_flags_with_unknown_values() {
+        let pytest = run(TestTool::Pytest, &["t.py::a"]);
+        assert_eq!(
+            rerun_failed_command("pytest -k smoke tests/", &pytest),
+            None
+        );
+        assert_eq!(
+            rerun_failed_command("pytest -v --tb=short", &pytest).as_deref(),
+            Some("pytest -v --tb=short 't.py::a'")
+        );
+        let mut go = run(TestTool::Go, &["TestA"]);
+        go.packages = vec!["p".to_string()];
+        assert_eq!(rerun_failed_command("go test -count 1 ./...", &go), None);
+        assert_eq!(rerun_failed_command("go test ./... -args -x", &go), None);
+        assert_eq!(
+            rerun_failed_command("go test -count=1 -v ./...", &go).as_deref(),
+            Some("go test -count=1 -v -run '^(TestA)$' 'p'")
+        );
+    }
+
+    #[test]
+    fn rerun_nextest_filters_and_positionals() {
+        let nextest = run(TestTool::Nextest, &["a"]);
+        assert_eq!(
+            rerun_failed_command("cargo nextest run --filter-expr 'x'", &nextest),
+            None
+        );
+        assert_eq!(
+            rerun_failed_command("cargo nextest run --filter-expr=test(x)", &nextest),
+            None
+        );
+        assert_eq!(
+            rerun_failed_command("cargo nextest run foo", &nextest).as_deref(),
+            Some("cargo nextest run foo -E 'test(=a)'")
+        );
+    }
+
+    #[test]
+    fn rerun_package_manager_commands_always_use_dashes() {
+        let jest = run(TestTool::Jest, &["a › b"]);
+        assert_eq!(
+            rerun_failed_command("npm run jest", &jest).as_deref(),
+            Some("npm run jest -- -t 'a b'")
+        );
+        assert_eq!(
+            rerun_failed_command("yarn jest", &jest).as_deref(),
+            Some("yarn jest -- -t 'a b'")
+        );
+        assert_eq!(
+            rerun_failed_command("npm test -- --watch", &jest).as_deref(),
+            Some("npm test -- --watch -t 'a b'")
+        );
+        assert_eq!(rerun_failed_command("npm test # x", &jest), None);
+        assert_eq!(rerun_failed_command("npm test \\x", &jest), None);
     }
 }
