@@ -59,52 +59,58 @@ pub fn signature_text(snapshot: &BufferSnapshot, item: &OutlineItem<Point>) -> S
 
 const MODIFIER_WORDS: [&str; 4] = ["async", "const", "unsafe", "default"];
 
-fn strip_leading_modifiers(mut text: &str) -> &str {
-    loop {
-        text = text.trim_start();
-        let rest = if let Some(rest) = text.strip_prefix("pub") {
-            let rest = rest.trim_start();
-            if rest.starts_with('(') {
-                rest.split_once(')').map_or(rest, |(_, after)| after)
-            } else {
-                rest
-            }
-        } else if let Some(rest) = text.strip_prefix("extern") {
-            let rest = rest.trim_start();
-            if rest.starts_with('"') {
-                rest.get(1..)
-                    .and_then(|quoted| quoted.split_once('"'))
-                    .map_or(rest, |(_, after)| after)
-            } else {
-                rest
-            }
-        } else if let Some(rest) = MODIFIER_WORDS
-            .iter()
-            .find_map(|word| text.strip_prefix(word))
-        {
-            rest
-        } else {
-            return text;
-        };
-        // A prefix match inside an identifier (`constant`, `public`) is not a modifier.
-        if rest.starts_with(|character: char| character.is_alphanumeric() || character == '_') {
-            return text;
-        }
-        text = rest;
+// A prefix match inside an identifier (`constant`, `public`) is not a keyword.
+fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(keyword)?;
+    if rest.starts_with(|character: char| character.is_alphanumeric() || character == '_') {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+fn strip_visibility(text: &str) -> &str {
+    let text = text.trim_start();
+    match strip_keyword(text, "pub") {
+        Some(rest) if rest.starts_with('(') => rest
+            .split_once(')')
+            .map_or(rest, |(_, after)| after.trim_start()),
+        Some(rest) => rest,
+        None => text,
     }
 }
 
-/// Signature with modifiers, whitespace and trailing commas removed, or `None` when the item is
-/// not callable: callable means it has a body, or is a bodiless `fn` declaration.
+/// Whether the text, once modifiers are skipped, is a `fn` item. Modifiers stay part of the
+/// compared signature because they change how callers call the function.
+fn is_function(text: &str) -> bool {
+    let mut text = text.trim_start();
+    loop {
+        let next = MODIFIER_WORDS
+            .iter()
+            .find_map(|word| strip_keyword(text, word))
+            .or_else(|| {
+                let rest = strip_keyword(text, "extern")?;
+                match rest
+                    .strip_prefix('"')
+                    .and_then(|quoted| quoted.split_once('"'))
+                {
+                    Some((_, after)) => Some(after.trim_start()),
+                    None => Some(rest),
+                }
+            });
+        match next {
+            Some(rest) => text = rest,
+            None => return strip_keyword(text, "fn").is_some(),
+        }
+    }
+}
+
+/// Signature with visibility, whitespace and trailing commas removed, or `None` when the item
+/// is not a function.
+// ponytail: only Rust-style `fn` items count as functions; other languages need their own keyword.
 fn callable_signature(snapshot: &BufferSnapshot, item: &OutlineItem<Point>) -> Option<String> {
     let collapsed = signature_text(snapshot, item);
-    let stripped = strip_leading_modifiers(&collapsed);
-    // ponytail: only Rust-style `fn` declarations count as bodiless callables; other languages
-    // with bodiless signatures need their own keyword.
-    let is_declaration = stripped
-        .strip_prefix("fn")
-        .is_some_and(|rest| rest.starts_with(|character: char| character.is_whitespace()));
-    if item.body_range.is_none() && !is_declaration {
+    let stripped = strip_visibility(&collapsed);
+    if !is_function(stripped) {
         return None;
     }
     let compact: Vec<char> = stripped
@@ -492,9 +498,54 @@ fn wide(
 
     #[gpui::test]
     async fn visibility_change_alone_is_not_a_signature_change(cx: &mut TestAppContext) {
-        let head = BASE.replace("fn top(", "pub(crate) async fn top(");
+        let head = BASE.replace("fn top(", "pub(crate) fn top(");
         let (found, _) = functions(analyse(cx, BASE, &head, true).await);
         assert_eq!(found, vec![("top".into(), FunctionChange::BodyOnly)]);
+    }
+
+    #[gpui::test]
+    async fn adding_async_is_a_signature_change(cx: &mut TestAppContext) {
+        let head = BASE.replace("fn top(", "async fn top(");
+        let (found, _) = functions(analyse(cx, BASE, &head, true).await);
+        assert_eq!(found, vec![("top".into(), FunctionChange::Signature)]);
+    }
+
+    const WITH_CONST: &str = "\
+struct Foo;
+
+impl Foo {
+    const LIMIT: u32 = 1;
+
+    fn bar(&self) {}
+
+    fn baz(&self) {}
+}
+
+trait Speak {
+    fn speak(&self, loud: bool);
+}
+";
+
+    #[gpui::test]
+    async fn associated_const_edit_is_file_level(cx: &mut TestAppContext) {
+        let head = WITH_CONST.replace("LIMIT: u32 = 1", "LIMIT: u32 = 2");
+        let (found, rows) = functions(analyse(cx, WITH_CONST, &head, true).await);
+        assert_eq!(found, vec![]);
+        assert_eq!(rows, vec![3..4]);
+    }
+
+    #[gpui::test]
+    async fn deleting_a_method_does_not_list_the_impl(cx: &mut TestAppContext) {
+        let head = WITH_CONST.replace("    fn baz(&self) {}\n", "");
+        let (found, _) = functions(analyse(cx, WITH_CONST, &head, true).await);
+        assert_eq!(found, vec![]);
+    }
+
+    #[gpui::test]
+    async fn trait_method_signature_change_is_signature(cx: &mut TestAppContext) {
+        let head = WITH_CONST.replace("loud: bool", "loud: u8");
+        let (found, _) = functions(analyse(cx, WITH_CONST, &head, true).await);
+        assert_eq!(found, vec![("speak".into(), FunctionChange::Signature)]);
     }
 
     #[gpui::test]
