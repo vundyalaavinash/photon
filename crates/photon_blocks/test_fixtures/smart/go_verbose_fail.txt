@@ -1,0 +1,10 @@
+=== RUN   TestOk
+--- PASS: TestOk (0.00s)
+=== RUN   TestBad
+=== RUN   TestBad/sub
+    a_test.go:5: boom
+--- FAIL: TestBad (0.00s)
+    --- FAIL: TestBad/sub (0.00s)
+FAIL
+FAIL	demo	0.199s
+FAIL

@@ -1,0 +1,40 @@
+# hand-written
+   Compiling cli v0.1.0 (/work/crates/cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.21s
+     Running unittests src/main.rs (target/debug/deps/cli-1a2b3c)
+
+running 30 tests
+test tests::parses_flags ... ok
+test tests::rejects_empty ... FAILED
+
+failures:
+
+---- tests::rejects_empty stdout ----
+
+thread 'tests::rejects_empty' (101) panicked at crates/cli/src/main.rs:356:9:
+assertion failed: parse("").is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::rejects_empty
+
+test result: FAILED. 29 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/core-4d5e6f)
+
+running 13 tests
+test tests::round_trip ... ok
+test tests::handles_unicode ... FAILED
+
+failures:
+
+---- tests::handles_unicode stdout ----
+
+thread 'tests::handles_unicode' (102) panicked at crates/core/src/lib.rs:88:13:
+left != right
+
+failures:
+    tests::handles_unicode
+
+test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -13457,6 +13457,8 @@ dependencies = [
  "anyhow",
  "log",
  "percent-encoding",
+ "regex",
+ "serde_json",
  "tempfile",
 ]
 
