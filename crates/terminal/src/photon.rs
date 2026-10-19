@@ -277,12 +277,36 @@ impl Terminal {
         max_lines: usize,
         max_bytes: usize,
     ) -> Option<Vec<photon_blocks::OutputLine>> {
-        self.block_output_lines_from(id, None, max_lines, max_bytes)
+        self.block_output_reader(id, max_lines, max_bytes)
+            .and_then(|read| read())
     }
 
-    /// Like `block_output_lines`, but only the logical lines that start on a row at or after
-    /// `from_line`, so a long-running block's new output can be read without rereading the old.
-    pub fn block_output_lines_from(
+    /// The same read as `block_output_lines`, deferred: the closure walks the grid when called,
+    /// so a background task can do the copying instead of the UI thread. It reads the lines the
+    /// block had when this was called; the caller must check the block still exists afterwards.
+    pub fn block_output_reader(
+        &self,
+        id: BlockId,
+        max_lines: usize,
+        max_bytes: usize,
+    ) -> Option<impl FnOnce() -> Option<Vec<photon_blocks::OutputLine>> + Send + use<>> {
+        let read = OutputRead {
+            output_line: self.blocks()?.block(id)?.output_line?,
+            end_line: self.blocks()?.block(id)?.end_line,
+            from_line: None,
+            completed_only: false,
+            truncate: false,
+            max_lines,
+            max_bytes,
+        };
+        let term = self.term.clone();
+        Some(move || read_output_lines(&term.lock(), &read))
+    }
+
+    /// Complete logical lines of a running block that start at or after `from_line`, at most
+    /// `max_lines` of them (the rest are left unread). The line holding the cursor is still
+    /// being printed, so it is left for a later read.
+    pub fn block_new_output_lines(
         &self,
         id: BlockId,
         from_line: Option<i64>,
@@ -290,69 +314,16 @@ impl Terminal {
         max_bytes: usize,
     ) -> Option<Vec<photon_blocks::OutputLine>> {
         let block = self.blocks()?.block(id)?;
-        let term = self.term.lock();
-        if is_alt_screen(&term) {
-            return None;
-        }
-        let origin = term.absolute_line(Line(0));
-        let grid = term.grid();
-        let output_start = block.output_line?.max(from_line.unwrap_or(i64::MIN));
-        let mut first = Line(i32::try_from(output_start - origin).ok()?).max(grid.topmost_line());
-        let last = match block.end_line {
-            Some(end) => Line(i32::try_from(end - origin - 1).ok()?),
-            None => grid.cursor.point.line,
-        }
-        .min(grid.bottommost_line());
-        // Start at a logical line, not in the middle of a wrapped one.
-        while from_line.is_some() && first > grid.topmost_line() && first <= last {
-            let above: Line = first - 1;
-            if !grid[above][grid.last_column()]
-                .flags
-                .contains(Flags::WRAPLINE)
-            {
-                break;
-            }
-            first += 1;
-        }
-
-        let last_column = grid.last_column();
-        let mut lines: Vec<photon_blocks::OutputLine> = Vec::new();
-        let mut bytes = 0;
-        let mut continuing = false;
-        let mut line = first;
-        while line <= last {
-            let row = &grid[line];
-            let text: String = (0..grid.columns())
-                .map(|column| &row[alacritty_terminal::index::Column(column)])
-                .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                .map(|cell| cell.c)
-                .collect();
-            let wraps = row[last_column].flags.contains(Flags::WRAPLINE);
-            match lines.last_mut().filter(|_| continuing) {
-                Some(open) => open.text.push_str(&text),
-                None => lines.push(photon_blocks::OutputLine {
-                    absolute_line: term.absolute_line(line),
-                    text,
-                }),
-            }
-            continuing = wraps;
-            if !wraps && let Some(done) = lines.last_mut() {
-                done.text.truncate(done.text.trim_end().len());
-                bytes += done.text.len();
-                if lines.len() > max_lines || bytes > max_bytes {
-                    return None;
-                }
-            }
-            line += 1;
-        }
-        // A wrapped row left open at the end of the range still needs its trailing spaces trimmed.
-        if let Some(open) = lines.last_mut().filter(|_| continuing) {
-            open.text.truncate(open.text.trim_end().len());
-        }
-        while lines.last().is_some_and(|last| last.text.is_empty()) {
-            lines.pop();
-        }
-        Some(lines)
+        let read = OutputRead {
+            output_line: block.output_line?,
+            end_line: block.end_line,
+            from_line,
+            completed_only: true,
+            truncate: true,
+            max_lines,
+            max_bytes,
+        };
+        read_output_lines(&self.term.lock(), &read)
     }
 
     /// Grid lines from the block's header through its last output line (to the cursor while
@@ -398,6 +369,98 @@ impl Terminal {
     pub fn process_wakeup_for_test(&mut self, cx: &mut Context<Self>) {
         self.process_event(crate::TerminalBackendEvent::Wakeup, cx);
     }
+}
+
+struct OutputRead {
+    output_line: i64,
+    end_line: Option<i64>,
+    from_line: Option<i64>,
+    /// Stop before the logical line holding the cursor.
+    completed_only: bool,
+    /// Stop at the limits with what was read, instead of returning None.
+    truncate: bool,
+    max_lines: usize,
+    max_bytes: usize,
+}
+
+fn read_output_lines(
+    term: &AlacrittyTerm,
+    read: &OutputRead,
+) -> Option<Vec<photon_blocks::OutputLine>> {
+    if is_alt_screen(term) {
+        return None;
+    }
+    let origin = term.absolute_line(Line(0));
+    let grid = term.grid();
+    let last_column = grid.last_column();
+    let output_start = read.output_line.max(read.from_line.unwrap_or(i64::MIN));
+    let mut first = Line(i32::try_from(output_start - origin).ok()?).max(grid.topmost_line());
+    let mut last = match read.end_line {
+        Some(end) => Line(i32::try_from(end - origin - 1).ok()?),
+        None => grid.cursor.point.line,
+    }
+    .min(grid.bottommost_line());
+    if read.completed_only {
+        let mut cursor_line_start = grid.cursor.point.line;
+        while cursor_line_start > grid.topmost_line() {
+            let above: Line = cursor_line_start - 1;
+            if !grid[above][last_column].flags.contains(Flags::WRAPLINE) {
+                break;
+            }
+            cursor_line_start = above;
+        }
+        last = last.min(cursor_line_start - 1);
+    }
+    // Start at a logical line, not in the middle of a wrapped one.
+    while read.from_line.is_some() && first > grid.topmost_line() && first <= last {
+        let above: Line = first - 1;
+        if !grid[above][last_column].flags.contains(Flags::WRAPLINE) {
+            break;
+        }
+        first += 1;
+    }
+
+    let mut lines: Vec<photon_blocks::OutputLine> = Vec::new();
+    let mut bytes = 0;
+    let mut continuing = false;
+    let mut line = first;
+    while line <= last {
+        let row = &grid[line];
+        let text: String = (0..grid.columns())
+            .map(|column| &row[alacritty_terminal::index::Column(column)])
+            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+            .map(|cell| cell.c)
+            .collect();
+        let wraps = row[last_column].flags.contains(Flags::WRAPLINE);
+        match lines.last_mut().filter(|_| continuing) {
+            Some(open) => open.text.push_str(&text),
+            None => lines.push(photon_blocks::OutputLine {
+                absolute_line: term.absolute_line(line),
+                text,
+            }),
+        }
+        continuing = wraps;
+        if !wraps && let Some(done) = lines.last_mut() {
+            done.text.truncate(done.text.trim_end().len());
+            bytes += done.text.len();
+            if lines.len() > read.max_lines || bytes > read.max_bytes {
+                if !read.truncate {
+                    return None;
+                }
+                lines.pop();
+                break;
+            }
+        }
+        line += 1;
+    }
+    // A wrapped row left open at the end of the range still needs its trailing spaces trimmed.
+    if let Some(open) = lines.last_mut().filter(|_| continuing) {
+        open.text.truncate(open.text.trim_end().len());
+    }
+    while lines.last().is_some_and(|last| last.text.is_empty()) {
+        lines.pop();
+    }
+    Some(lines)
 }
 
 #[cfg(test)]

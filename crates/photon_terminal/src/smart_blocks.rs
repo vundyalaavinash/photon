@@ -20,6 +20,9 @@ pub enum SmartBlocksEvent {
 
 #[derive(Default)]
 struct UrlScan {
+    /// The block's output start when scanning began; if it moves (lines were trimmed or
+    /// renumbered) the position below no longer means anything.
+    output_line: i64,
     /// Output lines read so far, which counts against `URL_SCAN_LINE_LIMIT`.
     lines: usize,
     /// The next absolute line to read from.
@@ -78,17 +81,15 @@ impl SmartBlocks {
         event: &Event,
         cx: &mut Context<Self>,
     ) {
-        if !TerminalSettings::get_global(cx).smart_blocks {
-            return;
-        }
+        let enabled = TerminalSettings::get_global(cx).smart_blocks;
         match event {
             Event::BlocksChanged(change) => {
                 self.forget_removed_blocks(cx);
-                if let Some(BlockEvent::Finished(id)) = change {
+                if let (true, Some(BlockEvent::Finished(id))) = (enabled, change) {
                     self.recognise_block(*id, cx);
                 }
             }
-            Event::Wakeup => self.scan_running_block_for_url(cx),
+            Event::Wakeup if enabled => self.scan_running_block_for_url(cx),
             _ => {}
         }
     }
@@ -117,11 +118,15 @@ impl SmartBlocks {
         };
         let command = block.command.clone();
         let exit_code = block.exit_code;
-        let Some(lines) = terminal.block_output_lines(id, MAX_INSIGHT_LINES, MAX_INSIGHT_BYTES)
+        let Some(read_lines) =
+            terminal.block_output_reader(id, MAX_INSIGHT_LINES, MAX_INSIGHT_BYTES)
         else {
             return;
         };
-        let task = cx.background_spawn(async move { recognise(&command, &lines, exit_code) });
+        let task = cx.background_spawn(async move {
+            let lines = read_lines()?;
+            recognise(&command, &lines, exit_code)
+        });
         let task = cx.spawn(async move |this, cx| {
             let insight = task.await;
             this.update(cx, |this, cx| {
@@ -177,15 +182,25 @@ impl SmartBlocks {
         if self.urls.contains_key(&id) {
             return;
         }
+        let Some(output_line) = terminal
+            .blocks()
+            .and_then(|blocks| blocks.block(id))
+            .and_then(|block| block.output_line)
+        else {
+            return;
+        };
         let scan = self.scans.entry(id).or_default();
+        if scan.output_line != output_line {
+            scan.output_line = output_line;
+            scan.next_line = None;
+        }
         let remaining = URL_SCAN_LINE_LIMIT.saturating_sub(scan.lines);
         if remaining == 0 {
             return;
         }
         let Some(lines) =
-            terminal.block_output_lines_from(id, scan.next_line, remaining, MAX_INSIGHT_BYTES)
+            terminal.block_new_output_lines(id, scan.next_line, remaining, MAX_INSIGHT_BYTES)
         else {
-            scan.lines = URL_SCAN_LINE_LIMIT;
             return;
         };
         let Some(last) = lines.last() else {
@@ -381,5 +396,70 @@ mod tests {
         );
         let id = block_ids(&terminal, cx)[0];
         smart.read_with(cx, |smart, _| assert!(smart.insight(id).is_none()));
+    }
+
+    const START_SERVER: &str =
+        "\x1b]133;A\x07$ \x1b]133;B\x07serve\r\n\x1b]633;E;serve\x07\x1b]133;C\x07";
+
+    #[gpui::test]
+    async fn url_split_across_reads_is_not_truncated(cx: &mut TestAppContext) {
+        let (terminal, smart, cx) = setup(cx, true);
+        feed(
+            &terminal,
+            &format!("{CWD}{START_SERVER}Local: http://localhost:51"),
+            cx,
+        );
+        let id = block_ids(&terminal, cx)[0];
+        smart.read_with(cx, |smart, _| assert_eq!(smart.local_url(id), None));
+        feed(&terminal, "73/\r\n", cx);
+        smart.read_with(cx, |smart, _| {
+            assert_eq!(smart.local_url(id), Some("http://localhost:5173/"));
+        });
+    }
+
+    #[gpui::test]
+    async fn url_inside_a_burst_over_the_budget_is_found(cx: &mut TestAppContext) {
+        let (terminal, smart, cx) = setup(cx, true);
+        let noise = "noise\r\n".repeat(URL_SCAN_LINE_LIMIT - 500);
+        feed(
+            &terminal,
+            &format!("{CWD}{START_SERVER}{noise}http://localhost:3000\r\n{noise}"),
+            cx,
+        );
+        let id = block_ids(&terminal, cx)[0];
+        smart.read_with(cx, |smart, _| {
+            assert_eq!(smart.local_url(id), Some("http://localhost:3000"));
+        });
+    }
+
+    #[gpui::test]
+    async fn block_cleared_while_recognising_stores_nothing(cx: &mut TestAppContext) {
+        let (terminal, smart, cx) = setup(cx, true);
+        let window = cx.windows()[0];
+        let _clear_on_finish = cx.update(|_, cx| {
+            let clearing = terminal.clone();
+            cx.subscribe(&terminal, move |_, event: &Event, cx| {
+                if matches!(event, Event::BlocksChanged(Some(BlockEvent::Finished(_)))) {
+                    window
+                        .update(cx, |_, window, cx| {
+                            clearing.update(cx, |terminal, cx| {
+                                terminal.clear();
+                                terminal.sync(window, cx);
+                            })
+                        })
+                        .log_err();
+                }
+            })
+        });
+        feed(
+            &terminal,
+            &command(
+                "pytest",
+                "FAILED t.py::a - x\r\n== 1 failed, 1 passed in 0.02s ==\r\n",
+            ),
+            cx,
+        );
+        assert!(block_ids(&terminal, cx).is_empty());
+        smart.read_with(cx, |smart, _| assert!(smart.insights.is_empty()));
     }
 }
