@@ -31,6 +31,7 @@ pub struct FileDiff {
     pub path: String,
     pub status: FileStatus,
     pub binary: bool,
+    pub submodule: bool,
     pub hunks: Vec<Hunk>,
 }
 
@@ -55,6 +56,7 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<FileDiff>> {
                 path: new_path,
                 status: FileStatus::Modified,
                 binary: false,
+                submodule: false,
                 hunks: Vec::new(),
             });
             continue;
@@ -71,8 +73,12 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<FileDiff>> {
             hunk.body.push_str(line);
         } else if text.starts_with("new file mode") {
             file.status = FileStatus::Added;
+            file.submodule |= text.ends_with(GITLINK_MODE);
         } else if text.starts_with("deleted file mode") {
             file.status = FileStatus::Deleted;
+            file.submodule |= text.ends_with(GITLINK_MODE);
+        } else if text.starts_with("index ") {
+            file.submodule |= text.ends_with(GITLINK_MODE);
         } else if let Some(from) = text.strip_prefix("rename from ") {
             file.status = FileStatus::Renamed {
                 from: unquote_git_path(from)?,
@@ -223,6 +229,7 @@ pub async fn git_diff(worktree: &Path, from: &str, to: &str) -> Result<Vec<FileD
             "--diff-algorithm=myers",
             "--inter-hunk-context=0",
             "--ignore-submodules=none",
+            "--submodule=short",
             "--find-renames",
             "-U3",
             "--src-prefix=a/",
@@ -236,17 +243,10 @@ pub async fn git_diff(worktree: &Path, from: &str, to: &str) -> Result<Vec<FileD
     parse_unified_diff(&patch)
 }
 
-/// A gitlink change diffs as `Subproject commit <sha>` lines instead of file content.
-fn is_submodule(file: &FileDiff) -> bool {
-    file.hunks.iter().any(|hunk| {
-        hunk.body.lines().any(|line| {
-            line.starts_with("+Subproject commit ") || line.starts_with("-Subproject commit ")
-        })
-    })
-}
+const GITLINK_MODE: &str = " 160000";
 
 pub fn commentable_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
-    if is_submodule(file) {
+    if file.submodule {
         return Vec::new();
     }
     file.hunks
@@ -258,7 +258,7 @@ pub fn commentable_lines(file: &FileDiff) -> Vec<RangeInclusive<u32>> {
 
 /// `None` for added, binary and submodule entries, which have no text base to show.
 pub async fn base_text(worktree: &Path, commit: &str, file: &FileDiff) -> Result<Option<String>> {
-    if file.binary || is_submodule(file) {
+    if file.binary || file.submodule {
         return Ok(None);
     }
     let old_path = match &file.status {
@@ -337,6 +337,7 @@ mod tests {
             path: path.into(),
             status,
             binary,
+            submodule: false,
             hunks: Vec::new(),
         }
     }
@@ -554,6 +555,58 @@ index 1111111..2222222 160000
             None
         );
         assert!(git_diff(missing, "--output=x", "HEAD").await.is_err());
+    }
+
+    #[test]
+    fn text_file_mentioning_subproject_commit_stays_normal() {
+        let patch = "\
+diff --git a/notes.txt b/notes.txt
+index 1..2 100644
+--- a/notes.txt
++++ b/notes.txt
+@@ -1 +1 @@
+-Subproject commit 1111
++Subproject commit 2222
+";
+        let files = parse_unified_diff(patch).expect("parse");
+        assert!(!files[0].submodule);
+        assert_eq!(commentable_lines(&files[0]), vec![1..=1]);
+    }
+
+    #[gpui::test]
+    async fn gitlink_with_submodule_log_config_is_a_submodule(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        run(repo, &["init", "-q"]);
+        run(repo, &["config", "diff.submodule", "log"]);
+        let link = |sha: &str| format!("160000,{sha},vendor/lib");
+        run(
+            repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &link(&"1".repeat(40)),
+            ],
+        );
+        run(repo, &["commit", "-q", "-m", "base"]);
+        let base = run(repo, &["rev-parse", "HEAD"]);
+        run(
+            repo,
+            &["update-index", "--cacheinfo", &link(&"2".repeat(40))],
+        );
+        run(repo, &["commit", "-q", "-m", "head"]);
+        let head = run(repo, &["rev-parse", "HEAD"]);
+
+        let files = git_diff(repo, &base, &head).await.expect("diff");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].submodule);
+        assert!(commentable_lines(&files[0]).is_empty());
+        assert_eq!(base_text(repo, &base, &files[0]).await.expect("base"), None);
     }
 
     #[gpui::test]
