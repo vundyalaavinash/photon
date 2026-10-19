@@ -277,7 +277,7 @@ pub fn build_loaded_file(
     diff: FileDiff,
     cx: &mut App,
 ) -> Task<Result<LoadedFile>> {
-    if diff.binary {
+    if diff.binary || diff.submodule {
         return Task::ready(Ok(LoadedFile {
             diff,
             contents: None,
@@ -802,5 +802,24 @@ index 1..2 100644
                 .collect()
         });
         assert_eq!(hunks, vec![0..4]);
+    }
+
+    #[gpui::test]
+    async fn submodule_has_no_buffer(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/repo", json!({ "vendor": { "lib": {} } }))
+            .await;
+        let project = Project::test(fs, ["/repo".as_ref()], cx).await;
+        let mut diff = file("vendor/lib", FileStatus::Modified, false);
+        diff.submodule = true;
+        let loaded = cx
+            .update(|cx| build_loaded_file(&project, "/repo/vendor/lib".into(), None, diff, cx))
+            .await
+            .expect("loaded");
+        assert!(loaded.contents.is_none());
     }
 }

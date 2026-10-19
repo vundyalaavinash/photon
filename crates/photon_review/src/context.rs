@@ -245,6 +245,7 @@ pub enum Direction {
 pub struct ContextExcerpt {
     pub buffer: Entity<Buffer>,
     pub range: Range<Point>,
+    pub name: String,
     pub label: String,
     pub full_rows: u32,
 }
@@ -304,6 +305,7 @@ pub fn context_excerpts(
         excerpts.push(ContextExcerpt {
             buffer: item.buffer.clone(),
             range: shown,
+            name: item.name.clone(),
             label: context_label(direction, &path, &item.name, &function.name, line),
             full_rows,
         });
@@ -326,7 +328,7 @@ pub fn context_label(
     }
 }
 
-fn buffer_path(buffer: &Entity<Buffer>, cx: &App) -> Option<String> {
+pub(crate) fn buffer_path(buffer: &Entity<Buffer>, cx: &App) -> Option<String> {
     let file = buffer.read(cx).file()?;
     Some(file.path().as_unix_str().to_string())
 }

@@ -5,6 +5,7 @@ mod functions;
 mod gh;
 mod github;
 mod inbox;
+mod review;
 mod review_map;
 mod store;
 
@@ -15,6 +16,7 @@ pub use functions::*;
 pub use gh::*;
 pub use github::*;
 pub use inbox::*;
+pub use review::*;
 pub use review_map::*;
 pub use store::*;
 

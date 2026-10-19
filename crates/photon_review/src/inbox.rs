@@ -23,7 +23,7 @@ use crate::{
     ChecksState, GhError, GhRunner, Inbox, InboxGroup, PrKey, PrSummary, ReviewDb, SinceReview,
     Tracked, auth_status_request,
     checkout::{ensure_safe_segment, force_remove_worktree, review_root, worktree_path},
-    cleanup_checkout, gh_runner, inbox_request, parse_auth_status, parse_inbox,
+    cleanup_checkout, gh_runner, inbox_request, open_review, parse_auth_status, parse_inbox,
 };
 
 actions!(
@@ -165,14 +165,11 @@ fn badge_color(badge: &str) -> Color {
     }
 }
 
-// Task 9 replaces this with `crate::review::open_review`.
-fn start_review(_summary: &PrSummary, _window: &mut Window, _cx: &mut App) {}
-
 // Task 13 replaces this with `crate::run_locally::run_locally`.
 fn run_locally(_summary: &PrSummary, _window: &mut Window, _cx: &mut App) {}
 
 pub struct InboxPanel {
-    _workspace: WeakEntity<Workspace>,
+    workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     state: InboxState,
     refreshing: bool,
@@ -190,7 +187,7 @@ impl InboxPanel {
         cx.spawn(async move |cx| {
             cx.update(|_, cx| {
                 cx.new(|cx| Self {
-                    _workspace: workspace,
+                    workspace,
                     focus_handle: cx.focus_handle(),
                     state: InboxState::Idle,
                     refreshing: false,
@@ -430,6 +427,7 @@ impl InboxPanel {
         let key = &summary.key;
         let id = format!("{}/{}/{}#{}", key.host, key.owner, key.repo, key.number);
         let primary_summary = summary.clone();
+        let workspace = self.workspace.clone();
         let local_summary = summary.clone();
         v_flex()
             .id(SharedString::from(id.clone()))
@@ -468,7 +466,14 @@ impl InboxPanel {
                             row.primary_action,
                         )
                         .style(ButtonStyle::Filled)
-                        .on_click(move |_, window, cx| start_review(&primary_summary, window, cx)),
+                        .on_click(move |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    open_review(primary_summary.clone(), workspace, window, cx)
+                                        .detach_and_log_err(cx)
+                                })
+                                .log_err();
+                        }),
                     ),
             )
     }
