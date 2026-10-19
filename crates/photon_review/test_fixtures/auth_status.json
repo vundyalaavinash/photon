@@ -1,0 +1,1 @@
+{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"alice","tokenSource":"keyring","scopes":"repo, read:org","gitProtocol":"https"}],"ghe.corp":[{"state":"error","active":true,"host":"ghe.corp","login":"alice-corp","tokenSource":"keyring","error":"The token in keyring is invalid.","gitProtocol":"https"}]}}

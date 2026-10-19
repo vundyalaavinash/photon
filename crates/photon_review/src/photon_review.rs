@@ -1,6 +1,8 @@
 mod gh;
+mod github;
 
 pub use gh::*;
+pub use github::*;
 
 use gpui::App;
 

@@ -1,0 +1,346 @@
+{
+ "data": {
+  "reviewRequested": {
+   "nodes": [
+    {
+     "id": "PR_482",
+     "number": 482,
+     "title": "Add retry to uploader",
+     "url": "https://github.com/acme/web/pull/482",
+     "author": {
+      "login": "alice"
+     },
+     "headRefOid": "a1",
+     "baseRefName": "main",
+     "repository": {
+      "nameWithOwner": "acme/web"
+     },
+     "commits": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "a1",
+         "statusCheckRollup": {
+          "state": "SUCCESS"
+         }
+        }
+       }
+      ]
+     },
+     "reviewThreads": {
+      "nodes": [
+       {
+        "isResolved": false
+       },
+       {
+        "isResolved": false
+       },
+       {
+        "isResolved": true
+       }
+      ]
+     },
+     "reviews": {
+      "nodes": []
+     }
+    },
+    {
+     "id": "PR_483",
+     "number": 483,
+     "title": "Fix flaky cache test",
+     "url": "https://github.com/acme/web/pull/483",
+     "author": {
+      "login": "bob"
+     },
+     "headRefOid": "b2",
+     "baseRefName": "main",
+     "repository": {
+      "nameWithOwner": "acme/web"
+     },
+     "commits": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "b1",
+         "statusCheckRollup": null
+        }
+       },
+       {
+        "commit": {
+         "oid": "b2",
+         "statusCheckRollup": {
+          "state": "PENDING"
+         }
+        }
+       }
+      ]
+     },
+     "reviewThreads": {
+      "nodes": [
+       {
+        "isResolved": true
+       }
+      ]
+     },
+     "reviews": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "b2"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "id": "PR_484",
+     "number": 484,
+     "title": "Rework router",
+     "url": "https://github.com/acme/web/pull/484",
+     "author": {
+      "login": "carol"
+     },
+     "headRefOid": "c5",
+     "baseRefName": "main",
+     "repository": {
+      "nameWithOwner": "acme/web"
+     },
+     "commits": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "c1",
+         "statusCheckRollup": null
+        }
+       },
+       {
+        "commit": {
+         "oid": "c2",
+         "statusCheckRollup": null
+        }
+       },
+       {
+        "commit": {
+         "oid": "c3",
+         "statusCheckRollup": null
+        }
+       },
+       {
+        "commit": {
+         "oid": "c4",
+         "statusCheckRollup": null
+        }
+       },
+       {
+        "commit": {
+         "oid": "c5",
+         "statusCheckRollup": {
+          "state": "FAILURE"
+         }
+        }
+       }
+      ]
+     },
+     "reviewThreads": {
+      "nodes": [
+       {
+        "isResolved": false
+       },
+       {
+        "isResolved": true
+       }
+      ]
+     },
+     "reviews": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "c2"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "id": "PR_485",
+     "number": 485,
+     "title": "Squash history",
+     "url": "https://github.com/acme/api/pull/485",
+     "author": {
+      "login": "dave"
+     },
+     "headRefOid": "d9",
+     "baseRefName": "main",
+     "repository": {
+      "nameWithOwner": "acme/api"
+     },
+     "commits": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "d9",
+         "statusCheckRollup": null
+        }
+       }
+      ]
+     },
+     "reviewThreads": {
+      "nodes": [
+       {
+        "isResolved": true
+       }
+      ]
+     },
+     "reviews": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "d1"
+        }
+       }
+      ]
+     }
+    }
+   ]
+  },
+  "yours": {
+   "nodes": [
+    {
+     "id": "PR_490",
+     "number": 490,
+     "title": "Bump deps",
+     "url": "https://github.com/acme/web/pull/490",
+     "author": {
+      "login": "alice"
+     },
+     "headRefOid": "e1",
+     "baseRefName": "main",
+     "repository": {
+      "nameWithOwner": "acme/web"
+     },
+     "commits": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "e1",
+         "statusCheckRollup": {
+          "state": "SUCCESS"
+         }
+        }
+       }
+      ]
+     },
+     "reviewThreads": {
+      "nodes": [
+       {
+        "isResolved": true
+       }
+      ]
+     },
+     "reviews": {
+      "nodes": []
+     }
+    }
+   ]
+  },
+  "mentioned": {
+   "nodes": [
+    {
+     "id": "PR_483",
+     "number": 483,
+     "title": "Fix flaky cache test",
+     "url": "https://github.com/acme/web/pull/483",
+     "author": {
+      "login": "bob"
+     },
+     "headRefOid": "b2",
+     "baseRefName": "main",
+     "repository": {
+      "nameWithOwner": "acme/web"
+     },
+     "commits": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "b1",
+         "statusCheckRollup": null
+        }
+       },
+       {
+        "commit": {
+         "oid": "b2",
+         "statusCheckRollup": {
+          "state": "PENDING"
+         }
+        }
+       }
+      ]
+     },
+     "reviewThreads": {
+      "nodes": [
+       {
+        "isResolved": true
+       }
+      ]
+     },
+     "reviews": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "b2"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "id": "PR_500",
+     "number": 500,
+     "title": "Docs pass",
+     "url": "https://github.com/acme/web/pull/500",
+     "author": {
+      "login": "erin"
+     },
+     "headRefOid": "f1",
+     "baseRefName": "main",
+     "repository": {
+      "nameWithOwner": "acme/web"
+     },
+     "commits": {
+      "nodes": [
+       {
+        "commit": {
+         "oid": "f1",
+         "statusCheckRollup": {
+          "state": "SUCCESS"
+         }
+        }
+       }
+      ]
+     },
+     "reviewThreads": {
+      "nodes": [
+       {
+        "isResolved": true
+       }
+      ]
+     },
+     "reviews": {
+      "nodes": []
+     }
+    }
+   ]
+  },
+  "nodes": [
+   {
+    "id": "PR_x",
+    "state": "MERGED"
+   },
+   {
+    "id": "PR_y",
+    "state": "OPEN"
+   },
+   null
+  ]
+ }
+}

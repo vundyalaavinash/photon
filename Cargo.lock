@@ -13474,9 +13474,11 @@ dependencies = [
 name = "photon_review"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "futures 0.3.34",
  "gpui",
  "parking_lot",
+ "serde",
  "serde_json",
  "tempfile",
  "util",

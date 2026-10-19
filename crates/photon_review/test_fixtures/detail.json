@@ -1,0 +1,105 @@
+{
+ "data": {
+  "repository": {
+   "pullRequest": {
+    "id": "PR_482",
+    "number": 482,
+    "title": "Add retry to uploader",
+    "url": "https://github.com/acme/web/pull/482",
+    "author": {
+     "login": "alice"
+    },
+    "headRefOid": "a2",
+    "baseRefName": "main",
+    "repository": {
+     "nameWithOwner": "acme/web"
+    },
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "oid": "a1",
+        "statusCheckRollup": null
+       }
+      },
+      {
+       "commit": {
+        "oid": "a2",
+        "statusCheckRollup": {
+         "state": "SUCCESS"
+        }
+       }
+      }
+     ]
+    },
+    "reviewThreads": {
+     "nodes": [
+      {
+       "id": "PRRT_1",
+       "isResolved": false,
+       "isOutdated": false,
+       "path": "src/upload.rs",
+       "line": 42,
+       "startLine": 40,
+       "diffSide": "RIGHT",
+       "comments": {
+        "nodes": [
+         {
+          "databaseId": 1001,
+          "author": {
+           "login": "bob"
+          },
+          "body": "Why retry here?",
+          "createdAt": "2026-10-01T10:00:00Z"
+         },
+         {
+          "databaseId": 1002,
+          "author": null,
+          "body": "Network flakes.",
+          "createdAt": "2026-10-01T11:00:00Z"
+         }
+        ]
+       }
+      },
+      {
+       "id": "PRRT_2",
+       "isResolved": true,
+       "isOutdated": true,
+       "path": "src/retry.rs",
+       "line": null,
+       "startLine": null,
+       "diffSide": "LEFT",
+       "comments": {
+        "nodes": []
+       }
+      }
+     ]
+    },
+    "reviews": {
+     "nodes": [
+      {
+       "commit": {
+        "oid": "a1"
+       }
+      }
+     ]
+    },
+    "state": "OPEN",
+    "additions": 120,
+    "deletions": 14,
+    "files": {
+     "nodes": [
+      {
+       "path": "src/upload.rs",
+       "viewerViewedState": "VIEWED"
+      },
+      {
+       "path": "src/retry.rs",
+       "viewerViewedState": "UNVIEWED"
+      }
+     ]
+    }
+   }
+  }
+ }
+}

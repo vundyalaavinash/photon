@@ -16,9 +16,11 @@ path = "src/photon_review.rs"
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
 futures.workspace = true
 gpui.workspace = true
 parking_lot.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 util.workspace = true
 
