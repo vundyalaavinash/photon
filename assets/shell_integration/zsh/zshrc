@@ -21,12 +21,14 @@ elif [[ $PHOTON_BLOCKS == 1 ]]; then
   }
 
   __photon_precmd() {
-    [[ -n $__photon_command_ran ]] && printf '\e]133;D;%s\a' "$__photon_status"
+    # The newline leaves a blank row inside the block below its output (Warp's padding).
+    [[ -n $__photon_command_ran ]] && printf '\n\e]133;D;%s\a' "$__photon_status"
     unset __photon_command_ran
     local url=${PWD//\%/%25}
     printf '\e]7;file://%s%s\a' "$HOST" "${url// /%20}"
     printf '\e]133;A\a'
-    PROMPT=$'%{\e]133;B\a%}'
+    # A blank row and a row for the block's folder/branch/time, then the typed command.
+    PROMPT=$'\n\n%{\e]133;B\a%}'
     RPROMPT=''
   }
 

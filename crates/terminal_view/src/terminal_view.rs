@@ -3939,6 +3939,43 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn photon_prompt_puts_metadata_above_command(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(
+            &terminal,
+            b"\x1b]133;A\x07\r\n\r\n\x1b]133;B\x07pwd\r\n\x1b]633;E;pwd\x07\x1b]133;C\x07/tmp\r\n\r\n\x1b]133;D;0\x07",
+            &mut cx,
+        );
+        let rows = terminal.read_with(&cx, |terminal, _| {
+            let screen_rows = terminal.last_content.terminal_bounds.num_lines();
+            photon_blocks_view::layout_block_chrome(terminal, None, screen_rows)
+                .iter()
+                .map(|chrome| (chrome.header_row, chrome.metadata_row))
+                .collect::<Vec<_>>()
+        });
+        // The fixture's own blocks put the command on the prompt row; Photon's prompt leaves a
+        // blank row and a metadata row above it.
+        let (header_row, metadata_row) = *rows.last().expect("three blocks");
+        assert_eq!(metadata_row, Some(header_row - 1), "{rows:?}");
+        assert!(
+            rows[..rows.len() - 1]
+                .iter()
+                .all(|(_, metadata)| metadata.is_none())
+        );
+    }
+
+    #[gpui::test]
+    async fn short_output_is_drawn_at_the_bottom(cx: &mut TestAppContext) {
+        let (terminal, _terminal_view, mut cx) = init_block_view(cx).await;
+        let blank_rows = |cx: &mut VisualTestContext| {
+            terminal.read_with(cx, |terminal, _| terminal.blank_rows_below_cursor())
+        };
+        assert!(blank_rows(&mut cx) > 0);
+        feed_block_output(&terminal, "line\r\n".repeat(200).as_bytes(), &mut cx);
+        assert_eq!(blank_rows(&mut cx), 0);
+    }
+
+    #[gpui::test]
     async fn escape_reaches_a_running_program(cx: &mut TestAppContext) {
         let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
         feed_block_output(
@@ -4495,7 +4532,7 @@ mod tests {
         finish_block_in(path, &terminal, &mut cx).await;
         take_pty_writes(&terminal, &mut cx);
 
-        cx.dispatch_action(photon_terminal::ToggleBranchPicker);
+        open_chip_picker(photon_terminal::ToggleBranchPicker, &mut cx);
         cx.simulate_input("feature");
         cx.simulate_keystrokes("enter");
         let writes = take_pty_writes(&terminal, &mut cx);
@@ -4519,7 +4556,7 @@ mod tests {
         git(path, &["branch", "feature"]).await;
         finish_block_in(path, &terminal, &mut cx).await;
 
-        cx.dispatch_action(photon_terminal::ToggleBranchPicker);
+        open_chip_picker(photon_terminal::ToggleBranchPicker, &mut cx);
         cx.simulate_input("feature");
         // A command started while the picker was open owns the keyboard.
         feed_block_output(
@@ -4529,7 +4566,56 @@ mod tests {
         );
         take_pty_writes(&terminal, &mut cx);
         cx.simulate_keystrokes("enter");
-        assert!(take_pty_writes(&terminal, &mut cx).is_empty());
+        // The picker closed with the input box; enter belongs to the running program.
+        let writes = take_pty_writes(&terminal, &mut cx);
+        assert!(
+            !writes
+                .iter()
+                .any(|write| String::from_utf8_lossy(write).contains("git switch")),
+            "{writes:?}"
+        );
+    }
+
+    /// The chip's popover focuses its picker two frames after opening, and typing reaches it
+    /// once a frame with the focused picker has been drawn.
+    fn open_chip_picker(action: impl gpui::Action, cx: &mut VisualTestContext) {
+        // The chip (and its popover) exists once a frame with the git info has been drawn.
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.dispatch_action(action);
+        cx.run_until_parked();
+        for _ in 0..2 {
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn chip_picker_opens_on_its_chip(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| editor::init(cx));
+        let directory = tempfile::tempdir().expect("tempdir");
+        finish_block_in(directory.path(), &terminal, &mut cx).await;
+
+        open_chip_picker(photon_terminal::ToggleFolderPicker, &mut cx);
+        let input = terminal_view.read_with(&cx, |view, _| view.block_input.clone().unwrap());
+        assert!(cx.update(|window, cx| !input.focus_handle(cx).contains_focused(window, cx)));
+        // Anchored to the chip, not centred in the window as a workspace modal.
+        assert!(input.read_with(&cx, |input, _| input.folder_picker_open()));
+        let workspace = terminal_view.read_with(&cx, |view, _| view.workspace.clone());
+        let modal_open = workspace
+            .update(&mut cx, |workspace, cx| {
+                workspace
+                    .active_modal::<photon_terminal::ChipPicker>(cx)
+                    .is_some()
+            })
+            .unwrap();
+        assert!(!modal_open);
     }
 
     #[gpui::test]
@@ -4543,7 +4629,7 @@ mod tests {
         finish_block_in(&path, &terminal, &mut cx).await;
         take_pty_writes(&terminal, &mut cx);
 
-        cx.dispatch_action(photon_terminal::ToggleFolderPicker);
+        open_chip_picker(photon_terminal::ToggleFolderPicker, &mut cx);
         cx.simulate_keystrokes("enter");
         let writes = take_pty_writes(&terminal, &mut cx);
         let expected = format!(

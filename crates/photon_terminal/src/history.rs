@@ -531,6 +531,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             branch: None,
             prompt_line: 0,
+            command_line: 0,
             output_line: None,
             end_line: None,
             started_at: None,

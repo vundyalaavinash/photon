@@ -1292,7 +1292,15 @@ impl Element for TerminalElement {
                         .advance(font_id, font_pixels, 'm')
                         .unwrap()
                         .width;
-                    gutter = cell_width;
+                    // photon: blocks inset text like Warp and keep the newest output at the bottom.
+                    let blocks_drawn = matches!(self.mode, TerminalMode::Standalone)
+                        && crate::photon_blocks_view::active_blocks(self.terminal.read(cx))
+                            .is_some();
+                    gutter = if blocks_drawn {
+                        cell_width * crate::photon_blocks_view::BLOCK_GUTTER_CELLS
+                    } else {
+                        cell_width
+                    };
 
                     let mut size = bounds.size;
                     size.width -= gutter;
@@ -1311,7 +1319,8 @@ impl Element for TerminalElement {
                     if matches!(self.terminal_view.read(cx).mode, TerminalMode::Standalone) {
                         let should_anchor_to_bottom = {
                             let content = self.terminal.read(cx).last_content();
-                            content.mode.contains(Modes::ALT_SCREEN)
+                            blocks_drawn // photon: see above
+                                || content.mode.contains(Modes::ALT_SCREEN)
                                 || (content.scrolled_to_bottom && content.bottom_row_occupied)
                         };
                         let scale_factor = window.scale_factor();
@@ -1337,6 +1346,14 @@ impl Element for TerminalElement {
                         size.height = snapped_height;
                         if should_anchor_to_bottom {
                             origin.y += padding;
+                        }
+                        if blocks_drawn {
+                            // photon: see above. Rows are drawn at the exact line height, so the
+                            // last row's bottom is put on the element's bottom, where the input
+                            // box overlaps a fixed number of rows.
+                            let blank_rows = self.terminal.read(cx).blank_rows_below_cursor();
+                            origin.y = bounds.origin.y + available_height
+                                - line_height_pixels * rows.saturating_sub(blank_rows) as f32;
                         }
                     }
 

@@ -71,9 +71,20 @@ fn block_rows(visible: &VisibleBlock, block: &Block, screen_rows: i32) -> Range<
     visible.first_row.max(0)..end.min(screen_rows)
 }
 
+/// Text starts this many cells in from the pane's left edge while blocks are drawn (Warp's
+/// inset); the block's coloured edge sits at the pane edge.
+pub(crate) const BLOCK_GUTTER_CELLS: f32 = 2.;
+
+/// Rows Photon's zsh prompt takes before a command is typed: a blank row, the metadata row and
+/// the command row (see `PROMPT` in assets/shell_integration/zsh/zshrc). The input box covers them.
+const PROMPT_ROWS: usize = 3;
+
 pub(crate) struct BlockChrome {
     rows: Range<i32>,
-    header_row: i32,
+    pub(crate) header_row: i32,
+    /// Photon's prompt leaves a row above the command for the metadata, as Warp does. Other
+    /// prompts put the command on the block's first row; the metadata then goes on its right.
+    pub(crate) metadata_row: Option<i32>,
     /// Prompt rows after the first (multi-line commands), which the header replaces.
     hidden_rows: Range<i32>,
     starts_on_screen: bool,
@@ -98,7 +109,18 @@ pub(crate) fn layout_block_chrome(
         .filter_map(|visible| {
             let block = blocks.block(visible.id)?;
             let rows = block_rows(visible, block, screen_rows);
-            let header_row = visible.header_row.unwrap_or(visible.first_row);
+            let command_row =
+                i32::try_from(block.command_line - top_absolute_line).unwrap_or(i32::MIN);
+            let (header_row, metadata_row) = if block.command_line - block.prompt_line >= 2 {
+                if command_row >= 0 {
+                    (command_row, Some(command_row - 1).filter(|row| *row >= 0))
+                } else {
+                    // Sticky: the command stays on the top row while its output scrolls.
+                    (0, None)
+                }
+            } else {
+                (visible.header_row.unwrap_or(visible.first_row), None)
+            };
             let output_row = block.output_line.map_or(header_row, |line| {
                 i32::try_from(line - top_absolute_line).unwrap_or(i32::MAX)
             });
@@ -117,7 +139,9 @@ pub(crate) fn layout_block_chrome(
                     .as_ref()
                     .map(|cwd| cwd.compact().to_string_lossy().into_owned()),
                 block.branch.clone(),
-                block.duration.map(format_duration),
+                block
+                    .duration
+                    .map(|duration| format!("({})", format_duration(duration))),
             ]
             .into_iter()
             .flatten()
@@ -127,6 +151,7 @@ pub(crate) fn layout_block_chrome(
                 hidden_rows: (header_row + 1).max(0)..output_row.min(rows.end),
                 rows,
                 header_row,
+                metadata_row,
                 starts_on_screen: visible.first_row > 0,
                 edge,
                 selected: is_selected,
@@ -147,9 +172,10 @@ pub(crate) fn paint_block_chrome(
     cx: &mut App,
 ) {
     let line_height = dimensions.line_height();
-    // The edge sits in the one-cell gutter left of the grid.
-    let left = origin.x - dimensions.cell_width();
-    let full_width = dimensions.width() + dimensions.cell_width();
+    // The edge sits at the pane's edge, in the gutter left of the grid.
+    let gutter = dimensions.cell_width() * BLOCK_GUTTER_CELLS;
+    let left = origin.x - gutter;
+    let full_width = dimensions.width() + gutter;
     let row_bounds = |rows: &Range<i32>| {
         Bounds::new(
             point(left, origin.y + line_height * rows.start as f32),
@@ -166,6 +192,9 @@ pub(crate) fn paint_block_chrome(
             row_bounds(&(block.header_row..block.header_row + 1)),
             background,
         ));
+        if let Some(row) = block.metadata_row {
+            window.paint_quad(fill(row_bounds(&(row..row + 1)), background));
+        }
         if !block.hidden_rows.is_empty() {
             window.paint_quad(fill(row_bounds(&block.hidden_rows), background));
         }
@@ -225,11 +254,16 @@ pub(crate) fn paint_block_chrome(
                 }],
                 None,
             );
-            let metadata_x =
-                origin.x + dimensions.width() - dimensions.cell_width() - metadata.width;
+            let metadata_origin = match block.metadata_row {
+                Some(row) => point(origin.x, origin.y + line_height * row as f32),
+                None => point(
+                    origin.x + dimensions.width() - dimensions.cell_width() - metadata.width,
+                    header_y,
+                ),
+            };
             metadata
                 .paint(
-                    point(metadata_x, header_y),
+                    metadata_origin,
                     line_height,
                     gpui::TextAlign::Left,
                     None,
@@ -432,7 +466,14 @@ impl TerminalView {
             && !self.read_only
             && !matches!(self.mode, TerminalMode::Embedded { .. })
             && active_blocks(self.terminal.read(cx)).is_some();
-        shown.then(|| photon_terminal::input_slot(self.visible_block_input(cx)))
+        let overlap = self
+            .terminal
+            .read(cx)
+            .last_content
+            .terminal_bounds
+            .line_height()
+            * PROMPT_ROWS as f32;
+        shown.then(|| photon_terminal::input_slot(self.visible_block_input(cx), overlap))
     }
 
     /// The input box, shown only while the shell waits at a block prompt.
@@ -494,6 +535,10 @@ impl TerminalView {
         };
         if self.block_input_focused(window, cx) {
             return true;
+        }
+        // Keys typed into something drawn over the terminal (a chip's picker) stay there.
+        if !self.focus_handle.is_focused(window) {
+            return false;
         }
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;

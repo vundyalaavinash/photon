@@ -402,3 +402,15 @@ fn zsh_writing_to_a_pipe_prints_no_marks() {
     // `grep -c` counts the lines of the inner zsh's output that contained an escape.
     assert!(output.contains("escapes=0\r"), "{output}");
 }
+
+#[test]
+fn blocks_get_padding_rows() {
+    if !zsh_available() {
+        return;
+    }
+    let (_marks, output, _home) = run_zsh("", "echo hi\nexit\n");
+    // A blank row closes the block's output, and the prompt leaves a blank row and a
+    // metadata row above the typed command.
+    assert!(output.contains("hi\n\n\x1b]133;D;0\x07"), "{output:?}");
+    assert!(output.contains("\n\n\x1b]133;B\x07"), "{output:?}");
+}

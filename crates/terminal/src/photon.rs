@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::grid::Dimensions as _;
 use gpui::{Context, Task};
 use photon_blocks::{BlockEvent, BlockId, BlockList, Phase, ShellMark, parse_shell_mark};
 use util::ResultExt as _;
@@ -209,6 +210,21 @@ impl Terminal {
             None => term.grid().cursor.point.line.0,
         };
         Some(first..=last)
+    }
+
+    /// Blank screen rows below the cursor while nothing has scrolled into history; drawing the
+    /// grid that much lower keeps the newest output next to the input box, as Warp does.
+    pub fn blank_rows_below_cursor(&self) -> usize {
+        let term = self.term.lock();
+        if self.blocks.is_none()
+            || term.history_size() > 0
+            || term.grid().display_offset() > 0
+            || is_alt_screen(&term)
+        {
+            return 0;
+        }
+        let cursor_line = term.grid().cursor.point.line.0;
+        usize::try_from(term.screen_lines() as i32 - 1 - cursor_line).unwrap_or(0)
     }
 
     pub fn set_block_branch(&mut self, branch: Option<String>) {

@@ -16,6 +16,8 @@ pub struct Block {
     pub cwd: Option<PathBuf>,
     pub branch: Option<String>,
     pub prompt_line: i64,
+    /// Where the B mark put the typed command; at or below `prompt_line`.
+    pub command_line: i64,
     pub output_line: Option<i64>,
     pub end_line: Option<i64>,
     pub started_at: Option<Instant>,
@@ -43,6 +45,7 @@ pub struct BlockList {
     next_id: u64,
     phase: Phase,
     prompt_line: i64,
+    command_line: i64,
     command_started: bool,
     pending_command: Option<(String, bool)>,
     current_cwd: Option<PathBuf>,
@@ -57,6 +60,7 @@ impl BlockList {
             next_id: 0,
             phase: Phase::AwaitingFirstMark,
             prompt_line: 0,
+            command_line: 0,
             command_started: false,
             pending_command: None,
             current_cwd: None,
@@ -88,6 +92,7 @@ impl BlockList {
             ShellMark::CommandStart => {
                 if self.phase == Phase::Prompt {
                     self.command_started = true;
+                    self.command_line = absolute_line;
                 }
             }
             ShellMark::CommandText {
@@ -139,6 +144,7 @@ impl BlockList {
             cwd: self.current_cwd.clone(),
             branch: self.branch.clone(),
             prompt_line: self.prompt_line,
+            command_line: self.command_line.max(self.prompt_line),
             output_line: Some(absolute_line),
             end_line: None,
             started_at: Some(now),
@@ -200,8 +206,10 @@ impl BlockList {
         // Clearing restarts absolute numbering with the cursor's line as line 0,
         // so whatever survives (prompt or running output) now starts there.
         self.prompt_line = 0;
+        self.command_line = 0;
         for block in &mut self.blocks {
             block.prompt_line = 0;
+            block.command_line = 0;
             block.output_line = Some(0);
         }
     }
@@ -253,6 +261,21 @@ mod tests {
         assert_eq!(blocks[0].end_line, Some(3));
         assert_eq!(blocks[0].exit_code, Some(0));
         assert_eq!(list.phase(), &Phase::Prompt);
+    }
+
+    #[test]
+    fn block_records_where_the_command_starts() {
+        let now = Instant::now();
+        let mut list = BlockList::new(10);
+        list.apply(PromptStart, 5, now);
+        list.apply(CommandStart, 7, now);
+        list.apply(text("ls"), 7, now);
+        list.apply(OutputStart, 8, now);
+        let block = list.blocks().next().expect("block");
+        assert_eq!((block.prompt_line, block.command_line), (5, 7));
+        list.clear();
+        let block = list.blocks().next().expect("running block survives clear");
+        assert_eq!((block.prompt_line, block.command_line), (0, 0));
     }
 
     #[test]

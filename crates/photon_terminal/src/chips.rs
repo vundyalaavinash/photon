@@ -181,7 +181,10 @@ impl ChipPicker {
 
 impl Render for ChipPicker {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(30.)).child(self.picker.clone())
+        v_flex()
+            .w(rems(30.))
+            .elevation_3(_cx)
+            .child(self.picker.clone())
     }
 }
 

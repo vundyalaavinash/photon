@@ -10,12 +10,16 @@ use project::{
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use gpui::{
-    Action as _, App, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement as _,
-    Render, Styled as _, Subscription, Task, TextStyleRefinement, WeakEntity, Window, actions, div,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement as _, Pixels, Render,
+    Styled as _, Subscription, Task, TextStyleRefinement, WeakEntity, Window, actions, div,
     prelude::*, px, relative, rgb,
 };
 use photon_blocks::BlockEvent;
 use terminal::{Event, InputTarget, Terminal};
+use ui::{
+    ButtonCommon as _, ButtonLike, ButtonSize, ButtonStyle, Color, Label, LabelCommon as _,
+    LabelSize, PopoverMenu, PopoverMenuHandle,
+};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -49,14 +53,15 @@ const MAX_LINES: usize = 10;
 const FONT_FAMILY: &str = "Hack";
 const FONT_SIZE: f32 = 13.;
 const LINE_HEIGHT: f32 = 1.2;
-const METADATA_COLOR: u32 = 0x8E8E8E;
 const BORDER_COLOR: u32 = 0x222222;
 const BACKGROUND_COLOR: u32 = 0x0a0a0a;
-const PADDING_TOP: f32 = 10.;
-const PADDING_BOTTOM: f32 = 12.;
+const PADDING_TOP: f32 = 12.;
+const PADDING_BOTTOM: f32 = 16.;
+/// Matches the grid's two-cell text inset, so the input lines up with block text.
+const PADDING_X: f32 = 16.;
 const BORDER_WIDTH: f32 = 1.;
-const CHIPS_HEIGHT: f32 = 22.;
-const CHIPS_GAP: f32 = 8.;
+const CHIPS_HEIGHT: f32 = 20.;
+const CHIPS_GAP: f32 = 14.;
 const CHIP_BORDER_COLOR: u32 = 0x333333;
 const FOLDER_CHIP_COLOR: u32 = 0xA5D5FE;
 const BRANCH_CHIP_COLOR: u32 = 0xB4FA72;
@@ -77,7 +82,11 @@ pub fn init(cx: &mut App) {
 /// empty while a command runs, plus the chips row above it, so the grid (and the PTY size)
 /// never changes as commands start and finish or chips come and go; extra input lines grow
 /// upward over the grid.
-pub fn input_slot(input: Option<Entity<BlockInput>>) -> impl IntoElement {
+///
+/// The slot also covers the grid's last `overlap` (the waiting prompt's blank rows and cursor
+/// row), so the input sits right under the newest block. While a command runs it draws nothing,
+/// and those rows show the command's newest output.
+pub fn input_slot(input: Option<Entity<BlockInput>>, overlap: Pixels) -> impl IntoElement {
     let height = BORDER_WIDTH
         + PADDING_TOP
         + CHIPS_HEIGHT
@@ -89,11 +98,12 @@ pub fn input_slot(input: Option<Entity<BlockInput>>) -> impl IntoElement {
         .flex_none()
         .w_full()
         .h(px(height))
-        .border_t_1()
-        .border_color(rgb(BORDER_COLOR))
-        .bg(rgb(BACKGROUND_COLOR))
+        .mt(-overlap)
         .when_some(input, |this, input| {
-            this.child(div().absolute().left_0().right_0().bottom_0().child(input))
+            this.border_t_1()
+                .border_color(rgb(BORDER_COLOR))
+                .bg(rgb(BACKGROUND_COLOR))
+                .child(div().absolute().left_0().right_0().bottom_0().child(input))
         })
 }
 
@@ -118,6 +128,8 @@ pub struct BlockInput {
     menu_items: Rc<RefCell<Option<(usize, Vec<Completion>)>>>,
     /// The rest of a history command, shown in grey after the cursor.
     suggestion: Option<String>,
+    folder_menu: PopoverMenuHandle<ChipPicker>,
+    branch_menu: PopoverMenuHandle<ChipPicker>,
     _terminal_subscription: Subscription,
     _editor_subscription: Subscription,
 }
@@ -175,6 +187,8 @@ impl BlockInput {
             completion_task: None,
             menu_items,
             suggestion: None,
+            folder_menu: PopoverMenuHandle::default(),
+            branch_menu: PopoverMenuHandle::default(),
             _terminal_subscription,
             _editor_subscription,
         };
@@ -224,17 +238,36 @@ impl BlockInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Deferred: building the picker reads this input, which is mid-update here.
+        let menu = self.folder_menu.clone();
+        window.defer(cx, move |window, cx| menu.toggle(window, cx));
+    }
+
+    pub fn folder_picker_open(&self) -> bool {
+        self.folder_menu.is_deployed()
+    }
+
+    pub fn branch_picker_open(&self) -> bool {
+        self.branch_menu.is_deployed()
+    }
+
+    fn folder_picker(&self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChipPicker> {
         let current = self.queried_cwd.clone();
         let recent = self.history.read(cx).recent_dirs(50);
         let terminal = self.terminal.clone();
         let workspace = self.workspace.clone();
-        self.workspace
-            .update(cx, |workspace_ref, cx| {
-                workspace_ref.toggle_modal(window, cx, |window, cx| {
-                    ChipPicker::folders(terminal, workspace, current, recent, window, cx)
-                });
-            })
-            .log_err();
+        cx.new(|cx| ChipPicker::folders(terminal, workspace, current, recent, window, cx))
+    }
+
+    fn branch_picker(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ChipPicker>> {
+        let info = self.git.clone()?;
+        let terminal = self.terminal.clone();
+        let workspace = self.workspace.clone();
+        Some(cx.new(|cx| ChipPicker::branches(terminal, workspace, info, window, cx)))
     }
 
     fn toggle_branch_picker(
@@ -243,18 +276,10 @@ impl BlockInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(info) = self.git.clone() else {
-            return;
-        };
-        let terminal = self.terminal.clone();
-        let workspace = self.workspace.clone();
-        self.workspace
-            .update(cx, |workspace_ref, cx| {
-                workspace_ref.toggle_modal(window, cx, |window, cx| {
-                    ChipPicker::branches(terminal, workspace, info, window, cx)
-                });
-            })
-            .log_err();
+        if self.git.is_some() {
+            let menu = self.branch_menu.clone();
+            window.defer(cx, move |window, cx| menu.toggle(window, cx));
+        }
     }
 
     fn record_finished_block(
@@ -555,23 +580,12 @@ impl Focusable for BlockInput {
 impl Render for BlockInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .key_context("PhotonBlockInput")
-            .capture_action(cx.listener(Self::copy))
-            .on_action(cx.listener(Self::run_input))
-            .on_action(cx.listener(Self::interrupt))
-            .on_action(cx.listener(Self::history_previous))
-            .on_action(cx.listener(Self::history_next))
-            .on_action(cx.listener(Self::search_history))
-            .on_action(cx.listener(Self::toggle_folder_picker))
-            .on_action(cx.listener(Self::toggle_branch_picker))
-            .on_action(cx.listener(Self::complete))
-            .on_action(cx.listener(Self::accept_suggestion))
             .flex()
             .flex_col()
             .flex_none()
             .gap(px(CHIPS_GAP))
             .pt(px(PADDING_TOP))
-            .px(px(14.))
+            .px(px(PADDING_X))
             .pb(px(PADDING_BOTTOM))
             .border_t_1()
             .border_color(rgb(BORDER_COLOR))
@@ -580,60 +594,77 @@ impl Render for BlockInput {
                 div()
                     .flex()
                     .h(px(CHIPS_HEIGHT))
-                    .gap(px(6.))
+                    .gap(px(8.))
                     .when_some(self.queried_cwd.as_ref(), |this, cwd| {
-                        this.child(chip(
-                            "photon-folder-chip",
-                            folder_chip_text(cwd),
-                            FOLDER_CHIP_COLOR,
-                            ToggleFolderPicker.boxed_clone(),
-                        ))
+                        let input = cx.weak_entity();
+                        this.child(
+                            PopoverMenu::new("photon-folder-chip-menu")
+                                .trigger(chip(
+                                    "photon-folder-chip",
+                                    folder_chip_text(cwd),
+                                    FOLDER_CHIP_COLOR,
+                                ))
+                                .with_handle(self.folder_menu.clone())
+                                .anchor(gpui::Anchor::BottomLeft)
+                                .offset(gpui::point(px(0.), px(-4.)))
+                                .menu(move |window, cx| {
+                                    input
+                                        .update(cx, |input, cx| input.folder_picker(window, cx))
+                                        .ok()
+                                }),
+                        )
                     })
                     .when_some(self.git.as_ref(), |this, info| {
-                        this.child(chip(
-                            "photon-branch-chip",
-                            branch_chip_text(info),
-                            BRANCH_CHIP_COLOR,
-                            ToggleBranchPicker.boxed_clone(),
-                        ))
+                        let input = cx.weak_entity();
+                        this.child(
+                            PopoverMenu::new("photon-branch-chip-menu")
+                                .trigger(chip(
+                                    "photon-branch-chip",
+                                    branch_chip_text(info),
+                                    BRANCH_CHIP_COLOR,
+                                ))
+                                .with_handle(self.branch_menu.clone())
+                                .anchor(gpui::Anchor::BottomLeft)
+                                .offset(gpui::point(px(0.), px(-4.)))
+                                .menu(move |window, cx| {
+                                    input
+                                        .update(cx, |input, cx| input.branch_picker(window, cx))
+                                        .ok()
+                                        .flatten()
+                                }),
+                        )
                     }),
             )
+            // The key context covers only the editor row: the chips' pickers render inside the
+            // chips row, and their own enter/up/down/tab must not run the input's bindings.
             .child(
                 div()
+                    .key_context("PhotonBlockInput")
+                    .capture_action(cx.listener(Self::copy))
+                    .on_action(cx.listener(Self::run_input))
+                    .on_action(cx.listener(Self::interrupt))
+                    .on_action(cx.listener(Self::history_previous))
+                    .on_action(cx.listener(Self::history_next))
+                    .on_action(cx.listener(Self::search_history))
+                    .on_action(cx.listener(Self::toggle_folder_picker))
+                    .on_action(cx.listener(Self::toggle_branch_picker))
+                    .on_action(cx.listener(Self::complete))
+                    .on_action(cx.listener(Self::accept_suggestion))
                     .flex()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .font_family(FONT_FAMILY)
-                            .text_size(px(FONT_SIZE))
-                            .line_height(relative(LINE_HEIGHT))
-                            .text_color(rgb(METADATA_COLOR))
-                            .child("❯"),
-                    )
                     .child(div().flex_1().child(self.editor.clone())),
             )
     }
 }
 
-fn chip(
-    id: &'static str,
-    text: String,
-    color: u32,
-    action: Box<dyn gpui::Action>,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex_none()
-        .px(px(7.))
-        .border_1()
-        .border_color(rgb(CHIP_BORDER_COLOR))
-        .rounded(px(4.))
-        .text_size(px(12.))
-        .text_color(rgb(color))
-        .cursor_pointer()
-        .hover(|style| style.border_color(rgb(0x19AAD8)))
-        .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
-        .child(text)
+fn chip(id: &'static str, text: String, color: u32) -> ButtonLike {
+    ButtonLike::new(id)
+        .style(ButtonStyle::OutlinedCustom(rgb(CHIP_BORDER_COLOR).into()))
+        .size(ButtonSize::Compact)
+        .child(
+            Label::new(text)
+                .size(LabelSize::Small)
+                .color(Color::Custom(rgb(color).into())),
+        )
 }
 
 /// Feeds the editor's completion menu with the candidates the last Tab produced.
