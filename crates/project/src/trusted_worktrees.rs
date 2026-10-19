@@ -51,7 +51,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::{debug_panic, paths::PathStyle};
+use util::{debug_panic, paths::PathStyle}; // photon: PathStyle for refused parent trust
 
 use crate::{project_settings::ProjectSettings, worktree_store::WorktreeStore};
 

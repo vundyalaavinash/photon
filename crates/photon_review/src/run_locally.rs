@@ -15,7 +15,7 @@ use workspace::{
 
 use crate::{
     Checkout, PrSummary, ReviewDb, Tracked, candidate_repos, fetch_url, find_clone,
-    forget_stale_trust, prepare_checkout, repo_id, review_root,
+    forget_stale_trust, git, prepare_checkout, repo_id, review_root, worktree_path,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, RegisterSetting)]
@@ -90,6 +90,53 @@ pub(crate) async fn prepare_local_checkout(
     Ok(checkout)
 }
 
+/// Moving an open window's worktree to new code would leave its language servers running on
+/// code nobody trusted. An unreadable `HEAD` counts as a change.
+pub(crate) fn must_refuse_checkout(
+    window_open: bool,
+    worktree_head: Option<&str>,
+    pr_head: &str,
+) -> bool {
+    window_open && worktree_head != Some(pr_head)
+}
+
+struct NewCommitsToast;
+
+/// Run before any `prepare_checkout` for the pull request. Returns true, having activated the
+/// window and told the user, when a window shows the PR's worktree and the checkout would move
+/// its head.
+pub(crate) async fn refuse_head_change_under_open_window(
+    summary: &PrSummary,
+    app_state: &AppState,
+    cx: &mut AsyncWindowContext,
+) -> Result<bool> {
+    let worktree = worktree_path(&review_root(), &summary.key);
+    let open = cx.update(|_, cx| find_workspace_with_worktree(app_state, &worktree, cx))?;
+    let Some((window, workspace)) = open else {
+        return Ok(false);
+    };
+    let worktree_head = cx
+        .background_spawn(async move { git(&worktree, &["rev-parse", "HEAD"]).await.log_err() })
+        .await;
+    if !must_refuse_checkout(true, worktree_head.as_deref(), &summary.head_sha) {
+        return Ok(false);
+    }
+    let message = format!(
+        "Close the window for PR #{} to load its new commits",
+        summary.key.number
+    );
+    window.update(cx, |_, window, cx| {
+        window.activate_window();
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                Toast::new(NotificationId::unique::<NewCommitsToast>(), message),
+                cx,
+            )
+        })
+    })?;
+    Ok(true)
+}
+
 /// A workspace that already shows `worktree`, so a second click reuses its window.
 fn find_workspace_with_worktree(
     app_state: &AppState,
@@ -153,6 +200,9 @@ async fn open_terminal(
     candidates: Task<Vec<PathBuf>>,
     cx: &mut AsyncWindowContext,
 ) -> Result<()> {
+    if refuse_head_change_under_open_window(&summary, &app_state, cx).await? {
+        return Ok(());
+    }
     let candidates = candidates.await;
     let url = fetch_url(&repo_id(&summary));
     let checkout = cx
@@ -242,6 +292,15 @@ mod tests {
             last_review_commit: None,
             since_review: SinceReview::NotReviewed,
         }
+    }
+
+    #[test]
+    fn head_change_is_refused_only_under_an_open_window() {
+        assert!(must_refuse_checkout(true, Some("old"), "new"));
+        assert!(must_refuse_checkout(true, None, "new"));
+        assert!(!must_refuse_checkout(true, Some("new"), "new"));
+        assert!(!must_refuse_checkout(false, Some("old"), "new"));
+        assert!(!must_refuse_checkout(false, None, "new"));
     }
 
     #[gpui::test]

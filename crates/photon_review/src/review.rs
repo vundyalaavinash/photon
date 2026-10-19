@@ -44,8 +44,9 @@ use crate::{
     classify_caller, classify_path, commentable_lines, context::buffer_path, context_excerpts,
     deleted_lines, detail_request, fetch_url, find_clone, functions, gh_runner, git_diff,
     is_sendable, landing_note, parse_auth_status, parse_detail, parse_mutation, parse_reply, place,
-    plan_since_review, prepare_checkout, reanchor, reply_request, reply_slot, resolve_request,
-    review_request, review_root, since_review_files, viewed_request,
+    plan_since_review, prepare_checkout, reanchor, refuse_head_change_under_open_window,
+    reply_request, reply_slot, resolve_request, review_request, review_root, since_review_files,
+    viewed_request,
 };
 
 actions!(
@@ -400,6 +401,9 @@ async fn open_in_new_window(
                 workspace.activate_item(&item, true, true, window, cx)
             })
         })?;
+        return Ok(());
+    }
+    if refuse_head_change_under_open_window(&summary, &app_state, cx).await? {
         return Ok(());
     }
 
