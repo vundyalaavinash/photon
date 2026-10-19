@@ -13483,7 +13483,11 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "settings",
  "tempfile",
+ "theme",
+ "theme_settings",
+ "ui",
  "util",
  "workspace",
 ]

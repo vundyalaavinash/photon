@@ -1,13 +1,17 @@
 mod checkout;
 mod gh;
 mod github;
+mod inbox;
 mod store;
 
 pub use checkout::*;
 pub use gh::*;
 pub use github::*;
+pub use inbox::*;
 pub use store::*;
 
 use gpui::App;
 
-pub fn init(_cx: &mut App) {}
+pub fn init(cx: &mut App) {
+    inbox::init_inbox(cx);
+}
