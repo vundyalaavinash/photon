@@ -57,7 +57,72 @@ pub fn signature_text(snapshot: &BufferSnapshot, item: &OutlineItem<Point>) -> S
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+const MODIFIER_WORDS: [&str; 4] = ["async", "const", "unsafe", "default"];
+
+fn strip_leading_modifiers(mut text: &str) -> &str {
+    loop {
+        text = text.trim_start();
+        let rest = if let Some(rest) = text.strip_prefix("pub") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                rest.split_once(')').map_or(rest, |(_, after)| after)
+            } else {
+                rest
+            }
+        } else if let Some(rest) = text.strip_prefix("extern") {
+            let rest = rest.trim_start();
+            if rest.starts_with('"') {
+                rest.get(1..)
+                    .and_then(|quoted| quoted.split_once('"'))
+                    .map_or(rest, |(_, after)| after)
+            } else {
+                rest
+            }
+        } else if let Some(rest) = MODIFIER_WORDS
+            .iter()
+            .find_map(|word| text.strip_prefix(word))
+        {
+            rest
+        } else {
+            return text;
+        };
+        // A prefix match inside an identifier (`constant`, `public`) is not a modifier.
+        if rest.starts_with(|character: char| character.is_alphanumeric() || character == '_') {
+            return text;
+        }
+        text = rest;
+    }
+}
+
+/// Signature with modifiers, whitespace and trailing commas removed, or `None` when the item is
+/// not callable: callable means it has a body, or is a bodiless `fn` declaration.
+fn callable_signature(snapshot: &BufferSnapshot, item: &OutlineItem<Point>) -> Option<String> {
+    let collapsed = signature_text(snapshot, item);
+    let stripped = strip_leading_modifiers(&collapsed);
+    // ponytail: only Rust-style `fn` declarations count as bodiless callables; other languages
+    // with bodiless signatures need their own keyword.
+    let is_declaration = stripped
+        .strip_prefix("fn")
+        .is_some_and(|rest| rest.starts_with(|character: char| character.is_whitespace()));
+    if item.body_range.is_none() && !is_declaration {
+        return None;
+    }
+    let compact: Vec<char> = stripped
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let mut normalised = String::with_capacity(compact.len());
+    for (index, character) in compact.iter().enumerate() {
+        let before_closer = matches!(compact.get(index + 1), Some(')' | '>' | ']'));
+        if *character != ',' || !before_closer {
+            normalised.push(*character);
+        }
+    }
+    Some(normalised)
+}
+
 struct NamedItem {
+    signature: Option<String>,
     item: OutlineItem<Point>,
     name: String,
     outline_path: Vec<String>,
@@ -75,6 +140,7 @@ fn named_items(snapshot: &BufferSnapshot) -> Vec<NamedItem> {
             ancestors.truncate(item.depth);
             ancestors.push(name.clone());
             NamedItem {
+                signature: callable_signature(snapshot, &item),
                 item,
                 name,
                 outline_path: ancestors.clone(),
@@ -118,7 +184,9 @@ pub fn analyse_file(
             .iter()
             .enumerate()
             .filter(|(_, named)| {
-                named.item.range.start.row <= row && row <= named.item.range.end.row
+                named.signature.is_some()
+                    && named.item.range.start.row <= row
+                    && row <= named.item.range.end.row
             })
             .max_by_key(|(_, named)| named.item.depth);
         match deepest {
@@ -135,15 +203,12 @@ pub fn analyse_file(
         .into_iter()
         .filter_map(|index| head_items.get(index))
         .map(|named| {
-            let base_match = base_items
-                .iter()
-                .find(|candidate| candidate.outline_path == named.outline_path);
+            let base_match = base_items.iter().find(|candidate| {
+                candidate.signature.is_some() && candidate.outline_path == named.outline_path
+            });
             let change = match base_match {
                 None => FunctionChange::Added,
-                Some(base_named)
-                    if signature_text(base, &base_named.item)
-                        != signature_text(buffer, &named.item) =>
-                {
+                Some(base_named) if base_named.signature != named.signature => {
                     FunctionChange::Signature
                 }
                 Some(_) => FunctionChange::BodyOnly,
@@ -181,6 +246,34 @@ pub fn analyse_loaded_file(file: &LoadedFile, cx: &mut App) -> Task<Option<FileA
     let buffer = buffer.clone();
     let buffer_diff = buffer_diff.clone();
     cx.spawn(async move |cx| {
+        let (language, registry, file_path) = cx.update(|cx| {
+            let buffer = buffer.read(cx);
+            (
+                buffer.language().cloned(),
+                buffer.language_registry(),
+                buffer.file().map(|file| file.full_path(cx)),
+            )
+        });
+        let language = match (language, registry, file_path) {
+            (Some(language), ..) => Some(language),
+            (None, Some(registry), Some(path)) => {
+                registry.load_language_for_file_path(&path).await.ok()
+            }
+            _ => None,
+        };
+        if let Some(language) = language {
+            buffer.update(cx, |buffer, cx| {
+                if buffer.language().is_none() {
+                    buffer.set_language(Some(language.clone()), cx);
+                }
+            });
+            let base_buffer = buffer_diff.read_with(cx, |diff, _| diff.base_text_buffer().clone());
+            base_buffer.update(cx, |base, cx| {
+                if base.language().is_none() {
+                    base.set_language(Some(language), cx);
+                }
+            });
+        }
         let (head_idle, base_idle) = cx.update(|cx| {
             (
                 buffer.read(cx).parsing_idle(),
@@ -212,9 +305,14 @@ pub fn analyse_loaded_file(file: &LoadedFile, cx: &mut App) -> Task<Option<FileA
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::{FileDiff, FileStatus, build_loaded_file};
     use buffer_diff::BufferDiff;
+    use fs::FakeFs;
     use gpui::TestAppContext;
     use language::Buffer;
+    use project::Project;
+    use serde_json::json;
+    use settings::SettingsStore;
 
     const BASE: &str = "\
 use std::fmt;
@@ -340,7 +438,7 @@ fn gone() {}
             "fn top(\n    a: u32,\n) ->   u32 {",
         );
         let (found, _) = functions(analyse(cx, BASE, &head, true).await);
-        assert_eq!(found, vec![("top".into(), FunctionChange::Signature)]);
+        assert_eq!(found, vec![("top".into(), FunctionChange::BodyOnly)]);
         let head = BASE.replace("fn top(a: u32) -> u32 {", "fn top(a:   u32)  ->  u32 {");
         let (found, _) = functions(analyse(cx, BASE, &head, true).await);
         assert_eq!(found, vec![("top".into(), FunctionChange::BodyOnly)]);
@@ -361,5 +459,93 @@ fn gone() {}
         let (found, rows) = functions(analyse(cx, BASE, &head, true).await);
         assert!(found.is_empty());
         assert_eq!(rows.len(), 1);
+    }
+
+    const WIDE: &str = "\
+fn wide(first: u32, second: Vec<u32>) -> u32 {
+    first
+}
+";
+
+    #[gpui::test]
+    async fn rustfmt_rewrap_is_not_a_signature_change(cx: &mut TestAppContext) {
+        let head = "\
+fn wide(
+    first: u32,
+    second: Vec<
+        u32,
+    >,
+) -> u32 {
+    first + 1
+}
+";
+        let (found, _) = functions(analyse(cx, WIDE, head, true).await);
+        assert_eq!(found, vec![("wide".into(), FunctionChange::BodyOnly)]);
+    }
+
+    #[gpui::test]
+    async fn parameter_type_change_is_signature(cx: &mut TestAppContext) {
+        let head = WIDE.replace("Vec<u32>", "Vec<u64>");
+        let (found, _) = functions(analyse(cx, WIDE, &head, true).await);
+        assert_eq!(found, vec![("wide".into(), FunctionChange::Signature)]);
+    }
+
+    #[gpui::test]
+    async fn visibility_change_alone_is_not_a_signature_change(cx: &mut TestAppContext) {
+        let head = BASE.replace("fn top(", "pub(crate) async fn top(");
+        let (found, _) = functions(analyse(cx, BASE, &head, true).await);
+        assert_eq!(found, vec![("top".into(), FunctionChange::BodyOnly)]);
+    }
+
+    #[gpui::test]
+    async fn struct_field_edit_is_file_level(cx: &mut TestAppContext) {
+        let base = "struct Foo {\n    x: u32,\n}\n\nconst LIMIT: u32 = 1;\n";
+        let head = "struct Foo {\n    x: u64,\n}\n\nconst LIMIT: u32 = 2;\n";
+        let (found, rows) = functions(analyse(cx, base, head, true).await);
+        assert_eq!(found, vec![]);
+        assert_eq!(rows, vec![1..2, 4..5]);
+    }
+
+    #[gpui::test]
+    async fn new_struct_beside_impl_does_not_disturb_methods(cx: &mut TestAppContext) {
+        let base = BASE.replace("struct Foo;\n\n", "");
+        let head = BASE.replace("        1\n", "        2\n");
+        let (found, rows) = functions(analyse(cx, &base, &head, true).await);
+        assert_eq!(found, vec![("bar".into(), FunctionChange::BodyOnly)]);
+        assert_eq!(rows, vec![2..4]);
+    }
+
+    #[gpui::test]
+    async fn loaded_rust_file_is_analysed_with_its_language(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let head = BASE.replace("    a\n", "    a + 1\n");
+        fs.insert_tree("/repo", json!({ "a.rs": head })).await;
+        let project = Project::test(fs, ["/repo".as_ref()], cx).await;
+        project.read_with(cx, |project, _| {
+            project.languages().add(language::rust_lang());
+        });
+        let diff = FileDiff {
+            path: "a.rs".into(),
+            status: FileStatus::Modified,
+            binary: false,
+            submodule: false,
+            hunks: Vec::new(),
+        };
+        let loaded = cx
+            .update(|cx| {
+                build_loaded_file(&project, "/repo/a.rs".into(), Some(BASE.into()), diff, cx)
+            })
+            .await
+            .expect("loaded");
+        let analysis = cx
+            .update(|cx| analyse_loaded_file(&loaded, cx))
+            .await
+            .expect("analysis");
+        let (found, _) = functions(analysis);
+        assert_eq!(found, vec![("top".into(), FunctionChange::BodyOnly)]);
     }
 }
