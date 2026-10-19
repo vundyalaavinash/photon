@@ -40,10 +40,18 @@ elif [[ $PHOTON_BLOCKS == 1 ]]; then
     if [[ $1 == ' '* ]] || [[ -n $HISTORY_IGNORE && $1 == ${~HISTORY_IGNORE} ]]; then
       flag=';nohist'
     fi
-    # Exported, with Photon's ZDOTDIR, so a zsh this command starts loads the hooks again;
-    # the user's ZDOTDIR is back by the next prompt.
-    typeset -gx __photon_command_ran=1
-    ZDOTDIR=$PHOTON_ZDOTDIR
+    typeset -g __photon_command_ran=1
+    # Only a command that starts zsh (`exec zsh`, `zsh`) gets Photon's ZDOTDIR, so that zsh loads
+    # the hooks again; anything else (`conda init zsh`) must see the user's own dotfiles.
+    local -a words=(${(z)1})
+    [[ $words[1] == exec ]] && shift words
+    while [[ $words[1] == -* ]]; do shift words; done
+    local program=${(Q)words[1]}
+    [[ $program == '$SHELL' || $program == '${SHELL}' ]] && program=$SHELL
+    if [[ ${program:t} == zsh ]]; then
+      export __photon_command_ran
+      ZDOTDIR=$PHOTON_ZDOTDIR
+    fi
     printf '\e]633;E;%s%s\a' "$command" "$flag"
     printf '\e]133;C\a'
   }

@@ -2,6 +2,14 @@
 # Announce the cwd before anything user-controlled runs, so a slow rc file
 # cannot look like "no shell integration" to the terminal.
 if [[ -o interactive && $PHOTON_BLOCKS == 1 ]]; then
+  if [[ -z $PHOTON_TTY ]]; then
+    export PHOTON_TTY=$TTY
+  elif [[ ! /dev/fd/1 -ef $PHOTON_TTY ]]; then
+    # A zsh writing to a pipe, tmux or an editor's terminal must not print marks into it.
+    unset PHOTON_BLOCKS __photon_command_ran
+  fi
+fi
+if [[ -o interactive && $PHOTON_BLOCKS == 1 ]]; then
   __photon_url=${PWD//\%/%25}
   printf '\e]7;file://%s%s\a' "$HOST" "${__photon_url// /%20}"
   unset __photon_url

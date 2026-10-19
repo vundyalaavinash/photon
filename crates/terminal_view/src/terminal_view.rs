@@ -1124,6 +1124,10 @@ impl TerminalView {
             // photon: a selected block's keys apply only while one is selected.
             if self.selected_block.is_some() {
                 dispatch_context.add("photon_block_selected");
+                // photon: a running program (less -X, fzf, a REPL) needs escape more than the selection does.
+                if self.terminal.read(cx).input_target() == terminal::InputTarget::Pty {
+                    dispatch_context.add("photon_keys_to_pty");
+                }
             }
         }
 
@@ -3932,6 +3936,21 @@ mod tests {
         cx.simulate_keystrokes("escape");
         assert_eq!(selected(&terminal_view, &mut cx), None);
         assert_eq!(needle_matches(&terminal_view, &mut cx).await, 2);
+    }
+
+    #[gpui::test]
+    async fn escape_reaches_a_running_program(cx: &mut TestAppContext) {
+        let (terminal, terminal_view, mut cx) = init_block_view(cx).await;
+        feed_block_output(
+            &terminal,
+            b"\x1b]133;A\x07\x1b]133;B\x07less -X\r\n\x1b]633;E;less -X\x07\x1b]133;C\x07page\r\n",
+            &mut cx,
+        );
+        cx.simulate_keystrokes("cmd-up");
+        assert!(selected(&terminal_view, &mut cx).is_some());
+        take_pty_writes(&terminal, &mut cx);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(take_pty_writes(&terminal, &mut cx), vec![b"\x1b".to_vec()]);
     }
 
     #[gpui::test]

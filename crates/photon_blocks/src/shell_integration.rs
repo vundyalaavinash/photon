@@ -57,5 +57,7 @@ pub fn prepare_zsh_env<S: BuildHasher>(
     }
     env.insert("ZDOTDIR".into(), integration_dir);
     env.insert("PHOTON_BLOCKS".into(), "1".into());
+    // Empty so the shell records its own terminal, not one inherited from a Photon launched inside Photon.
+    env.insert("PHOTON_TTY".into(), String::new());
     true
 }

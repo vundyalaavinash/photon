@@ -364,3 +364,41 @@ fn exec_zsh_keeps_blocks_going() {
         "{output}"
     );
 }
+
+#[test]
+fn commands_other_than_zsh_see_the_users_zdotdir() {
+    if !zsh_available() {
+        return;
+    }
+    // An installer (`conda init zsh`) writes to $ZDOTDIR/.zshrc; Photon's copy would be overwritten.
+    let (_marks, output, home) = run_zsh("", "printenv ZDOTDIR\nexit\n");
+    let home = home.path().to_string_lossy();
+    assert!(
+        output.lines().any(|line| line.ends_with(home.as_ref())),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn zsh_writing_to_a_pipe_prints_no_marks() {
+    if !zsh_available() {
+        return;
+    }
+    let home = tempfile::tempdir().expect("home");
+    let (env, _data) = photon_env(home.path());
+    // `script` gives the outer zsh a real terminal; the inner zsh, handed Photon's ZDOTDIR as
+    // preexec does for `zsh` commands, writes to a pipe.
+    let output = Command::new("script")
+        .args(["-q", "/dev/null", "zsh", "-ic"])
+        .arg("echo escapes=$(ZDOTDIR=$PHOTON_ZDOTDIR zsh -ic 'echo in''ner' | od -c | tr -d ' ' | grep -c 033)")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .envs(&env)
+        .stdin(Stdio::null())
+        .output()
+        .expect("script");
+    let output = String::from_utf8_lossy(&output.stdout);
+    // `grep -c` counts the lines of the inner zsh's output that contained an escape.
+    assert!(output.contains("escapes=0\r"), "{output}");
+}

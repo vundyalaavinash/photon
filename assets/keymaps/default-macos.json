@@ -1421,7 +1421,7 @@
     },
   },
   {
-    // photon: a selected block's actions; escape unselects it so find searches all blocks again.
+    // photon: a selected block's actions.
     "context": "Terminal && photon_block_selected",
     "use_key_equivalents": true,
     "bindings": {
@@ -1429,6 +1429,13 @@
       "cmd-alt-c": "photon_terminal::CopyBlockOutput",
       "cmd-alt-shift-c": "photon_terminal::CopyBlock",
       "cmd-shift-r": "photon_terminal::RerunBlock",
+    },
+  },
+  {
+    // photon: escape unselects the block only at a prompt; a running program gets the key.
+    "context": "Terminal && photon_block_selected && !photon_keys_to_pty",
+    "use_key_equivalents": true,
+    "bindings": {
       "escape": "photon_terminal::ClearBlockSelection",
     },
   },
