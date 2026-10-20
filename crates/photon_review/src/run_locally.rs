@@ -50,9 +50,8 @@ pub fn run_locally(
 ) -> Task<Result<()>> {
     let app_state = workspace.app_state().clone();
     let database = ReviewDb::global(cx);
-    let candidates = candidate_repos(cx);
     cx.spawn_in(window, async move |workspace, cx| {
-        let result = open_terminal(summary, app_state, database, candidates, cx).await;
+        let result = open_terminal(summary, app_state, database, cx).await;
         if let Err(error) = &result {
             let message = format!("{error:#}");
             workspace
@@ -217,10 +216,10 @@ async fn open_terminal(
     summary: PrSummary,
     app_state: Arc<AppState>,
     database: ReviewDb,
-    candidates: Task<Vec<PathBuf>>,
     cx: &mut AsyncWindowContext,
 ) -> Result<()> {
-    let candidates = candidates.await;
+    // Not read up front: the caller is usually mid-update on a workspace this would read.
+    let candidates = cx.update(|_, cx| candidate_repos(cx))?.await;
     let url = fetch_url(&repo_id(&summary));
     let fetched = cx
         .background_spawn({

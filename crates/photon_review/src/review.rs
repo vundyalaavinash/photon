@@ -312,9 +312,8 @@ pub fn open_review(
     let app_state = workspace.app_state().clone();
     let runner = gh_runner(cx);
     let database = ReviewDb::global(cx);
-    let candidates = candidate_repos(cx);
     cx.spawn_in(window, async move |workspace, cx| {
-        let result = open_in_new_window(summary, app_state, runner, database, candidates, cx).await;
+        let result = open_in_new_window(summary, app_state, runner, database, cx).await;
         drop(guard);
         if let Err(error) = &result {
             let message = format!("{error:#}");
@@ -388,7 +387,6 @@ async fn open_in_new_window(
     app_state: Arc<AppState>,
     runner: Arc<dyn GhRunner>,
     database: ReviewDb,
-    candidates: Task<Vec<PathBuf>>,
     cx: &mut AsyncWindowContext,
 ) -> Result<()> {
     let open = cx.update(|_, cx| find_open_review(&app_state, &summary.key, cx))?;
@@ -404,7 +402,8 @@ async fn open_in_new_window(
         return Ok(());
     }
 
-    let candidates = candidates.await;
+    // Not read up front: the caller is usually mid-update on a workspace this would read.
+    let candidates = cx.update(|_, cx| candidate_repos(cx))?.await;
     let url = fetch_url(&repo_id(&summary));
     let (login, fetched) = cx
         .background_spawn({
@@ -4098,6 +4097,36 @@ fn verify_password(user: &str, password: &str) -> bool {
         assert_eq!(fake.requests().len(), 1);
         assert!(!root.exists());
         assert!(database.tracked().expect("tracked").is_empty());
+    }
+
+    #[gpui::test]
+    async fn open_review_from_inside_a_workspace_update_does_not_panic(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fake = FakeGh::new();
+        fake.respond(
+            |request| request.args[0] == "auth",
+            Ok(include_str!("../test_fixtures/auth_status_logged_out.json").into()),
+        );
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            crate::set_gh_runner(fake.clone(), cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        cx.update(|cx| AppState::set_global(workspace.read(cx).app_state().clone(), cx));
+        let summary = parse_detail(&key(), DETAIL).expect("detail").summary;
+
+        // The inbox's Review button calls open_review while the workspace is being updated.
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let task = workspace.update_in(&mut visual, |workspace, window, cx| {
+            open_review(summary, workspace, window, cx)
+        });
+        let error = task.await.err().expect("logged out");
+        assert!(error.to_string().contains("Not logged in"), "{error:#}");
     }
 
     #[gpui::test]
