@@ -11,9 +11,9 @@ open_result=false
 local_install=false
 can_code_sign=false
 
-# This must match the team in the provisioning profile.
-IDENTITY="Zed Industries, Inc."
-APPLE_NOTARIZATION_TEAM="MQ55VZLNZQ"
+# photon: sign as the Photon owner's Developer ID (from CI secrets), never Zed's.
+IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
+APPLE_NOTARIZATION_TEAM="${APPLE_NOTARIZATION_TEAM:-}"
 
 # Function for displaying help info
 help_info() {
@@ -126,7 +126,8 @@ else
     echo "cargo::warning=Missing ${document_icon_source}; macOS document icons may not appear in Finder."
 fi
 
-if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+# photon: signing also needs the identity, since Photon has no built-in default.
+if [[ -n "${MACOS_SIGNING_IDENTITY:-}" && -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
     can_code_sign=true
 
     echo "Setting up keychain for code signing..."
@@ -205,7 +206,8 @@ function sign_app_binaries() {
     download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
 
     # Note: The app identifier for our development builds is the same as the app identifier for nightly.
-    cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
+    # photon: Zed's provisioning profile is bound to Zed's team and app ID; Photon's entitlements need none.
+    # cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
 
     if [[ $can_code_sign = true ]]; then
         echo "Code signing binaries"
@@ -215,7 +217,8 @@ function sign_app_binaries() {
         /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/zed" -v
         /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}" -v
     else
-        echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD, APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER_ID"
+        # photon: lists MACOS_SIGNING_IDENTITY too.
+        echo "One or more of the following variables are missing: MACOS_SIGNING_IDENTITY, MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD, APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER_ID"
 
         echo "====== WARNING ======"
         echo "This bundle is being signed without all entitlements, some features (e.g. universal links) will not work"

@@ -30,6 +30,15 @@ jobs:
           brew install cmake
           xcodebuild -downloadComponent MetalToolchain || true
       - name: Build the stable app
+        # Unset secrets leave these empty, and bundle-mac falls back to an ad-hoc signed, un-notarized build.
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+          APPLE_NOTARIZATION_TEAM: ${{ secrets.APPLE_NOTARIZATION_TEAM }}
         run: |
           echo stable > crates/zed/RELEASE_CHANNEL
           script/bundle-mac aarch64-apple-darwin
